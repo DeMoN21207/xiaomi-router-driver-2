@@ -1,0 +1,8 @@
+binary=vpn-manager
+goos=linux
+goarch=arm64
+default_port=18080
+package_dir=build/router
+data_dir=data
+openvpn_path=openvpn
+singbox_path=sing-box
