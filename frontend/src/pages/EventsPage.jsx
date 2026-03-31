@@ -87,7 +87,7 @@ export default function EventsPage() {
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-secondary opacity-75" />
               <span className="status-glow-success relative inline-flex h-2 w-2 rounded-full bg-secondary" />
             </span>
-            <p className="font-mono text-xs uppercase tracking-widest text-secondary">
+            <p className="font-mono text-xs uppercase tracking-widest text-on-surface-variant">
               {loading ? t("events.loading") : `${filtered.length} / ${total} ${t("events.entries")}`}
             </p>
           </div>

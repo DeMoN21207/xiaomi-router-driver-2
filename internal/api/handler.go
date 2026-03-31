@@ -3,15 +3,20 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -81,6 +86,8 @@ type applyResult struct {
 	Domains      []string `json:"domains"`
 }
 
+const applyRequestTimeout = 2 * time.Minute
+
 func NewHandler(deps Dependencies) *Handler {
 	handler := &Handler{
 		state:           deps.State,
@@ -120,6 +127,7 @@ func NewHandler(deps Dependencies) *Handler {
 	mux.HandleFunc("/api/blacklist", handler.handleBlacklist)
 	mux.HandleFunc("/api/blacklist/apply", handler.handleApplyBlacklist)
 	mux.HandleFunc("/api/system/resources", handler.handleSystemResources)
+	mux.HandleFunc("/api/system/reboot", handler.handleReboot)
 	handler.router = mux
 	return handler
 }
@@ -200,6 +208,27 @@ func (h *Handler) handleSystemResources(w http.ResponseWriter, r *http.Request) 
 
 	resources := status.CollectSystemResources(h.dataDir)
 	writeJSON(w, http.StatusOK, resources)
+}
+
+func (h *Handler) handleReboot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+
+	if runtime.GOOS != "linux" {
+		writeError(w, http.StatusServiceUnavailable, errors.New("reboot is only supported on the router (Linux)"))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "rebooting"})
+
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		if err := exec.Command("reboot").Run(); err != nil {
+			log.Printf("reboot command failed: %v", err)
+		}
+	}()
 }
 
 func (h *Handler) handleTrafficHistory(w http.ResponseWriter, r *http.Request) {
@@ -850,7 +879,7 @@ func (h *Handler) handleRules(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		if err := validateRuleDomains(rule, state.Providers, state.Rules); err != nil {
+		if err := validateRuleEntries(rule, state.Providers, state.Rules); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -904,43 +933,70 @@ func (h *Handler) handleRule(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, fmt.Errorf("rule %s not found", id))
 			return
 		}
-		if err := validateRuleDomains(rule, state.Providers, state.Rules); err != nil {
+		if err := validateRuleEntries(rule, state.Providers, state.Rules); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 
-		state.Rules[index] = rule
-		if _, err := h.state.Save(state); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+		savedRule, err := h.state.UpdateRule(rule)
+		if err != nil {
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				writeError(w, http.StatusNotFound, fmt.Errorf("rule %s not found", id))
+			default:
+				writeError(w, http.StatusInternalServerError, err)
+			}
 			return
 		}
 
-		writeJSON(w, http.StatusOK, map[string]any{"rule": rule})
-		h.recordEvent("info", "rule.updated", fmt.Sprintf("Rule %q updated", rule.Name))
+		if requestWantsApply(r) {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), applyRequestTimeout)
+			defer cancel()
+
+			result, err := h.applyCurrentRulesWithRollback(ctx, state)
+			if err != nil {
+				writeApplyError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"rule": savedRule, "apply": result})
+			h.recordEvent("info", "rule.updated", fmt.Sprintf("Rule %q updated and applied", savedRule.Name))
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{"rule": savedRule})
+		h.recordEvent("info", "rule.updated", fmt.Sprintf("Rule %q updated", savedRule.Name))
 	case http.MethodDelete:
 		state, err := h.state.Load()
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-
-		nextRules := make([]config.Rule, 0, len(state.Rules))
-		found := false
-		for _, rule := range state.Rules {
-			if rule.ID == id {
-				found = true
-				continue
-			}
-			nextRules = append(nextRules, rule)
-		}
-		if !found {
+		if findRuleIndex(state.Rules, id) < 0 {
 			writeError(w, http.StatusNotFound, fmt.Errorf("rule %s not found", id))
 			return
 		}
 
-		state.Rules = nextRules
-		if _, err := h.state.Save(state); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+		if err := h.state.DeleteRule(id); err != nil {
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				writeError(w, http.StatusNotFound, fmt.Errorf("rule %s not found", id))
+			default:
+				writeError(w, http.StatusInternalServerError, err)
+			}
+			return
+		}
+
+		if requestWantsApply(r) {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), applyRequestTimeout)
+			defer cancel()
+
+			result, err := h.applyCurrentRulesWithRollback(ctx, state)
+			if err != nil {
+				writeApplyError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "apply": result})
+			h.recordEvent("warn", "rule.deleted", fmt.Sprintf("Rule %s deleted and applied", id))
 			return
 		}
 
@@ -957,25 +1013,71 @@ func (h *Handler) handleApplyRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.applyCurrentRules(r.Context())
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), applyRequestTimeout)
+	defer cancel()
+
+	result, err := h.applyCurrentRules(ctx)
 	if err != nil {
-		statusCode := http.StatusInternalServerError
-		switch {
-		case strings.Contains(err.Error(), "not implemented yet"):
-			statusCode = http.StatusConflict
-		case strings.Contains(err.Error(), "is not configured"):
-			statusCode = http.StatusInternalServerError
-		}
-		writeError(w, statusCode, err)
+		writeApplyError(w, err)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, result)
 }
 
+func writeApplyError(w http.ResponseWriter, err error) {
+	statusCode := http.StatusInternalServerError
+	switch {
+	case strings.Contains(err.Error(), "not implemented yet"):
+		statusCode = http.StatusConflict
+	case strings.Contains(err.Error(), "is not configured"):
+		statusCode = http.StatusInternalServerError
+	}
+	writeError(w, statusCode, err)
+}
+
+func requestWantsApply(r *http.Request) bool {
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("apply"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func (h *Handler) ApplyCurrentRules(ctx context.Context) error {
 	_, err := h.applyCurrentRules(ctx)
 	return err
+}
+
+func (h *Handler) applyCurrentRulesWithRollback(ctx context.Context, previousState config.State) (applyResult, error) {
+	result, err := h.applyCurrentRules(ctx)
+	if err == nil {
+		return result, nil
+	}
+
+	if rollbackErr := h.rollbackFailedRuleApply(previousState); rollbackErr != nil {
+		h.recordEvent("error", "rules.apply_rollback_failed", fmt.Sprintf("%v; rollback failed: %v", err, rollbackErr))
+		return applyResult{}, fmt.Errorf("%w; rollback failed: %v", err, rollbackErr)
+	}
+
+	h.recordEvent("warn", "rules.apply_rolled_back", fmt.Sprintf("Rolled back configuration after apply failure: %v", err))
+	return applyResult{}, err
+}
+
+func (h *Handler) rollbackFailedRuleApply(previousState config.State) error {
+	if _, err := h.state.Save(previousState); err != nil {
+		return fmt.Errorf("restore previous config: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), applyRequestTimeout)
+	defer cancel()
+
+	if _, err := h.applyCurrentRules(ctx); err != nil {
+		return fmt.Errorf("restore previous runtime: %w", err)
+	}
+
+	return nil
 }
 
 func (h *Handler) applyCurrentRules(ctx context.Context) (applyResult, error) {
@@ -986,7 +1088,7 @@ func (h *Handler) applyCurrentRules(ctx context.Context) (applyResult, error) {
 	if err != nil {
 		return applyResult{}, err
 	}
-	if err := validateActiveRuleDomains(state); err != nil {
+	if err := validateActiveRuleEntries(state); err != nil {
 		state.LastError = err.Error()
 		_, _ = h.state.Save(state)
 		h.recordEvent("error", "rules.apply_failed", err.Error())
@@ -1159,7 +1261,7 @@ func (h *Handler) applyCurrentRules(ctx context.Context) (applyResult, error) {
 	state.LastError = ""
 	_, _ = h.state.Save(state)
 
-	h.recordEvent("info", "rules.applied", fmt.Sprintf("Applied %d rules for %d domains", len(enabledRules), len(domainsToApply)))
+	h.recordEvent("info", "rules.applied", fmt.Sprintf("Applied %d rules for %d routing entries", len(enabledRules), len(domainsToApply)))
 	return applyResult{
 		Status:       "applied",
 		RulesApplied: len(enabledRules),
@@ -1421,7 +1523,13 @@ type activeRuleOwner struct {
 	Label    string
 }
 
-func validateRuleDomains(candidate config.Rule, providers []config.Provider, existingRules []config.Rule) error {
+type activeIPRange struct {
+	entry  string
+	prefix netip.Prefix
+	owner  activeRuleOwner
+}
+
+func validateRuleEntries(candidate config.Rule, providers []config.Provider, existingRules []config.Rule) error {
 	if !candidate.Enabled {
 		return nil
 	}
@@ -1432,13 +1540,8 @@ func validateRuleDomains(candidate config.Rule, providers []config.Provider, exi
 		return nil
 	}
 
-	candidateDomains := make(map[string]struct{}, len(candidate.Domains))
-	for _, domain := range candidate.Domains {
-		candidateDomains[domain] = struct{}{}
-	}
-	if len(candidateDomains) == 0 {
-		return nil
-	}
+	seen := make(map[string]activeRuleOwner)
+	ipRanges := make([]activeIPRange, 0, 8)
 
 	for _, existing := range existingRules {
 		if existing.ID == candidate.ID || !existing.Enabled {
@@ -1448,18 +1551,22 @@ func validateRuleDomains(candidate config.Rule, providers []config.Provider, exi
 		if !exists || !existingProvider.Enabled {
 			continue
 		}
-		for _, domain := range existing.Domains {
-			if _, exists := candidateDomains[domain]; exists {
-				return duplicateDomainError(
-					domain,
-					activeRuleOwner{RuleID: existing.ID, RuleName: existing.Name, Label: formatRuleLabel(existing, existingProvider)},
-					activeRuleOwner{RuleID: candidate.ID, RuleName: candidate.Name, Label: formatRuleLabel(candidate, provider)},
-				)
-			}
+		if err := registerActiveEntries(
+			existing.Domains,
+			activeRuleOwner{RuleID: existing.ID, RuleName: existing.Name, Label: formatRuleLabel(existing, existingProvider)},
+			seen,
+			&ipRanges,
+		); err != nil {
+			return err
 		}
 	}
 
-	return nil
+	return registerActiveEntries(
+		candidate.Domains,
+		activeRuleOwner{RuleID: candidate.ID, RuleName: candidate.Name, Label: formatRuleLabel(candidate, provider)},
+		seen,
+		&ipRanges,
+	)
 }
 
 func validateProviderActivation(candidate config.Provider, providers []config.Provider, rules []config.Rule) error {
@@ -1471,6 +1578,7 @@ func validateProviderActivation(candidate config.Provider, providers []config.Pr
 	providersByID[candidate.ID] = candidate
 
 	seen := make(map[string]activeRuleOwner)
+	ipRanges := make([]activeIPRange, 0, 8)
 	for _, rule := range rules {
 		if !rule.Enabled {
 			continue
@@ -1485,20 +1593,18 @@ func validateProviderActivation(candidate config.Provider, providers []config.Pr
 			RuleName: rule.Name,
 			Label:    formatRuleLabel(rule, provider),
 		}
-		for _, domain := range rule.Domains {
-			if previous, exists := seen[domain]; exists && previous.RuleID != owner.RuleID {
-				return duplicateDomainError(domain, previous, owner)
-			}
-			seen[domain] = owner
+		if err := registerActiveEntries(rule.Domains, owner, seen, &ipRanges); err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
-func validateActiveRuleDomains(state config.State) error {
+func validateActiveRuleEntries(state config.State) error {
 	providersByID := providersIndex(state.Providers)
 	seen := make(map[string]activeRuleOwner)
+	ipRanges := make([]activeIPRange, 0, 8)
 
 	for _, rule := range state.Rules {
 		if !rule.Enabled {
@@ -1514,11 +1620,8 @@ func validateActiveRuleDomains(state config.State) error {
 			RuleName: rule.Name,
 			Label:    formatRuleLabel(rule, provider),
 		}
-		for _, domain := range rule.Domains {
-			if previous, exists := seen[domain]; exists && previous.RuleID != owner.RuleID {
-				return duplicateDomainError(domain, previous, owner)
-			}
-			seen[domain] = owner
+		if err := registerActiveEntries(rule.Domains, owner, seen, &ipRanges); err != nil {
+			return err
 		}
 	}
 
@@ -1553,8 +1656,42 @@ func formatRuleLabel(rule config.Rule, provider config.Provider) string {
 	return "unknown route"
 }
 
-func duplicateDomainError(domain string, left activeRuleOwner, right activeRuleOwner) error {
-	return fmt.Errorf("domain %q is already assigned to %q and cannot also be used in %q", domain, left.Label, right.Label)
+func registerActiveEntries(entries []string, owner activeRuleOwner, seen map[string]activeRuleOwner, ipRanges *[]activeIPRange) error {
+	for _, entry := range entries {
+		if previous, exists := seen[entry]; exists && previous.RuleID != owner.RuleID {
+			return duplicateEntryError(entry, previous, owner)
+		}
+		if prefix, ok := domains.ParseIPPrefix(entry); ok {
+			for _, existing := range *ipRanges {
+				if existing.owner.RuleID == owner.RuleID {
+					continue
+				}
+				if prefixesOverlap(existing.prefix, prefix) {
+					return overlappingEntryError(entry, existing.entry, existing.owner, owner)
+				}
+			}
+			*ipRanges = append(*ipRanges, activeIPRange{
+				entry:  entry,
+				prefix: prefix,
+				owner:  owner,
+			})
+		}
+		seen[entry] = owner
+	}
+
+	return nil
+}
+
+func prefixesOverlap(left netip.Prefix, right netip.Prefix) bool {
+	return left.Contains(right.Addr()) || right.Contains(left.Addr())
+}
+
+func duplicateEntryError(entry string, left activeRuleOwner, right activeRuleOwner) error {
+	return fmt.Errorf("entry %q is already assigned to %q and cannot also be used in %q", entry, left.Label, right.Label)
+}
+
+func overlappingEntryError(entry string, existing string, left activeRuleOwner, right activeRuleOwner) error {
+	return fmt.Errorf("entry %q overlaps with %q already assigned to %q and cannot also be used in %q", entry, existing, left.Label, right.Label)
 }
 
 func splitDomains(raw string) []string {

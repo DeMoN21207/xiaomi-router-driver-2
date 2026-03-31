@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +22,7 @@ import (
 	"xiomi-router-driver/internal/config"
 	"xiomi-router-driver/internal/routing"
 	"xiomi-router-driver/internal/runtimebin"
+	"xiomi-router-driver/internal/runtimehealth"
 )
 
 type Manager struct {
@@ -46,17 +46,25 @@ type desiredInstance struct {
 	Entry    Entry
 }
 
+type applyPlan struct {
+	desired        desiredInstance
+	settings       config.RoutingSettings
+	domainListPath string
+	configPath     string
+	configData     []byte
+}
+
 type managedInstance struct {
-	Key           string
-	ProviderID    string
-	ProviderName  string
-	Location      string
-	InterfaceName string
-	DomainCount   int
-	ConfigPath    string
-	Settings      config.RoutingSettings
-	PID           int
-	cmd           *exec.Cmd
+	Key            string
+	ProviderID     string
+	ProviderName   string
+	Location       string
+	InterfaceName  string
+	DomainCount    int
+	ConfigPath     string
+	Settings       config.RoutingSettings
+	PID            int
+	cmd            *exec.Cmd
 	domainListPath string
 }
 
@@ -73,6 +81,7 @@ type RuntimeSnapshot struct {
 	DomainCount   int    `json:"domainCount"`
 	PID           int    `json:"pid"`
 	Status        string `json:"status"`
+	StatusDetail  string `json:"statusDetail,omitempty"`
 }
 
 type manifest struct {
@@ -115,26 +124,62 @@ func (m *Manager) Apply(ctx context.Context, state config.State, enabledRules []
 		return err
 	}
 
-	if err := m.cleanupLocked(context.Background()); err != nil {
-		return err
-	}
-
 	desired, err := m.buildDesired(state, enabledRules)
 	if err != nil {
 		return err
 	}
 	if len(desired) == 0 {
+		if err := m.cleanupLocked(ctx); err != nil {
+			return err
+		}
 		return m.pruneRuntimeFilesLocked()
 	}
 
-	for index, item := range desired {
-		instance, err := m.startDesiredInstance(item, state.Routing, index)
+	plans, err := m.buildApplyPlans(desired, state.Routing)
+	if err != nil {
+		return err
+	}
+
+	existingInstances, err := m.loadInstancesLocked()
+	if err != nil {
+		return err
+	}
+
+	reusable := make(map[string]*managedInstance, len(plans))
+	for _, plan := range plans {
+		if existing := m.loadReusableInstanceLocked(plan, existingInstances); existing != nil {
+			reusable[plan.desired.Key] = existing
+		}
+	}
+
+	for _, instance := range existingInstances {
+		if instance == nil {
+			continue
+		}
+		if _, keep := reusable[instance.Key]; keep {
+			continue
+		}
+		if err := m.stopInstanceLocked(ctx, instance); err != nil {
+			return err
+		}
+	}
+
+	for _, plan := range plans {
+		if existing := reusable[plan.desired.Key]; existing != nil {
+			if err := m.applyRoutingToInstanceLocked(ctx, existing, plan); err != nil {
+				_ = m.cleanupLocked(context.Background())
+				return fmt.Errorf("apply routing for %s: %w", plan.desired.Location, err)
+			}
+			continue
+		}
+
+		instance, err := m.startPlannedInstance(plan)
 		if err != nil {
 			_ = m.cleanupLocked(context.Background())
 			return err
 		}
 
-		m.current[item.Key] = instance
+		m.current[plan.desired.Key] = instance
 		if err := m.saveInstanceLocked(instance); err != nil {
 			_ = m.cleanupLocked(context.Background())
 			return err
@@ -142,19 +187,23 @@ func (m *Manager) Apply(ctx context.Context, state config.State, enabledRules []
 
 		if err := waitForInterface(instance.Settings.VPNIface, 5*time.Second); err != nil {
 			_ = m.cleanupLocked(context.Background())
-			return fmt.Errorf("wait for %s interface: %w", item.Location, err)
+			return fmt.Errorf("wait for %s interface: %w", plan.desired.Location, err)
 		}
 
 		if err := m.routing.RunWithOptions(ctx, "add", routing.RunOptions{
 			Settings:       instance.Settings,
-			DomainListPath: instance.domainListPath,
+			DomainListPath: plan.domainListPath,
 		}); err != nil {
 			_ = m.cleanupLocked(context.Background())
-			return fmt.Errorf("apply routing for %s: %w", item.Location, err)
+			return fmt.Errorf("apply routing for %s: %w", plan.desired.Location, err)
 		}
 
-		removeIfExists(instance.domainListPath)
+		removeIfExists(plan.domainListPath)
 		instance.domainListPath = ""
+		if err := m.saveInstanceLocked(instance); err != nil {
+			_ = m.cleanupLocked(context.Background())
+			return err
+		}
 	}
 
 	return m.pruneRuntimeFilesLocked()
@@ -189,7 +238,7 @@ func (m *Manager) Snapshots() ([]RuntimeSnapshot, error) {
 		if instance == nil {
 			continue
 		}
-		snapshots = append(snapshots, snapshotFromInstance(instance))
+		snapshots = append(snapshots, m.snapshotFromInstance(instance))
 	}
 
 	sort.Slice(snapshots, func(i, j int) bool {
@@ -202,66 +251,57 @@ func (m *Manager) Snapshots() ([]RuntimeSnapshot, error) {
 	return snapshots, nil
 }
 
-func (m *Manager) startDesiredInstance(item desiredInstance, base config.RoutingSettings, index int) (*managedInstance, error) {
-	hash := shortHash(item.Provider.ID + "\n" + item.Location)
-	settings := deriveRoutingSettings(base, hash, index)
-	domainListPath := filepath.Join(m.runtimeDir, hash+".domains.list")
-	configPath := filepath.Join(m.runtimeDir, hash+".json")
-
-	if err := writeDomainList(domainListPath, item.Domains); err != nil {
-		return nil, fmt.Errorf("write domain list for %s: %w", item.Location, err)
+func (m *Manager) startPlannedInstance(plan applyPlan) (*managedInstance, error) {
+	if err := writeDomainList(plan.domainListPath, plan.desired.Domains); err != nil {
+		return nil, fmt.Errorf("write domain list for %s: %w", plan.desired.Location, err)
 	}
 
-	configData, err := json.MarshalIndent(buildSingBoxConfig(settings.VPNIface, index, item.Entry.Outbound), "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("marshal sing-box config for %s: %w", item.Location, err)
-	}
-	configData = append(configData, '\n')
-	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
-		return nil, fmt.Errorf("write sing-box config for %s: %w", item.Location, err)
+	if err := os.WriteFile(plan.configPath, plan.configData, 0o600); err != nil {
+		removeIfExists(plan.domainListPath)
+		return nil, fmt.Errorf("write sing-box config for %s: %w", plan.desired.Location, err)
 	}
 
-	cmd := exec.Command(m.singBoxBinary, "run", "-c", configPath)
+	cmd := exec.Command(m.singBoxBinary, "run", "-c", plan.configPath)
 	cmd.Dir = m.runtimeDir
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		removeIfExists(domainListPath)
-		removeIfExists(configPath)
-		return nil, fmt.Errorf("prepare stdout for %s: %w", item.Location, err)
+		removeIfExists(plan.domainListPath)
+		removeIfExists(plan.configPath)
+		return nil, fmt.Errorf("prepare stdout for %s: %w", plan.desired.Location, err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		removeIfExists(domainListPath)
-		removeIfExists(configPath)
-		return nil, fmt.Errorf("prepare stderr for %s: %w", item.Location, err)
+		removeIfExists(plan.domainListPath)
+		removeIfExists(plan.configPath)
+		return nil, fmt.Errorf("prepare stderr for %s: %w", plan.desired.Location, err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		removeIfExists(domainListPath)
-		removeIfExists(configPath)
-		return nil, fmt.Errorf("start sing-box for %s: %w", item.Location, err)
+		removeIfExists(plan.domainListPath)
+		removeIfExists(plan.configPath)
+		return nil, fmt.Errorf("start sing-box for %s: %w", plan.desired.Location, err)
 	}
 
 	instance := &managedInstance{
-		Key:            item.Key,
-		ProviderID:     item.Provider.ID,
-		ProviderName:   item.Provider.Name,
-		Location:       item.Location,
-		InterfaceName:  settings.VPNIface,
-		DomainCount:    len(item.Domains),
-		ConfigPath:     configPath,
-		Settings:       settings,
+		Key:            plan.desired.Key,
+		ProviderID:     plan.desired.Provider.ID,
+		ProviderName:   plan.desired.Provider.Name,
+		Location:       plan.desired.Location,
+		InterfaceName:  plan.settings.VPNIface,
+		DomainCount:    len(plan.desired.Domains),
+		ConfigPath:     plan.configPath,
+		Settings:       plan.settings,
 		PID:            cmd.Process.Pid,
 		cmd:            cmd,
-		domainListPath: domainListPath,
+		domainListPath: plan.domainListPath,
 	}
 
-	go m.streamRuntimeLogs(item.Provider.Name, item.Location, stdoutPipe)
-	go m.streamRuntimeLogs(item.Provider.Name, item.Location, stderrPipe)
-	go m.watchInstance(item.Key, cmd)
+	go m.streamRuntimeLogs(plan.desired.Provider.Name, plan.desired.Location, stdoutPipe)
+	go m.streamRuntimeLogs(plan.desired.Provider.Name, plan.desired.Location, stderrPipe)
+	go m.watchInstance(plan.desired.Key, cmd)
 
-	m.record("info", "subscription.runtime_started", fmt.Sprintf("%s: %s started on %s", item.Provider.Name, item.Location, settings.VPNIface))
+	m.record("info", "subscription.runtime_started", fmt.Sprintf("%s: %s started on %s", plan.desired.Provider.Name, plan.desired.Location, plan.settings.VPNIface))
 	return instance, nil
 }
 
@@ -384,6 +424,134 @@ func (m *Manager) cleanupLocked(ctx context.Context) error {
 	return nil
 }
 
+func (m *Manager) buildApplyPlans(desired []desiredInstance, base config.RoutingSettings) ([]applyPlan, error) {
+	plans := make([]applyPlan, 0, len(desired))
+	for index, item := range desired {
+		hash := shortHash(item.Provider.ID + "\n" + item.Location)
+		settings := deriveRoutingSettings(base, hash, index)
+		configData, err := json.MarshalIndent(buildSingBoxConfig(settings.VPNIface, index, item.Entry.Outbound), "", "  ")
+		if err != nil {
+			return nil, fmt.Errorf("marshal sing-box config for %s: %w", item.Location, err)
+		}
+		configData = append(configData, '\n')
+
+		plans = append(plans, applyPlan{
+			desired:        item,
+			settings:       settings,
+			domainListPath: filepath.Join(m.runtimeDir, hash+".domains.list"),
+			configPath:     filepath.Join(m.runtimeDir, hash+".json"),
+			configData:     configData,
+		})
+	}
+	return plans, nil
+}
+
+func (m *Manager) loadReusableInstanceLocked(plan applyPlan, existing []*managedInstance) *managedInstance {
+	if current := m.current[plan.desired.Key]; current != nil {
+		if m.canReuseInstance(current, plan) {
+			return current
+		}
+		return nil
+	}
+
+	for _, instance := range existing {
+		if instance == nil || instance.Key != plan.desired.Key {
+			continue
+		}
+		if m.canReuseInstance(instance, plan) {
+			return instance
+		}
+		return nil
+	}
+
+	return nil
+}
+
+func (m *Manager) canReuseInstance(instance *managedInstance, plan applyPlan) bool {
+	if !sameRuntimeConfig(instance, plan) {
+		return false
+	}
+	if !runtimehealth.InterfaceAlive(instance.InterfaceName) {
+		return false
+	}
+	if instance.PID <= 0 {
+		return false
+	}
+	return runtimehealth.ProcessAlive(instance.PID, m.singBoxBinary, instance.ConfigPath)
+}
+
+func (m *Manager) applyRoutingToInstanceLocked(ctx context.Context, instance *managedInstance, plan applyPlan) error {
+	target := instance
+	if current := m.current[instance.Key]; current != nil {
+		target = current
+	}
+
+	if err := writeDomainList(plan.domainListPath, plan.desired.Domains); err != nil {
+		return fmt.Errorf("write domain list for %s: %w", plan.desired.Location, err)
+	}
+	defer removeIfExists(plan.domainListPath)
+
+	if err := m.routing.RunWithOptions(ctx, "sync", routing.RunOptions{
+		Settings:       plan.settings,
+		DomainListPath: plan.domainListPath,
+	}); err != nil {
+		if err := m.routing.RunWithOptions(ctx, "add", routing.RunOptions{
+			Settings:       plan.settings,
+			DomainListPath: plan.domainListPath,
+		}); err != nil {
+			return err
+		}
+	}
+
+	target.ProviderID = plan.desired.Provider.ID
+	target.ProviderName = plan.desired.Provider.Name
+	target.Location = plan.desired.Location
+	target.InterfaceName = plan.settings.VPNIface
+	target.DomainCount = len(plan.desired.Domains)
+	target.ConfigPath = plan.configPath
+	target.Settings = plan.settings
+	target.domainListPath = ""
+	return m.saveInstanceLocked(target)
+}
+
+func (m *Manager) stopInstanceLocked(ctx context.Context, instance *managedInstance) error {
+	if instance == nil {
+		return nil
+	}
+
+	var cleanupErrors []error
+	if current := m.current[instance.Key]; current != nil {
+		delete(m.current, instance.Key)
+		removeIfExists(current.domainListPath)
+		if current.cmd != nil && current.cmd.Process != nil {
+			_ = current.cmd.Process.Kill()
+		} else if current.PID > 0 {
+			process, findErr := os.FindProcess(current.PID)
+			if findErr == nil {
+				_ = process.Kill()
+			}
+		}
+	} else if instance.PID > 0 {
+		process, findErr := os.FindProcess(instance.PID)
+		if findErr == nil {
+			_ = process.Kill()
+		}
+	}
+
+	if err := m.routing.RunWithOptions(ctx, "del", routing.RunOptions{
+		Settings: instance.Settings,
+	}); err != nil {
+		cleanupErrors = append(cleanupErrors, err)
+	}
+	if err := m.deleteInstanceLocked(instance.Key); err != nil {
+		cleanupErrors = append(cleanupErrors, err)
+	}
+	removeIfExists(instance.ConfigPath)
+	removeIfExists(instance.domainListPath)
+
+	return errors.Join(cleanupErrors...)
+}
+
 func (m *Manager) buildDesired(state config.State, enabledRules []config.Rule) ([]desiredInstance, error) {
 	providersByID := make(map[string]config.Provider, len(state.Providers))
 	for _, provider := range state.Providers {
@@ -430,20 +598,34 @@ func (m *Manager) buildDesired(state config.State, enabledRules []config.Rule) (
 		return nil, nil
 	}
 
-	entriesByProvider := make(map[string][]Entry, len(groups))
+	activeGroups := make([]*desiredInstance, 0, len(groups))
 	for _, group := range groups {
+		if group == nil || len(group.Domains) == 0 {
+			continue
+		}
+		activeGroups = append(activeGroups, group)
+	}
+	if len(activeGroups) == 0 {
+		return nil, nil
+	}
+
+	entriesByProvider := make(map[string][]Entry, len(activeGroups))
+	for _, group := range activeGroups {
 		if _, loaded := entriesByProvider[group.Provider.ID]; loaded {
 			continue
 		}
-		entries, err := FetchEntries(group.Provider.Source)
+		entries, fetchMode, err := FetchEntriesCached(group.Provider.Source, m.runtimeDir)
 		if err != nil {
 			return nil, fmt.Errorf("load subscription %q: %w", group.Provider.Name, err)
+		}
+		if fetchMode == entriesFetchStaleCacheFallback {
+			m.record("warn", "subscription.source_cache_used", fmt.Sprintf("%s source is unavailable, using cached subscription snapshot", group.Provider.Name))
 		}
 		entriesByProvider[group.Provider.ID] = entries
 	}
 
-	desired := make([]desiredInstance, 0, len(groups))
-	for _, group := range groups {
+	desired := make([]desiredInstance, 0, len(activeGroups))
+	for _, group := range activeGroups {
 		entry, found := findEntry(entriesByProvider[group.Provider.ID], group.Location)
 		if !found {
 			return nil, fmt.Errorf("location %q not found in provider %q", group.Location, group.Provider.Name)
@@ -585,7 +767,7 @@ func tunAddress(index int) string {
 func waitForInterface(name string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if _, err := net.InterfaceByName(name); err == nil {
+		if runtimehealth.InterfaceAlive(name) {
 			return nil
 		}
 		time.Sleep(250 * time.Millisecond)
@@ -610,11 +792,13 @@ func findEntry(entries []Entry, location string) (Entry, bool) {
 	return Entry{}, false
 }
 
-func snapshotFromInstance(instance *managedInstance) RuntimeSnapshot {
-	status := "stopped"
-	if _, err := net.InterfaceByName(instance.InterfaceName); err == nil {
-		status = "running"
-	}
+func (m *Manager) snapshotFromInstance(instance *managedInstance) RuntimeSnapshot {
+	assessment := runtimehealth.Assess(runtimehealth.Check{
+		InterfaceName:        instance.InterfaceName,
+		PID:                  instance.PID,
+		ProcessMarkers:       []string{m.singBoxBinary, instance.ConfigPath},
+		EnableInterfaceProbe: false,
+	})
 
 	return RuntimeSnapshot{
 		Key:           instance.Key,
@@ -628,7 +812,8 @@ func snapshotFromInstance(instance *managedInstance) RuntimeSnapshot {
 		DNSMasqConfig: instance.Settings.DNSMasqConfigFile,
 		DomainCount:   instance.DomainCount,
 		PID:           instance.PID,
-		Status:        status,
+		Status:        assessment.Status,
+		StatusDetail:  assessment.Detail,
 	}
 }
 
@@ -661,12 +846,39 @@ func runtimeLogLevel(line string) string {
 }
 
 func shouldRecordRuntimeLog(line string, level string) bool {
-	if level != "info" {
-		return true
+	lower := strings.ToLower(strings.TrimSpace(line))
+	if strings.Contains(lower, "icmp is not supported by default outbound: proxy") {
+		return false
 	}
 
-	lower := strings.ToLower(strings.TrimSpace(line))
+	if level == "info" {
+		return false
+	}
+
 	return !strings.Contains(lower, "trace") && !strings.Contains(lower, "debug")
+}
+
+func sameRuntimeConfig(instance *managedInstance, plan applyPlan) bool {
+	if instance == nil {
+		return false
+	}
+	if instance.Key != plan.desired.Key ||
+		instance.ProviderID != plan.desired.Provider.ID ||
+		strings.TrimSpace(instance.Location) != strings.TrimSpace(plan.desired.Location) ||
+		strings.TrimSpace(instance.InterfaceName) != strings.TrimSpace(plan.settings.VPNIface) ||
+		filepath.Clean(strings.TrimSpace(instance.ConfigPath)) != filepath.Clean(strings.TrimSpace(plan.configPath)) ||
+		instance.Settings != plan.settings {
+		return false
+	}
+	return fileContentsEqual(plan.configPath, plan.configData)
+}
+
+func fileContentsEqual(path string, expected []byte) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return string(data) == string(expected)
 }
 
 func removeIfExists(path string) {

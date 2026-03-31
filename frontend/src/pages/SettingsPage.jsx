@@ -12,7 +12,6 @@ export default function SettingsPage() {
   const { t, lang, setLang } = useI18n();
   const [status, setStatus] = useState(null);
   const [config, setConfig] = useState(null);
-  const [domains, setDomains] = useState([]);
   const [domainTraffic, setDomainTraffic] = useState({ domains: [], totalBytes: 0, updatedAt: "" });
   const [routing, setRouting] = useState(null);
   const [automation, setAutomation] = useState({ installService: false, autoRecover: false });
@@ -39,17 +38,15 @@ export default function SettingsPage() {
 
     const loadInitial = async () => {
       try {
-        const [nextStatus, nextConfig, nextDomains, nextDomainTraffic] = await Promise.all([
+        const [nextStatus, nextConfig, nextDomainTraffic] = await Promise.all([
           fetchJSON("/api/status"),
           fetchJSON("/api/config"),
-          fetchJSON("/api/domains"),
           fetchJSON("/api/traffic/domains?sort=bytes&limit=10"),
         ]);
         if (!active) return;
 
         setStatus(nextStatus);
         setConfig(nextConfig);
-        setDomains(nextDomains.domains || []);
         setDomainTraffic(nextDomainTraffic || { domains: [], totalBytes: 0, updatedAt: "" });
         setRouting(nextConfig.routing || null);
         setAutomation(nextConfig.automation || { installService: false, autoRecover: false });
@@ -87,16 +84,14 @@ export default function SettingsPage() {
   const refreshAll = async () => {
     setRefreshing(true);
     try {
-      const [nextStatus, nextConfig, nextDomains, nextDomainTraffic] = await Promise.all([
+      const [nextStatus, nextConfig, nextDomainTraffic] = await Promise.all([
         fetchJSON("/api/status"),
         fetchJSON("/api/config"),
-        fetchJSON("/api/domains"),
         fetchJSON("/api/traffic/domains?sort=bytes&limit=10"),
       ]);
 
       setStatus(nextStatus);
       setConfig(nextConfig);
-      setDomains(nextDomains.domains || []);
       setDomainTraffic(nextDomainTraffic || { domains: [], totalBytes: 0, updatedAt: "" });
       setRouting(nextConfig.routing || null);
       setAutomation(nextConfig.automation || { installService: false, autoRecover: false });
@@ -328,7 +323,7 @@ export default function SettingsPage() {
                         <td className="px-4 py-2 text-xs text-outline-variant">
                           <RankBadge rank={idx + 1} />
                         </td>
-                        <td className="px-4 py-2 font-mono text-sm text-secondary">{item.domain}</td>
+                        <td className="px-4 py-2 font-mono text-sm text-on-surface">{item.domain}</td>
                         <td className="px-4 py-2 text-right font-mono text-sm text-on-surface">{formatBytes(item.bytes || 0)}</td>
                       </tr>
                     ))}
@@ -344,7 +339,7 @@ export default function SettingsPage() {
             <div className="space-y-3">
               <StatRow label={t("settings.providersCount")} value={providers.length} />
               <StatRow label={t("settings.activeRules")} value={rules.filter((rule) => rule.enabled).length} />
-              <StatRow label={t("settings.totalDomains")} value={domains.length} />
+              <StatRow label={t("settings.totalDomains")} value={status?.domainsCount ?? 0} />
               <StatRow label={t("settings.lastApply")} value={formatDate(status?.lastAppliedAt || config?.lastAppliedAt) || t("common.notYet")} />
               <StatRow label={t("settings.lastUpdate")} value={formatDate(config?.updatedAt) || "-"} />
             </div>
@@ -557,7 +552,7 @@ function RuntimeMeta({ label, value }) {
   return (
     <div className="rounded-lg bg-surface-container-high px-3 py-2">
       <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-outline">{label}</p>
-      <p className="font-mono text-sm text-secondary">{value}</p>
+      <p className="font-mono text-sm text-on-surface">{value}</p>
     </div>
   );
 }

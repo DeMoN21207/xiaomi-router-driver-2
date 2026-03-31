@@ -12,7 +12,6 @@ const TRAFFIC_HISTORY_RANGES = ["1h", "3h", "1d", "3d", "7d", "30d"];
 export default function DashboardPage() {
   const { t } = useI18n();
   const [status, setStatus] = useState(null);
-  const [config, setConfig] = useState(null);
   const [events, setEvents] = useState([]);
   const [trafficHistory, setTrafficHistory] = useState(null);
   const [historyRange, setHistoryRange] = useState("7d");
@@ -21,6 +20,7 @@ export default function DashboardPage() {
   const [autoRefreshMs, setAutoRefreshMs] = useState(() => readDashboardRefreshInterval());
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [rebooting, setRebooting] = useState(false);
   const [error, setError] = useState("");
   const refreshInFlightRef = useRef(false);
 
@@ -41,14 +41,12 @@ export default function DashboardPage() {
     if (initial) setLoading(true);
     else if (showBusy) setBusy(true);
     try {
-      const [nextStatus, nextConfig, nextEvents, nextTrafficHistory] = await Promise.all([
+      const [nextStatus, nextEvents, nextTrafficHistory] = await Promise.all([
         fetchJSON("/api/status"),
-        fetchJSON("/api/config"),
         fetchJSON("/api/events?limit=6"),
         fetchJSON(buildTrafficHistoryUrl(rangeKey, from, to)),
       ]);
       setStatus(nextStatus);
-      setConfig(nextConfig);
       setEvents(nextEvents.events || []);
       setTrafficHistory(nextTrafficHistory);
       setError("");
@@ -90,12 +88,11 @@ export default function DashboardPage() {
     return () => window.clearInterval(timerId);
   }, [autoRefreshMs, historyRange, refresh]);
 
-  const providers = config?.providers ?? [];
-  const rules = config?.rules ?? [];
+  const providers = status?.providers ?? [];
   const trafficRoutes = status?.trafficRoutes ?? [];
   const wanState = status?.wan?.state || "unknown";
   const activeVpns = providers.filter((provider) => provider.enabled).length;
-  const enabledRules = rules.filter((rule) => rule.enabled).length;
+  const enabledRules = status?.enabledRules ?? 0;
   const totalTrafficBytes = trafficRoutes.reduce((sum, route) => sum + (route.totalBytes || 0), 0);
 
   return (
@@ -120,6 +117,26 @@ export default function DashboardPage() {
             <Icon name="refresh" className={`h-4 w-4 text-primary shrink-0${busy ? " animate-spin" : ""}`} />
             <span className="min-w-[5.5em] text-center">{t("dashboard.refresh")}</span>
           </button>
+          <button
+            type="button"
+            onClick={async () => {
+              if (!window.confirm(t("dashboard.rebootConfirm"))) return;
+              setRebooting(true);
+              try {
+                await fetchJSON("/api/system/reboot", { method: "POST" });
+                setError("");
+              } catch (err) {
+                setError(err.message);
+              } finally {
+                setRebooting(false);
+              }
+            }}
+            disabled={rebooting}
+            className="flex items-center gap-2 rounded-xl border border-error/30 bg-surface-container-high px-5 py-2.5 font-headline text-sm font-medium text-error transition-colors hover:bg-error-container/20 disabled:opacity-50"
+          >
+            <Icon name="restart_alt" className={`h-4 w-4 shrink-0${rebooting ? " animate-spin" : ""}`} />
+            <span className="min-w-[5.5em] text-center">{rebooting ? t("dashboard.rebooting") : t("dashboard.reboot")}</span>
+          </button>
         </div>
       </div>
 
@@ -131,7 +148,7 @@ export default function DashboardPage() {
         <KpiCard label={t("dashboard.routingRules")} value={loading ? "..." : `${enabledRules} ${t("dashboard.active")}`} icon="alt_route" accent="tertiary" loading={loading} />
         <KpiCard
           label={t("dashboard.lastApply")}
-          value={formatDate(status?.lastAppliedAt || config?.lastAppliedAt) || t("dashboard.notYet")}
+          value={formatDate(status?.lastAppliedAt) || t("dashboard.notYet")}
           icon="schedule"
           accent="outline"
           loading={loading}
@@ -165,7 +182,7 @@ export default function DashboardPage() {
           ) : (
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
               {providers.map((provider) => (
-                <ProviderCard key={provider.id} provider={provider} runtime={status?.providers?.find((item) => item.id === provider.id)} t={t} />
+                <ProviderCard key={provider.id} provider={provider} t={t} />
               ))}
             </div>
           )}
@@ -515,7 +532,7 @@ function TrafficAnalyticsCard({ routes, totalTrafficBytes, history, range, loadi
               <div key={provider.key} className="rounded-xl bg-surface-container p-4">
                 <div className="mb-1 flex items-center justify-between gap-3">
                   <p className="font-headline text-sm font-bold text-on-surface">{provider.providerName}</p>
-                  <p className="font-mono text-xs text-secondary">{formatBytes(provider.totalBytes)}</p>
+                  <p className="font-mono text-xs text-on-surface">{formatBytes(provider.totalBytes)}</p>
                 </div>
                 <p className="text-xs text-on-surface-variant">
                   {provider.routeCount} {t("dashboard.regionsActive")} · {t(`common.${provider.providerType}`)}
@@ -694,13 +711,13 @@ function MetricPill({ label, value }) {
   );
 }
 
-function ProviderCard({ provider, runtime, t }) {
+function ProviderCard({ provider, t }) {
   const navigate = useNavigate();
-  const tone = !provider.enabled ? "outline" : runtime?.health === "ready" ? "secondary" : runtime?.health === "warning" ? "tertiary" : "error";
+  const tone = !provider.enabled ? "outline" : provider.health === "ready" ? "secondary" : provider.health === "warning" ? "tertiary" : "error";
   const toneClasses = statusToneClasses(tone);
-  const isOnline = provider.enabled && runtime?.health === "ready";
+  const isOnline = provider.enabled && provider.health === "ready";
   const hasError = provider.enabled && !isOnline;
-  const errorMessage = runtime?.lastError || runtime?.message || runtime?.healthDetails || "";
+  const errorMessage = provider.healthDetails || "";
 
   return (
     <div
@@ -732,7 +749,7 @@ function ProviderCard({ provider, runtime, t }) {
         </div>
         <div>
           <p className="mb-1 text-[10px] uppercase tracking-tighter text-outline-variant">{t("dashboard.source")}</p>
-          <p className="truncate font-mono text-xs text-secondary">{provider.source}</p>
+          <p className="truncate font-mono text-xs text-on-surface">{provider.source}</p>
         </div>
       </div>
     </div>
@@ -756,7 +773,7 @@ function TrafficBreakdownPanel({ title, items, totalBytes, emptyLabel }) {
                     <p className="font-headline text-sm font-bold text-on-surface">{item.title}</p>
                     <p className="text-xs text-on-surface-variant">{item.subtitle}</p>
                   </div>
-                  <p className="font-mono text-xs text-secondary">{formatBytes(item.totalBytes || 0)}</p>
+                  <p className="font-mono text-xs text-on-surface">{formatBytes(item.totalBytes || 0)}</p>
                 </div>
                 <div className="h-2 overflow-hidden rounded-full bg-surface-container-lowest/70">
                   <div className="h-full rounded-full bg-gradient-to-r from-primary via-secondary to-tertiary" style={{ width: `${share}%` }} />
@@ -774,7 +791,7 @@ function TrafficMeta({ label, value }) {
   return (
     <div>
       <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-outline">{label}</p>
-      <p className="font-mono text-sm text-secondary">{value}</p>
+      <p className="font-mono text-sm text-on-surface">{value}</p>
     </div>
   );
 }

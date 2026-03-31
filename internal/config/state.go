@@ -152,6 +152,104 @@ func (m *Manager) Save(state State) (State, error) {
 	return state, nil
 }
 
+func (m *Manager) UpdateRule(rule Rule) (Rule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := m.ensureReadyUnlocked(); err != nil {
+		return Rule{}, err
+	}
+
+	normalized := normalizeRules([]Rule{rule})
+	if len(normalized) == 0 {
+		return Rule{}, errors.New("rule is invalid")
+	}
+	rule = normalized[0]
+	updatedAt := time.Now().UTC().Format(time.RFC3339)
+
+	tx, err := m.db.Begin()
+	if err != nil {
+		return Rule{}, err
+	}
+
+	result, err := tx.Exec(`
+		UPDATE rules
+		SET name = ?, provider_id = ?, selected_location = ?, enabled = ?
+		WHERE id = ?
+	`, rule.Name, rule.ProviderID, rule.SelectedLocation, boolToInt(rule.Enabled), rule.ID)
+	if err != nil {
+		_ = tx.Rollback()
+		return Rule{}, err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		_ = tx.Rollback()
+		return Rule{}, err
+	}
+	if rowsAffected == 0 {
+		_ = tx.Rollback()
+		return Rule{}, sql.ErrNoRows
+	}
+
+	if err := replaceRuleDomainsTx(tx, rule.ID, rule.Domains); err != nil {
+		_ = tx.Rollback()
+		return Rule{}, err
+	}
+	if err := saveMetaTx(tx, "updatedAt", updatedAt); err != nil {
+		_ = tx.Rollback()
+		return Rule{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Rule{}, err
+	}
+
+	return rule, nil
+}
+
+func (m *Manager) DeleteRule(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := m.ensureReadyUnlocked(); err != nil {
+		return err
+	}
+
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return sql.ErrNoRows
+	}
+
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+
+	var position int
+	if err := tx.QueryRow(`SELECT position FROM rules WHERE id = ?`, id).Scan(&position); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	if _, err := tx.Exec(`DELETE FROM rule_domains WHERE rule_id = ?`, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM rules WHERE id = ?`, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE rules SET position = position - 1 WHERE position > ?`, position); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := saveMetaTx(tx, "updatedAt", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
 func (m *Manager) ensureReadyUnlocked() error {
 	if m.initialized {
 		return m.initErr
@@ -331,13 +429,8 @@ func saveStateTx(tx *sql.Tx, state State) error {
 			return err
 		}
 
-		for domainIndex, domain := range rule.Domains {
-			if _, err := tx.Exec(`
-				INSERT INTO rule_domains (rule_id, domain, position)
-				VALUES (?, ?, ?)
-			`, rule.ID, domain, domainIndex); err != nil {
-				return err
-			}
+		if err := replaceRuleDomainsTx(tx, rule.ID, rule.Domains); err != nil {
+			return err
 		}
 	}
 
@@ -377,16 +470,38 @@ func saveStateTx(tx *sql.Tx, state State) error {
 		"lastError":     state.LastError,
 		"updatedAt":     state.UpdatedAt,
 	} {
-		if _, err := tx.Exec(`
-			INSERT INTO app_meta (key, value)
-			VALUES (?, ?)
-			ON CONFLICT(key) DO UPDATE SET value = excluded.value
-		`, key, value); err != nil {
+		if err := saveMetaTx(tx, key, value); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+func replaceRuleDomainsTx(tx *sql.Tx, ruleID string, domains []string) error {
+	if _, err := tx.Exec(`DELETE FROM rule_domains WHERE rule_id = ?`, ruleID); err != nil {
+		return err
+	}
+
+	for domainIndex, domain := range domains {
+		if _, err := tx.Exec(`
+			INSERT INTO rule_domains (rule_id, domain, position)
+			VALUES (?, ?, ?)
+		`, ruleID, domain, domainIndex); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func saveMetaTx(tx *sql.Tx, key string, value string) error {
+	_, err := tx.Exec(`
+		INSERT INTO app_meta (key, value)
+		VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, key, value)
+	return err
 }
 
 func (m *Manager) loadUnlocked() (State, error) {

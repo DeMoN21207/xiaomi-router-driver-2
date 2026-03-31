@@ -453,7 +453,7 @@ export default function TrafficStatsPage() {
                           <td className="px-5 py-3">
                             <RouteBadge item={item} t={t} />
                           </td>
-                          <td className="px-5 py-3 text-right font-mono text-secondary">{formatBytes(item.bytes)}</td>
+                          <td className="px-5 py-3 text-right font-mono text-on-surface">{formatBytes(item.bytes)}</td>
                           <td className="hidden px-5 py-3 text-right font-mono text-outline-variant lg:table-cell">
                             {item.packets.toLocaleString()}
                           </td>

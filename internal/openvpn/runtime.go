@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +18,7 @@ import (
 	"xiomi-router-driver/internal/config"
 	"xiomi-router-driver/internal/routing"
 	"xiomi-router-driver/internal/runtimebin"
+	"xiomi-router-driver/internal/runtimehealth"
 )
 
 type Manager struct {
@@ -58,6 +58,7 @@ type RuntimeSnapshot struct {
 	DomainCount   int    `json:"domainCount"`
 	PID           int    `json:"pid"`
 	Status        string `json:"status"`
+	StatusDetail  string `json:"statusDetail,omitempty"`
 }
 
 func NewManager(appDir string, dataDir string, db *sql.DB, routingRunner *routing.Runner, recordEvent func(level string, kind string, message string)) *Manager {
@@ -82,15 +83,6 @@ func (m *Manager) Apply(ctx context.Context, provider config.Provider, domains [
 		return err
 	}
 
-	if err := m.cleanupLocked(context.Background()); err != nil {
-		return err
-	}
-
-	openvpnBinary, err := exec.LookPath(strings.TrimSpace(m.openvpnBinary))
-	if err != nil {
-		return fmt.Errorf("openvpn binary is not available: %w", err)
-	}
-
 	profilePath, err := resolveProfilePath(provider.Source, m.dataDir)
 	if err != nil {
 		return err
@@ -98,7 +90,29 @@ func (m *Manager) Apply(ctx context.Context, provider config.Provider, domains [
 
 	normalizedDomains := normalizeDomains(domains)
 	if len(normalizedDomains) == 0 {
+		return m.cleanupLocked(ctx)
+	}
+
+	existing, err := m.loadReusableInstanceLocked(provider.ID, profilePath, settings)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		if err := m.applyRoutingToInstanceLocked(ctx, existing, provider, profilePath, settings, normalizedDomains); err != nil {
+			_ = m.cleanupLocked(context.Background())
+			return fmt.Errorf("apply openvpn routing for %s: %w", provider.Name, err)
+		}
+		m.record("info", "openvpn.routing_updated", fmt.Sprintf("%s routing updated on %s", provider.Name, settings.VPNIface))
 		return nil
+	}
+
+	if err := m.cleanupLocked(context.Background()); err != nil {
+		return err
+	}
+
+	openvpnBinary, err := exec.LookPath(strings.TrimSpace(m.openvpnBinary))
+	if err != nil {
+		return fmt.Errorf("openvpn binary is not available: %w", err)
 	}
 
 	domainListPath := filepath.Join(m.runtimeDir, "openvpn-"+provider.ID+".domains.list")
@@ -244,7 +258,7 @@ func (m *Manager) Snapshots() ([]RuntimeSnapshot, error) {
 		if instance == nil {
 			continue
 		}
-		snapshots = append(snapshots, snapshotFromInstance(instance))
+		snapshots = append(snapshots, m.snapshotFromInstance(instance))
 	}
 
 	sort.Slice(snapshots, func(i, j int) bool {
@@ -371,11 +385,13 @@ func (m *Manager) streamRuntimeLogs(providerName string, reader io.Reader) {
 	}
 }
 
-func snapshotFromInstance(instance *managedInstance) RuntimeSnapshot {
-	status := "stopped"
-	if _, err := net.InterfaceByName(instance.InterfaceName); err == nil {
-		status = "running"
-	}
+func (m *Manager) snapshotFromInstance(instance *managedInstance) RuntimeSnapshot {
+	assessment := runtimehealth.Assess(runtimehealth.Check{
+		InterfaceName:        instance.InterfaceName,
+		PID:                  instance.PID,
+		ProcessMarkers:       []string{m.openvpnBinary, instance.ProfilePath, instance.InterfaceName},
+		EnableInterfaceProbe: true,
+	})
 
 	return RuntimeSnapshot{
 		ProviderID:    instance.ProviderID,
@@ -388,7 +404,8 @@ func snapshotFromInstance(instance *managedInstance) RuntimeSnapshot {
 		DNSMasqConfig: instance.Settings.DNSMasqConfigFile,
 		DomainCount:   instance.DomainCount,
 		PID:           instance.PID,
-		Status:        status,
+		Status:        assessment.Status,
+		StatusDetail:  assessment.Detail,
 	}
 }
 
@@ -443,7 +460,7 @@ func writeDomainList(path string, domains []string) error {
 func waitForInterface(name string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if _, err := net.InterfaceByName(name); err == nil {
+		if runtimehealth.InterfaceAlive(name) {
 			return nil
 		}
 		time.Sleep(250 * time.Millisecond)
@@ -452,12 +469,88 @@ func waitForInterface(name string, timeout time.Duration) error {
 }
 
 func interfaceExists(name string) bool {
-	name = strings.TrimSpace(name)
-	if name == "" {
+	return runtimehealth.InterfaceAlive(name)
+}
+
+func (m *Manager) loadReusableInstanceLocked(providerID string, profilePath string, settings config.RoutingSettings) (*managedInstance, error) {
+	if current := m.current[providerID]; current != nil {
+		if m.canReuseInstance(current, profilePath, settings) {
+			return current, nil
+		}
+		return nil, nil
+	}
+
+	instances, err := m.loadInstancesLocked()
+	if err != nil {
+		return nil, err
+	}
+	for _, instance := range instances {
+		if instance == nil || instance.ProviderID != providerID {
+			continue
+		}
+		if m.canReuseInstance(instance, profilePath, settings) {
+			return instance, nil
+		}
+		return nil, nil
+	}
+
+	return nil, nil
+}
+
+func (m *Manager) canReuseInstance(instance *managedInstance, profilePath string, settings config.RoutingSettings) bool {
+	if !sameRuntimeConfig(instance, profilePath, settings) {
 		return false
 	}
-	_, err := net.InterfaceByName(name)
-	return err == nil
+	if !runtimehealth.InterfaceAlive(instance.InterfaceName) {
+		return false
+	}
+	if instance.PID <= 0 {
+		return true
+	}
+	return runtimehealth.ProcessAlive(instance.PID, m.openvpnBinary, instance.ProfilePath, instance.InterfaceName)
+}
+
+func (m *Manager) applyRoutingToInstanceLocked(ctx context.Context, instance *managedInstance, provider config.Provider, profilePath string, settings config.RoutingSettings, domains []string) error {
+	target := instance
+	if current := m.current[instance.ProviderID]; current != nil {
+		target = current
+	}
+
+	domainListPath := filepath.Join(m.runtimeDir, "openvpn-"+target.ProviderID+".domains.list")
+	if err := writeDomainList(domainListPath, domains); err != nil {
+		return fmt.Errorf("write openvpn domain list: %w", err)
+	}
+	defer removeIfExists(domainListPath)
+
+	if err := m.routing.RunWithOptions(ctx, "sync", routing.RunOptions{
+		Settings:       settings,
+		DomainListPath: domainListPath,
+	}); err != nil {
+		if err := m.routing.RunWithOptions(ctx, "add", routing.RunOptions{
+			Settings:       settings,
+			DomainListPath: domainListPath,
+		}); err != nil {
+			return err
+		}
+	}
+
+	target.ProviderID = provider.ID
+	target.ProviderName = provider.Name
+	target.InterfaceName = settings.VPNIface
+	target.ProfilePath = profilePath
+	target.Settings = settings
+	target.DomainCount = len(domains)
+	target.domainListPath = ""
+	return m.saveInstanceLocked(target)
+}
+
+func sameRuntimeConfig(instance *managedInstance, profilePath string, settings config.RoutingSettings) bool {
+	if instance == nil {
+		return false
+	}
+	return strings.TrimSpace(instance.InterfaceName) == strings.TrimSpace(settings.VPNIface) &&
+		filepath.Clean(strings.TrimSpace(instance.ProfilePath)) == filepath.Clean(strings.TrimSpace(profilePath)) &&
+		instance.Settings == settings
 }
 
 func runtimeLogLevel(line string) string {
@@ -473,8 +566,8 @@ func runtimeLogLevel(line string) string {
 }
 
 func shouldRecordRuntimeLog(line string, level string) bool {
-	if level != "info" {
-		return true
+	if level == "info" {
+		return false
 	}
 
 	lower := strings.ToLower(strings.TrimSpace(line))

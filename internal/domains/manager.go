@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,6 +15,16 @@ import (
 )
 
 var domainPattern = regexp.MustCompile(`^[a-z0-9.-]+$`)
+var ipv4ishPattern = regexp.MustCompile(`^[0-9./:]+$`)
+
+type EntryKind string
+
+const (
+	EntryKindDomain EntryKind = "domain"
+	EntryKindIP     EntryKind = "ip"
+)
+
+var errNotIPEntry = errors.New("not an ip entry")
 
 type Manager struct {
 	db          *sql.DB
@@ -47,6 +58,28 @@ func (m *Manager) List() ([]string, error) {
 	return m.listUnlocked()
 }
 
+func (m *Manager) Count() (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := m.ensureReadyLocked(); err != nil {
+		return 0, err
+	}
+
+	return m.countUnlocked()
+}
+
+func (m *Manager) CountDomains() (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := m.ensureReadyLocked(); err != nil {
+		return 0, err
+	}
+
+	return m.countDomainsUnlocked()
+}
+
 func (m *Manager) Add(domain string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -55,7 +88,7 @@ func (m *Manager) Add(domain string) error {
 		return err
 	}
 
-	normalized, err := normalizeDomain(domain)
+	normalized, _, err := NormalizeEntry(domain)
 	if err != nil {
 		return err
 	}
@@ -93,7 +126,7 @@ func (m *Manager) Delete(domain string) error {
 		return err
 	}
 
-	normalized, err := normalizeDomain(domain)
+	normalized, _, err := NormalizeEntry(domain)
 	if err != nil {
 		return err
 	}
@@ -189,10 +222,50 @@ func (m *Manager) listUnlocked() ([]string, error) {
 	return result, nil
 }
 
+func (m *Manager) countUnlocked() (int, error) {
+	var count int
+	if err := m.db.QueryRow(`SELECT COUNT(1) FROM current_domains`).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (m *Manager) countDomainsUnlocked() (int, error) {
+	rows, err := m.db.Query(`SELECT domain FROM current_domains`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		var entry string
+		if err := rows.Scan(&entry); err != nil {
+			return 0, err
+		}
+		if !IsIPEntry(entry) {
+			count++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	return count, nil
+}
+
 func (m *Manager) replaceAllUnlocked(domains []string) error {
 	normalized, err := normalizeDomainList(domains)
 	if err != nil {
 		return err
+	}
+
+	existing, err := m.listUnlocked()
+	if err != nil {
+		return err
+	}
+	if sameDomainList(existing, normalized) {
+		return m.syncRuntimeFile(normalized)
 	}
 
 	tx, err := m.db.Begin()
@@ -242,7 +315,7 @@ func normalizeDomainList(domains []string) ([]string, error) {
 	result := make([]string, 0, len(domains))
 	seen := make(map[string]struct{}, len(domains))
 	for _, domain := range domains {
-		normalized, err := normalizeDomain(domain)
+		normalized, _, err := NormalizeEntry(domain)
 		if err != nil {
 			return nil, err
 		}
@@ -255,11 +328,23 @@ func normalizeDomainList(domains []string) ([]string, error) {
 	return result, nil
 }
 
+func sameDomainList(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func NormalizeEntries(domains []string) []string {
 	result := make([]string, 0, len(domains))
 	seen := make(map[string]struct{}, len(domains))
 	for _, domain := range domains {
-		normalized, err := normalizeDomain(domain)
+		normalized, _, err := NormalizeEntry(domain)
 		if err != nil {
 			continue
 		}
@@ -290,8 +375,8 @@ func SplitInput(raw string) []string {
 	return NormalizeEntries(items)
 }
 
-func normalizeDomain(domain string) (string, error) {
-	normalized := strings.ToLower(strings.TrimSpace(domain))
+func NormalizeEntry(value string) (string, EntryKind, error) {
+	normalized := strings.ToLower(strings.TrimSpace(value))
 	normalized, _, _ = strings.Cut(normalized, "#")
 	normalized = strings.TrimSpace(normalized)
 	normalized = strings.TrimPrefix(normalized, "https://")
@@ -299,15 +384,91 @@ func normalizeDomain(domain string) (string, error) {
 	if at := strings.LastIndex(normalized, "@"); at >= 0 {
 		normalized = normalized[at+1:]
 	}
+	normalized = strings.TrimSpace(strings.Trim(normalized, "/"))
+
+	if normalized == "" {
+		return "", "", errors.New("entry is required")
+	}
+
+	if ipEntry, err := normalizeIPEntry(normalized); err == nil {
+		return ipEntry, EntryKindIP, nil
+	} else if !errors.Is(err, errNotIPEntry) {
+		return "", "", err
+	}
+
+	domain, err := normalizeDomainCandidate(normalized)
+	if err != nil {
+		return "", "", err
+	}
+	return domain, EntryKindDomain, nil
+}
+
+func IsIPEntry(value string) bool {
+	_, kind, err := NormalizeEntry(value)
+	return err == nil && kind == EntryKindIP
+}
+
+func ParseIPPrefix(value string) (netip.Prefix, bool) {
+	normalized, kind, err := NormalizeEntry(value)
+	if err != nil || kind != EntryKindIP {
+		return netip.Prefix{}, false
+	}
+
+	if prefix, err := netip.ParsePrefix(normalized); err == nil && prefix.Addr().Is4() {
+		return prefix.Masked(), true
+	}
+	if addr, err := netip.ParseAddr(normalized); err == nil && addr.Is4() {
+		return netip.PrefixFrom(addr, addr.BitLen()), true
+	}
+
+	return netip.Prefix{}, false
+}
+
+func normalizeIPEntry(raw string) (string, error) {
+	candidate := stripHostPort(raw)
+
+	if prefix, err := netip.ParsePrefix(candidate); err == nil {
+		if !prefix.Addr().Is4() {
+			return "", errors.New("only IPv4 addresses and CIDR ranges are supported")
+		}
+		return prefix.Masked().String(), nil
+	}
+	if addr, err := netip.ParseAddr(candidate); err == nil {
+		if !addr.Is4() {
+			return "", errors.New("only IPv4 addresses and CIDR ranges are supported")
+		}
+		return addr.String(), nil
+	}
+	if looksLikeIPv4Entry(candidate) {
+		return "", errors.New("invalid IPv4 address or CIDR range")
+	}
+
+	return "", errNotIPEntry
+}
+
+func looksLikeIPv4Entry(value string) bool {
+	if value == "" || !ipv4ishPattern.MatchString(value) {
+		return false
+	}
+	return strings.Count(value, ".") == 3
+}
+
+func stripHostPort(value string) string {
+	if host, port, err := net.SplitHostPort(value); err == nil && port != "" {
+		return host
+	}
+	if host, port, ok := strings.Cut(value, ":"); ok && port != "" && strings.IndexByte(port, '.') < 0 {
+		if _, err := strconv.Atoi(port); err == nil {
+			return host
+		}
+	}
+	return value
+}
+
+func normalizeDomainCandidate(domain string) (string, error) {
+	normalized := stripHostPort(domain)
 	if slash := strings.Index(normalized, "/"); slash >= 0 {
 		normalized = normalized[:slash]
-	}
-	if host, port, err := net.SplitHostPort(normalized); err == nil && port != "" {
-		normalized = host
-	} else if host, port, ok := strings.Cut(normalized, ":"); ok && port != "" && strings.IndexByte(port, '.') < 0 {
-		if _, err := strconv.Atoi(port); err == nil {
-			normalized = host
-		}
 	}
 	normalized = strings.TrimSpace(strings.Trim(normalized, "/"))
 
@@ -370,7 +531,7 @@ func parseDomainLine(line string) (string, bool) {
 		return "", false
 	}
 
-	normalized, err := normalizeDomain(trimmed)
+	normalized, _, err := NormalizeEntry(trimmed)
 	if err != nil {
 		return "", false
 	}

@@ -5,13 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 )
 
 const maxSubscriptionBodySize = 2 * 1024 * 1024
@@ -24,27 +21,11 @@ type Entry struct {
 }
 
 func FetchEntries(source string) ([]Entry, error) {
-	if _, err := url.ParseRequestURI(source); err != nil {
-		return nil, fmt.Errorf("invalid subscription URL: %w", err)
-	}
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(source)
+	raw, err := fetchEntriesRaw(source)
 	if err != nil {
-		return nil, fmt.Errorf("load subscription: %w", err)
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("subscription server returned %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBodySize))
-	if err != nil {
-		return nil, fmt.Errorf("read subscription response: %w", err)
-	}
-
-	return ParseEntries(string(body))
+	return ParseEntries(raw)
 }
 
 func ParseEntries(raw string) ([]Entry, error) {

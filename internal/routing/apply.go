@@ -65,6 +65,7 @@ func (r *Runner) RunWithOptions(ctx context.Context, action string, options RunO
 	cmd.Dir = r.workingDir
 	cmd.Env = withEnvMap(os.Environ(), map[string]string{
 		"DOMAIN_LIST":               domainListPath,
+		"DOMAIN_STATS_MAX_DOMAINS":  strconv.Itoa(DomainStatsMaxDomains()),
 		"VPN_GATEWAY":               options.Settings.VPNGateway,
 		"VPN_ROUTE_MODE":            options.Settings.VPNRouteMode,
 		"VPN_MASQUERADE":            boolToScriptValue(options.Settings.VPNMasquerade),

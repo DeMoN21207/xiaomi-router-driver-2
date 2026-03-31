@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"xiomi-router-driver/internal/config"
+	"xiomi-router-driver/internal/openvpn"
 	"xiomi-router-driver/internal/subscription"
 )
 
@@ -201,6 +202,13 @@ func (s *Service) TrafficRoutes() ([]TrafficRoute, error) {
 	}
 
 	_, _, domainsByProvider := summarizeEnabledRules(state)
+	openvpnRuntime := []openvpn.RuntimeSnapshot{}
+	if s.openvpn != nil {
+		openvpnRuntime, err = s.openvpn.Snapshots()
+		if err != nil {
+			return nil, err
+		}
+	}
 	subscriptionRuntime := []subscription.RuntimeSnapshot{}
 	if s.subscriptions != nil {
 		subscriptionRuntime, err = s.subscriptions.Snapshots()
@@ -209,7 +217,7 @@ func (s *Service) TrafficRoutes() ([]TrafficRoute, error) {
 		}
 	}
 
-	return buildTrafficRoutes(state, subscriptionRuntime, domainsByProvider), nil
+	return buildTrafficRoutes(state, openvpnRuntime, subscriptionRuntime, domainsByProvider), nil
 }
 
 func (s *Service) TrafficHistory(rangeName string) (TrafficHistoryResponse, error) {

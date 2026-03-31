@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"xiomi-router-driver/internal/sqlitedb"
 )
@@ -102,6 +103,103 @@ func TestManagerMigratesLegacyJSON(t *testing.T) {
 	}
 	if loaded.LastError != "legacy" {
 		t.Fatalf("expected migrated meta, got %+v", loaded)
+	}
+}
+
+func TestManagerUpdateRuleSQLite(t *testing.T) {
+	db := openTestDB(t)
+	manager := NewManager(db, filepath.Join(t.TempDir(), "vpn-state.json"))
+
+	state := State{
+		Providers: []Provider{
+			{ID: "provider_1", Name: "Fizz", Type: ProviderTypeSubscription, Source: "https://example.com/sub", Enabled: true},
+		},
+		Rules: []Rule{
+			{ID: "rule_1", Name: "OpenAI", ProviderID: "provider_1", SelectedLocation: "USA", Domains: []string{"openai.com"}, Enabled: true},
+			{ID: "rule_2", Name: "Media", ProviderID: "provider_1", SelectedLocation: "NL", Domains: []string{"youtube.com"}, Enabled: true},
+		},
+		Routing:    DefaultRoutingSettings(),
+		Automation: DefaultAutomationSettings(),
+	}
+
+	saved, err := manager.Save(state)
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+
+	updated, err := manager.UpdateRule(Rule{
+		ID:               "rule_2",
+		Name:             "Media Updated",
+		ProviderID:       "provider_1",
+		SelectedLocation: "NL",
+		Domains:          []string{"YouTube.com", "googlevideo.com"},
+		Enabled:          true,
+	})
+	if err != nil {
+		t.Fatalf("UpdateRule() error = %v", err)
+	}
+	if updated.Name != "Media Updated" {
+		t.Fatalf("unexpected updated rule: %+v", updated)
+	}
+
+	loaded, err := manager.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if len(loaded.Rules) != 2 {
+		t.Fatalf("expected 2 rules, got %+v", loaded.Rules)
+	}
+	if loaded.Rules[1].Name != "Media Updated" {
+		t.Fatalf("expected second rule to be updated, got %+v", loaded.Rules[1])
+	}
+	if len(loaded.Rules[1].Domains) != 2 || loaded.Rules[1].Domains[0] != "youtube.com" || loaded.Rules[1].Domains[1] != "googlevideo.com" {
+		t.Fatalf("expected normalized updated domains, got %+v", loaded.Rules[1].Domains)
+	}
+	if loaded.Rules[0].Name != state.Rules[0].Name {
+		t.Fatalf("unexpected first rule mutation: %+v", loaded.Rules[0])
+	}
+	if loaded.UpdatedAt == "" || loaded.UpdatedAt == saved.UpdatedAt {
+		t.Fatalf("expected updatedAt to change, before=%q after=%q", saved.UpdatedAt, loaded.UpdatedAt)
+	}
+}
+
+func TestManagerDeleteRuleSQLite(t *testing.T) {
+	db := openTestDB(t)
+	manager := NewManager(db, filepath.Join(t.TempDir(), "vpn-state.json"))
+
+	state := State{
+		Providers: []Provider{
+			{ID: "provider_1", Name: "Fizz", Type: ProviderTypeSubscription, Source: "https://example.com/sub", Enabled: true},
+		},
+		Rules: []Rule{
+			{ID: "rule_1", Name: "First", ProviderID: "provider_1", SelectedLocation: "USA", Domains: []string{"openai.com"}, Enabled: true},
+			{ID: "rule_2", Name: "Second", ProviderID: "provider_1", SelectedLocation: "NL", Domains: []string{"youtube.com"}, Enabled: true},
+		},
+		Routing:    DefaultRoutingSettings(),
+		Automation: DefaultAutomationSettings(),
+	}
+
+	if _, err := manager.Save(state); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	if err := manager.DeleteRule("rule_1"); err != nil {
+		t.Fatalf("DeleteRule() error = %v", err)
+	}
+
+	loaded, err := manager.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if len(loaded.Rules) != 1 {
+		t.Fatalf("expected 1 rule after delete, got %+v", loaded.Rules)
+	}
+	if loaded.Rules[0].ID != "rule_2" || loaded.Rules[0].Name != "Second" {
+		t.Fatalf("expected remaining rule to keep order, got %+v", loaded.Rules[0])
 	}
 }
 

@@ -7,7 +7,6 @@ import (
 	"log"
 	"os/exec"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -137,10 +136,15 @@ func (s *Service) activeDomainStatsChains() []string {
 	var chains []string
 
 	// Main routing ipset -> chain
-	mainChain := routing.DomainStatsChainName(state.Routing.IPSetName)
-	if !seen[mainChain] {
-		seen[mainChain] = true
-		chains = append(chains, mainChain)
+	if s.domains != nil {
+		domainCount, countErr := s.domains.CountDomains()
+		if countErr == nil && routing.DomainStatsEnabled(domainCount) {
+			mainChain := routing.DomainStatsChainName(state.Routing.IPSetName)
+			if !seen[mainChain] {
+				seen[mainChain] = true
+				chains = append(chains, mainChain)
+			}
+		}
 	}
 
 	// Subscription instances have their own ipset names
@@ -148,7 +152,7 @@ func (s *Service) activeDomainStatsChains() []string {
 		snapshots, err := s.subscriptions.Snapshots()
 		if err == nil {
 			for _, snap := range snapshots {
-				if snap.IPSetName != "" {
+				if snap.IPSetName != "" && routing.DomainStatsEnabled(snap.DomainCount) {
 					chain := routing.DomainStatsChainName(snap.IPSetName)
 					if !seen[chain] {
 						seen[chain] = true
@@ -167,39 +171,19 @@ func (s *Service) DomainTraffic(sortBy string, limit int) (DomainTrafficResponse
 	if s.domainTraffic == nil {
 		return DomainTrafficResponse{Domains: []DomainTrafficStat{}}, nil
 	}
+	if len(s.activeDomainStatsChains()) == 0 {
+		return DomainTrafficResponse{Domains: []DomainTrafficStat{}}, nil
+	}
 
-	stats, err := s.domainTraffic.List()
+	result, err := s.domainTraffic.List(sortBy, limit)
 	if err != nil {
 		return DomainTrafficResponse{}, err
 	}
 
-	// Sort
-	switch sortBy {
-	case "domain":
-		sort.Slice(stats, func(i, j int) bool { return stats[i].Domain < stats[j].Domain })
-	case "packets":
-		sort.Slice(stats, func(i, j int) bool { return stats[i].Packets > stats[j].Packets })
-	default: // "bytes"
-		sort.Slice(stats, func(i, j int) bool { return stats[i].Bytes > stats[j].Bytes })
-	}
-
-	var totalBytes uint64
-	updatedAt := ""
-	for _, s := range stats {
-		totalBytes += s.Bytes
-		if s.UpdatedAt > updatedAt {
-			updatedAt = s.UpdatedAt
-		}
-	}
-
-	if limit > 0 && len(stats) > limit {
-		stats = stats[:limit]
-	}
-
 	return DomainTrafficResponse{
-		Domains:    stats,
-		TotalBytes: totalBytes,
-		UpdatedAt:  updatedAt,
+		Domains:    result.Stats,
+		TotalBytes: result.TotalBytes,
+		UpdatedAt:  result.UpdatedAt,
 	}, nil
 }
 
@@ -304,34 +288,59 @@ func (s *domainTrafficStore) Upsert(stats []DomainTrafficStat, now string) error
 	return tx.Commit()
 }
 
-func (s *domainTrafficStore) List() ([]DomainTrafficStat, error) {
+type domainTrafficQueryResult struct {
+	Stats      []DomainTrafficStat
+	TotalBytes uint64
+	UpdatedAt  string
+}
+
+func (s *domainTrafficStore) List(sortBy string, limit int) (domainTrafficQueryResult, error) {
 	if err := s.ensureReady(); err != nil {
-		return nil, err
+		return domainTrafficQueryResult{}, err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rows, err := s.db.Query(`SELECT domain, bytes, packets, updated_at FROM domain_traffic ORDER BY bytes DESC`)
+	var totalBytes sql.NullInt64
+	var updatedAt sql.NullString
+	if err := s.db.QueryRow(`SELECT COALESCE(SUM(bytes), 0), COALESCE(MAX(updated_at), '') FROM domain_traffic`).Scan(&totalBytes, &updatedAt); err != nil {
+		return domainTrafficQueryResult{}, err
+	}
+
+	query := `SELECT domain, bytes, packets, updated_at FROM domain_traffic ORDER BY ` + domainTrafficOrderClause(sortBy)
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if limit > 0 {
+		query += ` LIMIT ?`
+		rows, err = s.db.Query(query, limit)
+	} else {
+		rows, err = s.db.Query(query)
+	}
 	if err != nil {
-		return nil, err
+		return domainTrafficQueryResult{}, err
 	}
 	defer rows.Close()
 
-	var stats []DomainTrafficStat
+	stats := make([]DomainTrafficStat, 0, 32)
 	for rows.Next() {
-		var s DomainTrafficStat
-		if err := rows.Scan(&s.Domain, &s.Bytes, &s.Packets, &s.UpdatedAt); err != nil {
-			return nil, err
+		var stat DomainTrafficStat
+		if err := rows.Scan(&stat.Domain, &stat.Bytes, &stat.Packets, &stat.UpdatedAt); err != nil {
+			return domainTrafficQueryResult{}, err
 		}
-		stats = append(stats, s)
+		stats = append(stats, stat)
+	}
+	if err := rows.Err(); err != nil {
+		return domainTrafficQueryResult{}, err
 	}
 
-	if stats == nil {
-		stats = []DomainTrafficStat{}
-	}
-
-	return stats, rows.Err()
+	return domainTrafficQueryResult{
+		Stats:      stats,
+		TotalBytes: nullInt64ToUint64(totalBytes),
+		UpdatedAt:  updatedAt.String,
+	}, nil
 }
 
 func (s *domainTrafficStore) Reset() error {
@@ -347,4 +356,15 @@ func (s *domainTrafficStore) Reset() error {
 	}
 	_, err := s.db.Exec(`DELETE FROM domain_traffic_counters`)
 	return err
+}
+
+func domainTrafficOrderClause(sortBy string) string {
+	switch strings.TrimSpace(sortBy) {
+	case "domain":
+		return `domain ASC`
+	case "packets":
+		return `packets DESC, domain ASC`
+	default:
+		return `bytes DESC, domain ASC`
+	}
 }

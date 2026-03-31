@@ -7,7 +7,7 @@ import (
 	"xiomi-router-driver/internal/config"
 )
 
-func TestValidateRuleDomainsRejectsDuplicateAcrossActiveProviders(t *testing.T) {
+func TestValidateRuleEntriesRejectsDuplicateAcrossActiveProviders(t *testing.T) {
 	providers := []config.Provider{
 		testProvider("provider-a", "Alpha", true),
 		testProvider("provider-b", "Beta", true),
@@ -17,18 +17,18 @@ func TestValidateRuleDomainsRejectsDuplicateAcrossActiveProviders(t *testing.T) 
 	}
 	candidate := testRule("rule-b", "Rule B", "provider-b", "Prague", []string{"chatgpt.com"}, true)
 
-	err := validateRuleDomains(candidate, providers, existingRules)
+	err := validateRuleEntries(candidate, providers, existingRules)
 	if err == nil {
-		t.Fatal("validateRuleDomains() error = nil, want duplicate error")
+		t.Fatal("validateRuleEntries() error = nil, want duplicate error")
 	}
-	for _, fragment := range []string{`domain "chatgpt.com"`, `Alpha / Warsaw`, `Beta / Prague`} {
+	for _, fragment := range []string{`entry "chatgpt.com"`, `Alpha / Warsaw`, `Beta / Prague`} {
 		if !strings.Contains(err.Error(), fragment) {
-			t.Fatalf("validateRuleDomains() error = %q, want fragment %q", err.Error(), fragment)
+			t.Fatalf("validateRuleEntries() error = %q, want fragment %q", err.Error(), fragment)
 		}
 	}
 }
 
-func TestValidateRuleDomainsIgnoresDisabledProviders(t *testing.T) {
+func TestValidateRuleEntriesIgnoresDisabledProviders(t *testing.T) {
 	providers := []config.Provider{
 		testProvider("provider-a", "Alpha", false),
 		testProvider("provider-b", "Beta", true),
@@ -38,8 +38,29 @@ func TestValidateRuleDomainsIgnoresDisabledProviders(t *testing.T) {
 	}
 	candidate := testRule("rule-b", "Rule B", "provider-b", "Prague", []string{"chatgpt.com"}, true)
 
-	if err := validateRuleDomains(candidate, providers, existingRules); err != nil {
-		t.Fatalf("validateRuleDomains() error = %v, want nil", err)
+	if err := validateRuleEntries(candidate, providers, existingRules); err != nil {
+		t.Fatalf("validateRuleEntries() error = %v, want nil", err)
+	}
+}
+
+func TestValidateRuleEntriesRejectsOverlappingCIDR(t *testing.T) {
+	providers := []config.Provider{
+		testProvider("provider-a", "Alpha", true),
+		testProvider("provider-b", "Beta", true),
+	}
+	existingRules := []config.Rule{
+		testRule("rule-a", "Rule A", "provider-a", "Warsaw", []string{"149.154.160.0/20"}, true),
+	}
+	candidate := testRule("rule-b", "Rule B", "provider-b", "Prague", []string{"149.154.167.41"}, true)
+
+	err := validateRuleEntries(candidate, providers, existingRules)
+	if err == nil {
+		t.Fatal("validateRuleEntries() error = nil, want overlap error")
+	}
+	for _, fragment := range []string{`entry "149.154.167.41" overlaps with "149.154.160.0/20"`, `Alpha / Warsaw`, `Beta / Prague`} {
+		if !strings.Contains(err.Error(), fragment) {
+			t.Fatalf("validateRuleEntries() error = %q, want fragment %q", err.Error(), fragment)
+		}
 	}
 }
 
@@ -57,14 +78,14 @@ func TestValidateProviderActivationRejectsDuplicates(t *testing.T) {
 	if err == nil {
 		t.Fatal("validateProviderActivation() error = nil, want duplicate error")
 	}
-	for _, fragment := range []string{`domain "youtube.com"`, `Alpha / Warsaw`, `Beta / Prague`} {
+	for _, fragment := range []string{`entry "youtube.com"`, `Alpha / Warsaw`, `Beta / Prague`} {
 		if !strings.Contains(err.Error(), fragment) {
 			t.Fatalf("validateProviderActivation() error = %q, want fragment %q", err.Error(), fragment)
 		}
 	}
 }
 
-func TestValidateActiveRuleDomainsRejectsDuplicates(t *testing.T) {
+func TestValidateActiveRuleEntriesRejectsDuplicates(t *testing.T) {
 	state := config.State{
 		Providers: []config.Provider{
 			testProvider("provider-a", "Alpha", true),
@@ -76,16 +97,16 @@ func TestValidateActiveRuleDomainsRejectsDuplicates(t *testing.T) {
 		},
 	}
 
-	err := validateActiveRuleDomains(state)
+	err := validateActiveRuleEntries(state)
 	if err == nil {
-		t.Fatal("validateActiveRuleDomains() error = nil, want duplicate error")
+		t.Fatal("validateActiveRuleEntries() error = nil, want duplicate error")
 	}
-	if !strings.Contains(err.Error(), `domain "oaistatic.com"`) {
-		t.Fatalf("validateActiveRuleDomains() error = %q, want duplicated domain in message", err.Error())
+	if !strings.Contains(err.Error(), `entry "oaistatic.com"`) {
+		t.Fatalf("validateActiveRuleEntries() error = %q, want duplicated entry in message", err.Error())
 	}
 }
 
-func TestValidateActiveRuleDomainsIgnoresDisabledRules(t *testing.T) {
+func TestValidateActiveRuleEntriesIgnoresDisabledRules(t *testing.T) {
 	state := config.State{
 		Providers: []config.Provider{
 			testProvider("provider-a", "Alpha", true),
@@ -97,8 +118,8 @@ func TestValidateActiveRuleDomainsIgnoresDisabledRules(t *testing.T) {
 		},
 	}
 
-	if err := validateActiveRuleDomains(state); err != nil {
-		t.Fatalf("validateActiveRuleDomains() error = %v, want nil", err)
+	if err := validateActiveRuleEntries(state); err != nil {
+		t.Fatalf("validateActiveRuleEntries() error = %v, want nil", err)
 	}
 }
 

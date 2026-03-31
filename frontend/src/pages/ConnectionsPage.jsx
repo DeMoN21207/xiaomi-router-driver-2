@@ -7,6 +7,9 @@ import InlineNotice from "../components/InlineNotice.jsx";
 import { formatLatencyMs, statusToneClasses } from "../utils.js";
 
 const defaultForm = { name: "", type: "openvpn", source: "", enabled: true };
+const DOMAIN_PREVIEW_LIMIT = 80;
+const DOMAIN_SEARCH_RESULT_LIMIT = 200;
+const ROUTING_ENTRIES_EXAMPLE = "# Example routing entries\n# Lines starting with # are ignored\n# Domains, IPv4 addresses and IPv4 CIDR ranges are supported\n\nyoutube.com\ngooglevideo.com\ndiscord.com\ngateway.discord.gg\n149.154.160.0/20\n91.108.56.0/22\n";
 
 export default function ConnectionsPage() {
   const { t } = useI18n();
@@ -539,7 +542,7 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
             {editingSource ? (
               <div className="flex gap-2">
                 <input
-                  className="w-full rounded-lg border border-outline-variant/20 bg-surface-container-lowest/50 px-3 py-2 font-mono text-sm text-secondary outline-none transition-colors focus:border-primary/40"
+                  className="w-full rounded-lg border border-outline-variant/20 bg-surface-container-lowest/50 px-3 py-2 font-mono text-sm text-on-surface outline-none transition-colors focus:border-primary/40"
                   value={sourceDraft}
                   onChange={(e) => setSourceDraft(e.target.value)}
                   disabled={savingSource}
@@ -581,7 +584,7 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
               </div>
             ) : (
               <div className="flex items-center gap-2">
-                <code className="block w-full overflow-hidden text-ellipsis rounded-lg bg-surface-container-lowest/50 px-3 py-2 font-mono text-sm text-secondary">
+                <code className="block w-full overflow-hidden text-ellipsis rounded-lg bg-surface-container-lowest/50 px-3 py-2 font-mono text-sm text-on-surface">
                   {sourceVisible ? provider.source : "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"}
                 </code>
                 <button
@@ -673,7 +676,6 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
                 allProviders={providers}
                 saving={saving}
                 setSaving={setSaving}
-                applyAndRefresh={applyAndRefresh}
                 onDeleteRule={() => deleteRule(rule.id)}
                 showToast={showToast}
                 setPageError={setPageError}
@@ -805,7 +807,7 @@ function LocationsBrowser({ locations, selectedLocation = "", onSelect, usedLoca
                         {formatLocationType(loc.type)}
                       </span>
                     </div>
-                    <div className="px-3 py-2.5 font-mono text-xs text-secondary">{loc.address || "—"}</div>
+                    <div className="px-3 py-2.5 font-mono text-xs text-on-surface">{loc.address || "—"}</div>
                     <div className="px-3 py-2.5 text-on-surface">
                       <div className="flex items-center gap-2">
                         <span className="truncate">{loc.name}</span>
@@ -975,7 +977,7 @@ function findRuleDomainConflict(rule, provider, domains, allRules, allProviders)
     }
     for (const domain of existing.domains || []) {
       if (candidateDomains.has(domain)) {
-        return `domain "${domain}" is already assigned to "${formatRuleConflictLabel(existing, existingProvider)}" and cannot also be used in "${formatRuleConflictLabel(rule, provider)}"`;
+        return `entry "${domain}" is already assigned to "${formatRuleConflictLabel(existing, existingProvider)}" and cannot also be used in "${formatRuleConflictLabel(rule, provider)}"`;
       }
     }
   }
@@ -983,7 +985,7 @@ function findRuleDomainConflict(rule, provider, domains, allRules, allProviders)
   return "";
 }
 
-function RuleBlock({ rule, provider, allRules, allProviders, saving, setSaving, applyAndRefresh, onDeleteRule, showToast, setPageError, t }) {
+function RuleBlock({ rule, provider, allRules, allProviders, saving, setSaving, onDeleteRule, showToast, setPageError, t }) {
   const [domainInput, setDomainInput] = useState("");
   const fileInputRef = useRef(null);
 
@@ -997,13 +999,13 @@ function RuleBlock({ rule, provider, allRules, allProviders, saving, setSaving, 
 
     setSaving(true);
     try {
-      await fetchJSON(`/api/rules/${encodeURIComponent(rule.id)}`, {
+      await fetchJSON(`/api/rules/${encodeURIComponent(rule.id)}?apply=1`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: rule.name, providerId: provider.id, selectedLocation: rule.selectedLocation, domains: merged.join(","), enabled: rule.enabled }),
       });
       setDomainInput("");
-      await applyAndRefresh();
+      await onDomainsChange();
       showToast(t("connections.domainsUpdated"));
     } catch (error) {
       setPageError(error.message);
@@ -1041,15 +1043,39 @@ function RuleBlock({ rule, provider, allRules, allProviders, saving, setSaving, 
     try {
       const remaining = rule.domains.filter((d) => d !== domain);
       if (remaining.length === 0) {
-        await fetchJSON(`/api/rules/${encodeURIComponent(rule.id)}`, { method: "DELETE" });
+        await fetchJSON(`/api/rules/${encodeURIComponent(rule.id)}?apply=1`, { method: "DELETE" });
       } else {
-        await fetchJSON(`/api/rules/${encodeURIComponent(rule.id)}`, {
+        await fetchJSON(`/api/rules/${encodeURIComponent(rule.id)}?apply=1`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name: rule.name, providerId: provider.id, selectedLocation: rule.selectedLocation, domains: remaining.join(","), enabled: rule.enabled }),
         });
       }
-      await applyAndRefresh();
+      await onDomainsChange();
+    } catch (error) {
+      setPageError(error.message);
+      showToast(error.message, true);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function removeDomains(domainsToRemove) {
+    setSaving(true);
+    try {
+      const removeSet = new Set(domainsToRemove);
+      const remaining = rule.domains.filter((d) => !removeSet.has(d));
+      if (remaining.length === 0) {
+        await fetchJSON(`/api/rules/${encodeURIComponent(rule.id)}?apply=1`, { method: "DELETE" });
+      } else {
+        await fetchJSON(`/api/rules/${encodeURIComponent(rule.id)}?apply=1`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: rule.name, providerId: provider.id, selectedLocation: rule.selectedLocation, domains: remaining.join(","), enabled: rule.enabled }),
+        });
+      }
+      await onDomainsChange();
+      showToast(t("connections.deletedCount", { count: String(domainsToRemove.length) }));
     } catch (error) {
       setPageError(error.message);
       showToast(error.message, true);
@@ -1078,12 +1104,15 @@ function RuleBlock({ rule, provider, allRules, allProviders, saving, setSaving, 
       </div>
 
       <form onSubmit={addDomains} className="mb-3 space-y-2">
+        <div className="rounded-lg border border-outline-variant/10 bg-surface-container-high px-3 py-2 text-xs text-on-surface-variant">
+          Domains, IPv4 and CIDR are supported here. Example: <span className="font-mono text-on-surface">149.154.160.0/20</span>
+        </div>
         <textarea
           className="w-full resize-y rounded-lg border-none bg-surface-container-highest px-3 py-2 font-mono text-sm text-on-surface placeholder:text-outline-variant focus:ring-1 focus:ring-primary"
           rows={2}
           value={domainInput}
           onChange={(e) => setDomainInput(e.target.value)}
-          placeholder={t("connections.domainsPlaceholder")}
+          placeholder={`${t("connections.domainsPlaceholder")}\nIPv4/CIDR: 149.154.160.0/20`}
           disabled={saving}
         />
         <div className="flex gap-2">
@@ -1108,11 +1137,11 @@ function RuleBlock({ rule, provider, allRules, allProviders, saving, setSaving, 
             type="button"
             onClick={() => {
               const sample = "# Пример списка доменов для импорта\n# Строки с # игнорируются\n\nyoutube.com\ngooglevideo.com\nyoutu.be\nnetflix.com\nnflxvideo.net\ntwitch.tv\ndiscord.com\ngateway.discord.gg\nspotify.com\naudio-ak-spotify-com.akamaized.net\n";
-              const blob = new Blob([sample], { type: "text/plain" });
+              const blob = new Blob([ROUTING_ENTRIES_EXAMPLE], { type: "text/plain" });
               const url = URL.createObjectURL(blob);
               const a = document.createElement("a");
               a.href = url;
-              a.download = "domains-example.txt";
+              a.download = "routing-entries-example.txt";
               a.click();
               URL.revokeObjectURL(url);
             }}
@@ -1126,66 +1155,207 @@ function RuleBlock({ rule, provider, allRules, allProviders, saving, setSaving, 
       </form>
 
       {rule.domains.length > 0 && (
-        <>
-          <div className="mb-2 flex gap-2">
-            <button
-              type="button"
-              disabled={saving}
-              onClick={() => {
-                const blob = new Blob([rule.domains.join("\n") + "\n"], { type: "text/plain" });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement("a");
-                a.href = url;
-                a.download = `${(rule.selectedLocation || rule.name || "domains").replace(/\s+/g, "_")}.txt`;
-                a.click();
-                URL.revokeObjectURL(url);
-              }}
-              className="flex items-center gap-1.5 rounded-lg bg-outline-variant/10 px-3 py-1.5 text-xs font-medium text-on-surface-variant transition-colors hover:bg-outline-variant/20 disabled:opacity-40"
-            >
-              <Icon name="download" className="h-3.5 w-3.5" />
-              {t("connections.exportDomains")}
-            </button>
-            <button
-              type="button"
-              disabled={saving}
-              onClick={async () => {
-                if (!window.confirm(t("connections.clearAllConfirm"))) return;
-                setSaving(true);
-                try {
-                  await fetchJSON(`/api/rules/${encodeURIComponent(rule.id)}`, { method: "DELETE" });
-                  await applyAndRefresh();
-                  showToast(t("connections.domainsCleared"));
-                } catch (error) {
-                  setPageError(error.message);
-                  showToast(error.message, true);
-                } finally {
-                  setSaving(false);
-                }
-              }}
-              className="flex items-center gap-1.5 rounded-lg bg-error/10 px-3 py-1.5 text-xs font-medium text-error transition-colors hover:bg-error/20 disabled:opacity-40"
-            >
-              <Icon name="delete_sweep" className="h-3.5 w-3.5" />
-              {t("connections.clearAll")}
-            </button>
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            {rule.domains.map((domain) => (
-              <span key={domain} className="flex items-center gap-1 rounded-lg bg-surface-container-highest px-2.5 py-1 font-mono text-xs text-secondary">
-                {domain}
-                <button
-                  type="button"
-                  onClick={() => removeDomain(domain)}
-                  disabled={saving}
-                  className="text-outline-variant transition-colors hover:text-error disabled:opacity-40"
-                >
-                  <Icon name="close" className="h-3 w-3" />
-                </button>
-              </span>
-            ))}
-          </div>
-        </>
+        <RuleDomainsPanel
+          domains={rule.domains}
+          saving={saving}
+          onRemoveDomain={removeDomain}
+          onRemoveDomains={removeDomains}
+          onExport={() => {
+            const blob = new Blob([rule.domains.join("\n") + "\n"], { type: "text/plain" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `${(rule.selectedLocation || rule.name || "domains").replace(/\s+/g, "_")}.txt`;
+            a.click();
+            URL.revokeObjectURL(url);
+          }}
+          onClearAll={async () => {
+            if (!window.confirm(t("connections.clearAllConfirm"))) return;
+            setSaving(true);
+            try {
+              await fetchJSON(`/api/rules/${encodeURIComponent(rule.id)}?apply=1`, { method: "DELETE" });
+              await onDomainsChange();
+              showToast(t("connections.domainsCleared"));
+            } catch (error) {
+              setPageError(error.message);
+              showToast(error.message, true);
+            } finally {
+              setSaving(false);
+            }
+          }}
+          t={t}
+        />
       )}
     </div>
+  );
+}
+
+function RuleDomainsPanel({ domains, saving, onRemoveDomain, onRemoveDomains, onExport, onClearAll, t }) {
+  const [query, setQuery] = useState("");
+  const [selected, setSelected] = useState(() => new Set());
+  const deferredQuery = useDeferredValue(query);
+  const normalizedQuery = deferredQuery.trim().toLowerCase();
+
+  const filteredDomains = useMemo(() => {
+    if (!normalizedQuery) return domains;
+    return domains.filter((domain) => domain.toLowerCase().includes(normalizedQuery));
+  }, [domains, normalizedQuery]);
+
+  const visibleDomains = useMemo(() => {
+    return filteredDomains.slice(0, DOMAIN_SEARCH_RESULT_LIMIT);
+  }, [filteredDomains]);
+
+  const hiddenCount = Math.max(0, filteredDomains.length - visibleDomains.length);
+
+  const allVisibleSelected = visibleDomains.length > 0 && visibleDomains.every((d) => selected.has(d));
+
+  const toggleOne = useCallback((domain) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(domain)) next.delete(domain);
+      else next.add(domain);
+      return next;
+    });
+  }, []);
+
+  const toggleAll = useCallback(() => {
+    setSelected((prev) => {
+      if (visibleDomains.every((d) => prev.has(d))) {
+        const next = new Set(prev);
+        for (const d of visibleDomains) next.delete(d);
+        return next;
+      }
+      return new Set([...prev, ...visibleDomains]);
+    });
+  }, [visibleDomains]);
+
+  const handleDeleteSelected = useCallback(async () => {
+    if (selected.size === 0) return;
+    const toRemove = [...selected];
+    setSelected(new Set());
+    await onRemoveDomains(toRemove);
+  }, [selected, onRemoveDomains]);
+
+  // Clear selection when domains list changes (after delete)
+  useEffect(() => {
+    setSelected((prev) => {
+      const next = new Set([...prev].filter((d) => domains.includes(d)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [domains]);
+
+  return (
+    <>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <label className="relative block flex-1 min-w-[200px]">
+          <Icon name="search" className="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-outline-variant" />
+          <input
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder={t("connections.domainFilterPlaceholder")}
+            className="w-full rounded-lg border-none bg-surface-container-highest py-2 pl-9 pr-3 text-sm text-on-surface placeholder:text-outline-variant focus:ring-1 focus:ring-primary"
+            disabled={saving}
+          />
+        </label>
+        {selected.size > 0 && (
+          <button
+            type="button"
+            disabled={saving}
+            onClick={handleDeleteSelected}
+            className="flex items-center gap-1.5 rounded-lg bg-error/10 px-3 py-2 text-xs font-medium text-error transition-colors hover:bg-error/20 disabled:opacity-40"
+          >
+            <Icon name="delete" className="h-3.5 w-3.5" />
+            {t("connections.deleteSelected", { count: String(selected.size) })}
+          </button>
+        )}
+        <button
+          type="button"
+          disabled={saving}
+          onClick={onExport}
+          className="flex items-center gap-1.5 rounded-lg bg-outline-variant/10 px-3 py-2 text-xs font-medium text-on-surface-variant transition-colors hover:bg-outline-variant/20 disabled:opacity-40"
+        >
+          <Icon name="download" className="h-3.5 w-3.5" />
+          {t("connections.exportDomains")}
+        </button>
+        <button
+          type="button"
+          disabled={saving}
+          onClick={onClearAll}
+          className="flex items-center gap-1.5 rounded-lg bg-error/10 px-3 py-2 text-xs font-medium text-error transition-colors hover:bg-error/20 disabled:opacity-40"
+        >
+          <Icon name="delete_sweep" className="h-3.5 w-3.5" />
+          {t("connections.clearAll")}
+        </button>
+      </div>
+
+      <div className="overflow-hidden rounded-lg border border-outline-variant/15">
+        <div className="max-h-[420px] overflow-y-auto">
+          <table className="w-full text-left text-sm">
+            <thead className="sticky top-0 z-10 bg-surface-container text-xs uppercase tracking-wider text-outline">
+              <tr>
+                <th className="w-10 px-3 py-2 text-center">
+                  <input
+                    type="checkbox"
+                    checked={allVisibleSelected}
+                    onChange={toggleAll}
+                    disabled={saving || visibleDomains.length === 0}
+                    className="h-3.5 w-3.5 cursor-pointer accent-primary"
+                  />
+                </th>
+                <th className="w-12 px-3 py-2 text-right">#</th>
+                <th className="px-3 py-2">{t("connections.domainColumn")}</th>
+                <th className="w-12 px-3 py-2" />
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-outline-variant/10">
+              {visibleDomains.map((domain, idx) => (
+                <tr key={domain} className={`transition-colors hover:bg-surface-container-highest/60${selected.has(domain) ? " bg-primary/5" : ""}`}>
+                  <td className="px-3 py-1.5 text-center">
+                    <input
+                      type="checkbox"
+                      checked={selected.has(domain)}
+                      onChange={() => toggleOne(domain)}
+                      disabled={saving}
+                      className="h-3.5 w-3.5 cursor-pointer accent-primary"
+                    />
+                  </td>
+                  <td className="px-3 py-1.5 text-right font-mono text-xs text-outline-variant">
+                    {normalizedQuery ? idx + 1 : domains.indexOf(domain) + 1}
+                  </td>
+                  <td className="px-3 py-1.5 font-mono text-on-surface">{domain}</td>
+                  <td className="px-3 py-1.5 text-center">
+                    <button
+                      type="button"
+                      onClick={() => onRemoveDomain(domain)}
+                      disabled={saving}
+                      className="text-outline-variant transition-colors hover:text-error disabled:opacity-40"
+                    >
+                      <Icon name="close" className="h-3.5 w-3.5" />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              {visibleDomains.length === 0 && (
+                <tr>
+                  <td colSpan={4} className="px-4 py-6 text-center text-sm text-on-surface-variant">
+                    {t("connections.domainNoMatch")}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <p className="mt-2 text-xs text-on-surface-variant">
+        {normalizedQuery
+          ? hiddenCount > 0
+            ? t("connections.domainMatchesPreview", { visible: String(visibleDomains.length), total: String(filteredDomains.length) })
+            : t("connections.domainMatches", { total: String(filteredDomains.length) })
+          : t("connections.domainTotal", { total: String(domains.length) })}
+      </p>
+    </>
   );
 }
 

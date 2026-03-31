@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"xiomi-router-driver/internal/config"
 	"xiomi-router-driver/internal/sqlitedb"
 )
 
@@ -374,6 +375,182 @@ func TestSiteTrafficStoreListHistoryAggregatesDeviceDomainsInRange(t *testing.T)
 	}
 	if result.Stats[1].Domain != "youtube.com" || result.Stats[1].Bytes != 500 || result.Stats[1].ViaTunnel {
 		t.Fatalf("unexpected second history stat: %+v", result.Stats[1])
+	}
+}
+
+func TestBuildRouteMatcherResolvesSuffixesAndKeepsRulePriority(t *testing.T) {
+	state := config.State{
+		Providers: []config.Provider{
+			{
+				ID:      "provider-sub",
+				Name:    "FizzVPN",
+				Type:    config.ProviderTypeSubscription,
+				Source:  "https://example.com/sub",
+				Enabled: true,
+			},
+			{
+				ID:      "provider-openvpn",
+				Name:    "OpenVPN",
+				Type:    config.ProviderTypeOpenVPN,
+				Source:  "profiles/demo.ovpn",
+				Enabled: true,
+			},
+		},
+		Rules: []config.Rule{
+			{
+				ID:               "rule-1",
+				Name:             "Generic media",
+				ProviderID:       "provider-sub",
+				SelectedLocation: "NL",
+				Domains:          []string{"googlevideo.com"},
+				Enabled:          true,
+			},
+			{
+				ID:         "rule-2",
+				Name:       "Specific media",
+				ProviderID: "provider-openvpn",
+				Domains:    []string{"rr2---sn-a5mekn7z.googlevideo.com"},
+				Enabled:    true,
+			},
+		},
+		Routing: config.RoutingSettings{
+			VPNIface: "tun0",
+		},
+	}
+
+	matcher := buildRouteMatcher(state)
+
+	viaTunnel, routeLabel := matcher.resolve("rr2---sn-a5mekn7z.googlevideo.com")
+	if !viaTunnel {
+		t.Fatalf("expected matched domain to be routed")
+	}
+	if routeLabel != "FizzVPN / NL" {
+		t.Fatalf("expected first matching rule to win, got %q", routeLabel)
+	}
+
+	viaTunnel, routeLabel = matcher.resolve("rr2---sn-a5mekn7z.googlevideo.com.")
+	if !viaTunnel || routeLabel != "FizzVPN / NL" {
+		t.Fatalf("expected normalized observed domain to resolve, got routed=%t label=%q", viaTunnel, routeLabel)
+	}
+}
+
+func TestBuildRouteMatcherIgnoresDisabledRulesAndProviders(t *testing.T) {
+	state := config.State{
+		Providers: []config.Provider{
+			{
+				ID:      "provider-disabled",
+				Name:    "Disabled",
+				Type:    config.ProviderTypeSubscription,
+				Source:  "https://example.com/sub",
+				Enabled: false,
+			},
+			{
+				ID:      "provider-enabled",
+				Name:    "Enabled",
+				Type:    config.ProviderTypeOpenVPN,
+				Source:  "profiles/demo.ovpn",
+				Enabled: true,
+			},
+		},
+		Rules: []config.Rule{
+			{
+				ID:               "rule-disabled-provider",
+				Name:             "Disabled provider",
+				ProviderID:       "provider-disabled",
+				SelectedLocation: "US",
+				Domains:          []string{"openai.com"},
+				Enabled:          true,
+			},
+			{
+				ID:         "rule-disabled",
+				Name:       "Disabled rule",
+				ProviderID: "provider-enabled",
+				Domains:    []string{"chatgpt.com"},
+				Enabled:    false,
+			},
+			{
+				ID:         "rule-enabled",
+				Name:       "Enabled rule",
+				ProviderID: "provider-enabled",
+				Domains:    []string{"oaistatic.com"},
+				Enabled:    true,
+			},
+		},
+		Routing: config.RoutingSettings{
+			VPNIface: "tun9",
+		},
+	}
+
+	matcher := buildRouteMatcher(state)
+
+	if viaTunnel, _ := matcher.resolve("openai.com"); viaTunnel {
+		t.Fatalf("expected disabled provider route to be ignored")
+	}
+	if viaTunnel, _ := matcher.resolve("chatgpt.com"); viaTunnel {
+		t.Fatalf("expected disabled rule route to be ignored")
+	}
+
+	viaTunnel, routeLabel := matcher.resolve("files.oaistatic.com")
+	if !viaTunnel {
+		t.Fatalf("expected enabled route to match suffix")
+	}
+	if routeLabel != "Enabled / tun9" {
+		t.Fatalf("unexpected route label %q", routeLabel)
+	}
+}
+
+func TestBuildRouteMatcherResolvesIPv4AndCIDREntries(t *testing.T) {
+	state := config.State{
+		Providers: []config.Provider{
+			{
+				ID:      "provider-broad",
+				Name:    "Broad",
+				Type:    config.ProviderTypeSubscription,
+				Source:  "https://example.com/sub",
+				Enabled: true,
+			},
+			{
+				ID:      "provider-specific",
+				Name:    "Specific",
+				Type:    config.ProviderTypeOpenVPN,
+				Source:  "profiles/demo.ovpn",
+				Enabled: true,
+			},
+		},
+		Rules: []config.Rule{
+			{
+				ID:               "rule-broad",
+				Name:             "Broad CIDR",
+				ProviderID:       "provider-broad",
+				SelectedLocation: "NL",
+				Domains:          []string{"149.154.160.0/20"},
+				Enabled:          true,
+			},
+			{
+				ID:         "rule-specific",
+				Name:       "Specific host",
+				ProviderID: "provider-specific",
+				Domains:    []string{"149.154.167.41"},
+				Enabled:    true,
+			},
+		},
+		Routing: config.RoutingSettings{
+			VPNIface: "tun7",
+		},
+	}
+
+	matcher := buildRouteMatcher(state)
+
+	viaTunnel, routeLabel := matcher.resolve("149.154.167.41")
+	if !viaTunnel {
+		t.Fatalf("expected matched ip to be routed")
+	}
+	if routeLabel != "Broad / NL" {
+		t.Fatalf("expected first matching IP rule to win, got %q", routeLabel)
+	}
+
+	if viaTunnel, _ := matcher.resolve("149.154.200.1"); viaTunnel {
+		t.Fatalf("expected unrelated ip to stay outside the route")
 	}
 }
 

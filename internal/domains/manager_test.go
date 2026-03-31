@@ -35,6 +35,14 @@ func TestManagerReplaceAllPersistsToSQLiteAndRuntimeFile(t *testing.T) {
 	if string(content) != "openai.com\nchatgpt.com\n" {
 		t.Fatalf("unexpected runtime file content: %q", string(content))
 	}
+
+	count, err := manager.Count()
+	if err != nil {
+		t.Fatalf("Count() error = %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected count 2, got %d", count)
+	}
 }
 
 func TestManagerMigratesLegacyDomainsFile(t *testing.T) {
@@ -85,6 +93,27 @@ func TestNormalizeEntriesSanitizesImportedDomains(t *testing.T) {
 	}
 }
 
+func TestNormalizeEntriesAcceptsIPv4AndCIDR(t *testing.T) {
+	got := NormalizeEntries([]string{
+		"149.154.167.41",
+		"149.154.167.41:443",
+		"149.154.160.0/20",
+		"149.154.160.0/33",
+		"300.1.1.1",
+		"91.108.56.0/22",
+	})
+
+	want := []string{
+		"149.154.167.41",
+		"149.154.160.0/20",
+		"91.108.56.0/22",
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("NormalizeEntries() = %+v, want %+v", got, want)
+	}
+}
+
 func TestSplitInputIgnoresCommentsAndSeparators(t *testing.T) {
 	raw := `
 # comment
@@ -106,6 +135,31 @@ rc.bwa.to/xds
 
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("SplitInput() = %+v, want %+v", got, want)
+	}
+}
+
+func TestManagerCountDomainsIgnoresIPv4Entries(t *testing.T) {
+	db := openDomainsTestDB(t)
+	manager := NewManager(db, filepath.Join(t.TempDir(), ".vpn-manager", "domains.list"), filepath.Join(t.TempDir(), "domains.list"))
+
+	if err := manager.ReplaceAll([]string{"youtube.com", "149.154.160.0/20", "91.108.56.130"}); err != nil {
+		t.Fatalf("ReplaceAll() error = %v", err)
+	}
+
+	total, err := manager.Count()
+	if err != nil {
+		t.Fatalf("Count() error = %v", err)
+	}
+	if total != 3 {
+		t.Fatalf("expected total count 3, got %d", total)
+	}
+
+	domainCount, err := manager.CountDomains()
+	if err != nil {
+		t.Fatalf("CountDomains() error = %v", err)
+	}
+	if domainCount != 1 {
+		t.Fatalf("expected domain count 1, got %d", domainCount)
 	}
 }
 

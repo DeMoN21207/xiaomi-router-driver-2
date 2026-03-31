@@ -19,6 +19,7 @@ import (
 	"xiomi-router-driver/internal/domains"
 	"xiomi-router-driver/internal/openvpn"
 	"xiomi-router-driver/internal/runtimebin"
+	"xiomi-router-driver/internal/runtimehealth"
 	"xiomi-router-driver/internal/subscription"
 )
 
@@ -150,7 +151,7 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 
-	domainList, err := s.domains.List()
+	domainCount, err := s.domains.Count()
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -177,7 +178,10 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 			return Snapshot{}, err
 		}
 	}
-	trafficRoutes := buildTrafficRoutes(state, subscriptionRuntime, domainsByProvider)
+	trafficRoutes := buildTrafficRoutes(state, openvpnRuntime, subscriptionRuntime, domainsByProvider)
+	openvpnRuntimeByProvider := indexOpenVPNRuntimeByProvider(openvpnRuntime)
+	subscriptionRuntimeByKey := indexSubscriptionRuntimeByKey(subscriptionRuntime)
+	expectedSubscriptionKeys := expectedSubscriptionKeysByProvider(state)
 
 	for _, provider := range state.Providers {
 		runtime := ProviderRuntime{
@@ -195,7 +199,7 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 		case config.ProviderTypeSubscription:
 			runtime.BinaryAvailable = binaries.SingBox
 		}
-		runtime.Health, runtime.HealthDetails = providerHealth(provider, runtime.BinaryAvailable, rulesByProvider[provider.ID])
+		runtime.Health, runtime.HealthDetails = providerHealth(provider, runtime.BinaryAvailable, rulesByProvider[provider.ID], openvpnRuntimeByProvider[provider.ID], expectedSubscriptionKeys[provider.ID], subscriptionRuntimeByKey)
 
 		providers = append(providers, runtime)
 	}
@@ -209,7 +213,7 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 		ProvidersCount: len(state.Providers),
 		RulesCount:     len(state.Rules),
 		EnabledRules:   enabledRules,
-		DomainsCount:   len(domainList),
+		DomainsCount:   domainCount,
 		LastAppliedAt:  state.LastAppliedAt,
 		LastError:      state.LastError,
 		UpdatedAt:      state.UpdatedAt,
@@ -229,7 +233,7 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 	}, nil
 }
 
-func providerHealth(provider config.Provider, binaryAvailable bool, rulesCount int) (string, string) {
+func providerHealth(provider config.Provider, binaryAvailable bool, rulesCount int, openvpnSnapshot *openvpn.RuntimeSnapshot, subscriptionKeys []string, subscriptionRuntime map[string]subscription.RuntimeSnapshot) (string, string) {
 	if !provider.Enabled {
 		return "disabled", "provider is disabled"
 	}
@@ -242,6 +246,30 @@ func providerHealth(provider config.Provider, binaryAvailable bool, rulesCount i
 	if rulesCount == 0 {
 		return "warning", "provider has no active routes yet"
 	}
+
+	switch provider.Type {
+	case config.ProviderTypeOpenVPN:
+		if openvpnSnapshot == nil {
+			return "error", "openvpn runtime is not running"
+		}
+		if openvpnSnapshot.Status != "running" {
+			return "error", firstNonEmpty(openvpnSnapshot.StatusDetail, "openvpn runtime is not healthy")
+		}
+	case config.ProviderTypeSubscription:
+		if len(subscriptionKeys) == 0 {
+			return "warning", "subscription provider has no active locations yet"
+		}
+		for _, key := range subscriptionKeys {
+			snapshot, exists := subscriptionRuntime[key]
+			if !exists {
+				return "error", "subscription runtime is missing for an active location"
+			}
+			if snapshot.Status != "running" {
+				return "error", firstNonEmpty(snapshot.StatusDetail, fmt.Sprintf("subscription location %s is not healthy", snapshot.Location))
+			}
+		}
+	}
+
 	return "ready", fmt.Sprintf("%d routes configured", rulesCount)
 }
 
@@ -348,8 +376,9 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-func buildTrafficRoutes(state config.State, subscriptionRuntime []subscription.RuntimeSnapshot, domainsByProvider map[string]map[string]struct{}) []TrafficRoute {
+func buildTrafficRoutes(state config.State, openvpnRuntime []openvpn.RuntimeSnapshot, subscriptionRuntime []subscription.RuntimeSnapshot, domainsByProvider map[string]map[string]struct{}) []TrafficRoute {
 	routes := make([]TrafficRoute, 0, len(subscriptionRuntime)+len(state.Providers))
+	openvpnRuntimeByProvider := indexOpenVPNRuntimeByProvider(openvpnRuntime)
 
 	for _, instance := range subscriptionRuntime {
 		rxBytes, txBytes := readInterfaceTraffic(instance.InterfaceName)
@@ -376,6 +405,10 @@ func buildTrafficRoutes(state config.State, subscriptionRuntime []subscription.R
 		}
 
 		rxBytes, txBytes := readInterfaceTraffic(state.Routing.VPNIface)
+		status := interfaceStatus(state.Routing.VPNIface)
+		if snapshot := openvpnRuntimeByProvider[provider.ID]; snapshot != nil {
+			status = snapshot.Status
+		}
 		routes = append(routes, TrafficRoute{
 			ProviderID:    provider.ID,
 			ProviderName:  provider.Name,
@@ -383,7 +416,7 @@ func buildTrafficRoutes(state config.State, subscriptionRuntime []subscription.R
 			Location:      firstNonEmpty(strings.TrimSpace(provider.SelectedLocation), state.Routing.VPNIface),
 			InterfaceName: state.Routing.VPNIface,
 			DomainCount:   len(domainsByProvider[provider.ID]),
-			Status:        interfaceStatus(state.Routing.VPNIface),
+			Status:        status,
 			RXBytes:       rxBytes,
 			TXBytes:       txBytes,
 			TotalBytes:    rxBytes + txBytes,
@@ -401,6 +434,62 @@ func buildTrafficRoutes(state config.State, subscriptionRuntime []subscription.R
 	})
 
 	return routes
+}
+
+func indexOpenVPNRuntimeByProvider(snapshots []openvpn.RuntimeSnapshot) map[string]*openvpn.RuntimeSnapshot {
+	index := make(map[string]*openvpn.RuntimeSnapshot, len(snapshots))
+	for i := range snapshots {
+		index[snapshots[i].ProviderID] = &snapshots[i]
+	}
+	return index
+}
+
+func indexSubscriptionRuntimeByKey(snapshots []subscription.RuntimeSnapshot) map[string]subscription.RuntimeSnapshot {
+	index := make(map[string]subscription.RuntimeSnapshot, len(snapshots))
+	for _, snapshot := range snapshots {
+		index[snapshot.Key] = snapshot
+	}
+	return index
+}
+
+func expectedSubscriptionKeysByProvider(state config.State) map[string][]string {
+	providersByID := make(map[string]config.Provider, len(state.Providers))
+	for _, provider := range state.Providers {
+		providersByID[provider.ID] = provider
+	}
+
+	byProvider := make(map[string][]string)
+	seen := make(map[string]map[string]struct{})
+	for _, rule := range state.Rules {
+		if !rule.Enabled {
+			continue
+		}
+
+		provider, exists := providersByID[rule.ProviderID]
+		if !exists || !provider.Enabled || provider.Type != config.ProviderTypeSubscription {
+			continue
+		}
+		if !ruleHasDomains(rule) {
+			continue
+		}
+
+		location := strings.TrimSpace(rule.SelectedLocation)
+		if location == "" {
+			continue
+		}
+
+		key := provider.ID + "::" + strings.ToLower(location)
+		if seen[provider.ID] == nil {
+			seen[provider.ID] = make(map[string]struct{})
+		}
+		if _, exists := seen[provider.ID][key]; exists {
+			continue
+		}
+		seen[provider.ID][key] = struct{}{}
+		byProvider[provider.ID] = append(byProvider[provider.ID], key)
+	}
+
+	return byProvider
 }
 
 func readInterfaceTraffic(interfaceName string) (uint64, uint64) {
@@ -426,14 +515,7 @@ func readUintFile(path string) uint64 {
 }
 
 func interfaceStatus(name string) string {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return "stopped"
-	}
-	if _, err := os.Stat(filepath.Join("/sys/class/net", name)); err == nil {
-		return "running"
-	}
-	return "stopped"
+	return runtimehealth.Status(name, 0)
 }
 
 // PurgeTrafficOlderThan deletes all traffic data (history, domain stats, site/device stats)
@@ -481,4 +563,13 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func ruleHasDomains(rule config.Rule) bool {
+	for _, domain := range rule.Domains {
+		if strings.TrimSpace(domain) != "" {
+			return true
+		}
+	}
+	return false
 }

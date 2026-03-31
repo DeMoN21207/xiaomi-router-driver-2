@@ -3,7 +3,12 @@ package subscription
 import (
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestParseLineVMess(t *testing.T) {
@@ -110,4 +115,119 @@ func TestParseLineShadowsocks(t *testing.T) {
 	if entry.Outbound["password"] != "secret" {
 		t.Fatalf("unexpected password: %#v", entry.Outbound["password"])
 	}
+}
+
+func TestFetchEntriesCachedUsesFreshCacheWithoutNetwork(t *testing.T) {
+	t.Setenv("VPN_MANAGER_SUBSCRIPTION_CACHE_TTL", "10m")
+
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Error(w, "network should not be used", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	cacheDir := t.TempDir()
+	raw := testSubscriptionPayload(t, "Japan")
+	if err := saveEntriesCache(entriesCachePath(cacheDir, server.URL), server.URL, raw, time.Now().UTC()); err != nil {
+		t.Fatalf("saveEntriesCache() error = %v", err)
+	}
+
+	entries, mode, err := FetchEntriesCached(server.URL, cacheDir)
+	if err != nil {
+		t.Fatalf("FetchEntriesCached() error = %v", err)
+	}
+	if mode != entriesFetchFreshCache {
+		t.Fatalf("FetchEntriesCached() mode = %q, want %q", mode, entriesFetchFreshCache)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("expected no network hits, got %d", hits.Load())
+	}
+	if len(entries) != 1 || entries[0].Name != "Japan" {
+		t.Fatalf("unexpected cached entries: %+v", entries)
+	}
+}
+
+func TestFetchEntriesCachedFallsBackToStaleCacheWhenLiveFetchFails(t *testing.T) {
+	t.Setenv("VPN_MANAGER_SUBSCRIPTION_CACHE_TTL", "1s")
+
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Error(w, "upstream down", http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	cacheDir := t.TempDir()
+	raw := testSubscriptionPayload(t, "Netherlands")
+	if err := saveEntriesCache(entriesCachePath(cacheDir, server.URL), server.URL, raw, time.Now().UTC().Add(-10*time.Minute)); err != nil {
+		t.Fatalf("saveEntriesCache() error = %v", err)
+	}
+
+	entries, mode, err := FetchEntriesCached(server.URL, cacheDir)
+	if err != nil {
+		t.Fatalf("FetchEntriesCached() error = %v", err)
+	}
+	if mode != entriesFetchStaleCacheFallback {
+		t.Fatalf("FetchEntriesCached() mode = %q, want %q", mode, entriesFetchStaleCacheFallback)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("expected one live fetch attempt before fallback, got %d", hits.Load())
+	}
+	if len(entries) != 1 || entries[0].Name != "Netherlands" {
+		t.Fatalf("unexpected fallback entries: %+v", entries)
+	}
+}
+
+func TestFetchEntriesCachedWritesAndReusesCache(t *testing.T) {
+	t.Setenv("VPN_MANAGER_SUBSCRIPTION_CACHE_TTL", "10m")
+
+	var hits atomic.Int32
+	raw := testSubscriptionPayload(t, "Germany")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(raw))
+	}))
+	defer server.Close()
+
+	cacheDir := t.TempDir()
+
+	entries, mode, err := FetchEntriesCached(server.URL, cacheDir)
+	if err != nil {
+		t.Fatalf("FetchEntriesCached() first call error = %v", err)
+	}
+	if mode != entriesFetchLive {
+		t.Fatalf("FetchEntriesCached() first mode = %q, want %q", mode, entriesFetchLive)
+	}
+	if len(entries) != 1 || entries[0].Name != "Germany" {
+		t.Fatalf("unexpected live entries: %+v", entries)
+	}
+
+	cachePath := entriesCachePath(cacheDir, server.URL)
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("expected cache file to be created, err=%v", err)
+	}
+
+	server.Close()
+
+	entries, mode, err = FetchEntriesCached(server.URL, cacheDir)
+	if err != nil {
+		t.Fatalf("FetchEntriesCached() cached call error = %v", err)
+	}
+	if mode != entriesFetchFreshCache {
+		t.Fatalf("FetchEntriesCached() cached mode = %q, want %q", mode, entriesFetchFreshCache)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("expected only one live fetch, got %d", hits.Load())
+	}
+	if len(entries) != 1 || entries[0].Name != "Germany" {
+		t.Fatalf("unexpected reused cache entries: %+v", entries)
+	}
+}
+
+func testSubscriptionPayload(t *testing.T, name string) string {
+	t.Helper()
+
+	encoded := base64.RawURLEncoding.EncodeToString([]byte("aes-128-gcm:secret"))
+	return "ss://" + encoded + "@jp.example.com:8388#" + name + "\n"
 }

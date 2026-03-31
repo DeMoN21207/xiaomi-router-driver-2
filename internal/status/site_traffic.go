@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"xiomi-router-driver/internal/config"
+	"xiomi-router-driver/internal/domains"
 )
 
 const (
@@ -129,6 +131,21 @@ type siteTrafficConnection struct {
 	Packets    uint64
 	ViaTunnel  bool
 	RouteLabel string
+}
+
+type routeDecision struct {
+	order      int
+	routeLabel string
+}
+
+type routePrefixDecision struct {
+	prefix netip.Prefix
+	routeDecision
+}
+
+type routeMatcher struct {
+	decisions map[string]routeDecision
+	prefixes  []routePrefixDecision
 }
 
 type siteTrafficStore struct {
@@ -509,6 +526,7 @@ func readConntrackSiteTraffic(state config.State, observedIPs map[string]string,
 	if err != nil {
 		return nil, err
 	}
+	matcher := buildRouteMatcher(state)
 
 	file, err := os.Open("/proc/net/nf_conntrack")
 	if err != nil {
@@ -537,7 +555,7 @@ func readConntrackSiteTraffic(state config.State, observedIPs map[string]string,
 			domain = entry.dstIP
 		}
 
-		viaTunnel, routeLabel := resolveObservedRoute(domain, state)
+		viaTunnel, routeLabel := matcher.resolve(domain)
 		identity := deviceIdentities[entry.srcIP]
 		entries = append(entries, siteTrafficConnection{
 			Key:        entry.key,
@@ -667,10 +685,21 @@ func ipInAnySubnet(raw string, subnets []*net.IPNet) bool {
 }
 
 func resolveObservedRoute(domain string, state config.State) (bool, string) {
+	return buildRouteMatcher(state).resolve(domain)
+}
+
+func buildRouteMatcher(state config.State) routeMatcher {
 	providersByID := make(map[string]config.Provider, len(state.Providers))
 	for _, provider := range state.Providers {
 		providersByID[provider.ID] = provider
 	}
+
+	matcher := routeMatcher{
+		decisions: make(map[string]routeDecision),
+		prefixes:  make([]routePrefixDecision, 0, 8),
+	}
+	seenPrefixes := make(map[string]struct{})
+	nextOrder := 0
 
 	for _, rule := range state.Rules {
 		if !rule.Enabled {
@@ -678,9 +707,6 @@ func resolveObservedRoute(domain string, state config.State) (bool, string) {
 		}
 		provider, exists := providersByID[rule.ProviderID]
 		if !exists || !provider.Enabled {
-			continue
-		}
-		if !matchesObservedDomain(domain, rule.Domains) {
 			continue
 		}
 
@@ -695,29 +721,101 @@ func resolveObservedRoute(domain string, state config.State) (bool, string) {
 				routeLabel += " / " + iface
 			}
 		}
-		return true, routeLabel
+		for _, entry := range rule.Domains {
+			if prefix, ok := domains.ParseIPPrefix(entry); ok {
+				key := prefix.String()
+				if _, recorded := seenPrefixes[key]; recorded {
+					continue
+				}
+				seenPrefixes[key] = struct{}{}
+				matcher.prefixes = append(matcher.prefixes, routePrefixDecision{
+					prefix: prefix,
+					routeDecision: routeDecision{
+						order:      nextOrder,
+						routeLabel: routeLabel,
+					},
+				})
+				nextOrder++
+				continue
+			}
+
+			candidate := normalizeObservedDomain(entry)
+			if candidate == "" {
+				continue
+			}
+			if _, recorded := matcher.decisions[candidate]; recorded {
+				continue
+			}
+			matcher.decisions[candidate] = routeDecision{
+				order:      nextOrder,
+				routeLabel: routeLabel,
+			}
+			nextOrder++
+		}
 	}
 
-	return false, ""
+	return matcher
 }
 
-func matchesObservedDomain(observed string, candidates []string) bool {
-	observed = normalizeObservedDomain(observed)
-	if observed == "" {
-		return false
+func (m routeMatcher) resolve(domain string) (bool, string) {
+	if addr, ok := normalizeObservedIP(domain); ok {
+		bestOrder := -1
+		bestLabel := ""
+		for _, decision := range m.prefixes {
+			if !decision.prefix.Contains(addr) {
+				continue
+			}
+			if bestOrder < 0 || decision.order < bestOrder {
+				bestOrder = decision.order
+				bestLabel = decision.routeLabel
+			}
+		}
+		if bestOrder >= 0 {
+			return true, bestLabel
+		}
+		return false, ""
 	}
 
-	for _, candidate := range candidates {
-		candidate = normalizeObservedDomain(candidate)
-		if candidate == "" {
-			continue
-		}
-		if observed == candidate || strings.HasSuffix(observed, "."+candidate) {
-			return true
-		}
+	observed := normalizeObservedDomain(domain)
+	if observed == "" || len(m.decisions) == 0 {
+		return false, ""
 	}
 
-	return false
+	bestOrder := -1
+	bestLabel := ""
+	current := observed
+	for {
+		if decision, exists := m.decisions[current]; exists {
+			if bestOrder < 0 || decision.order < bestOrder {
+				bestOrder = decision.order
+				bestLabel = decision.routeLabel
+			}
+		}
+
+		nextDot := strings.IndexByte(current, '.')
+		if nextDot < 0 {
+			break
+		}
+		current = current[nextDot+1:]
+	}
+
+	if bestOrder < 0 {
+		return false, ""
+	}
+	return true, bestLabel
+}
+
+func normalizeObservedIP(raw string) (netip.Addr, bool) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return netip.Addr{}, false
+	}
+
+	addr, err := netip.ParseAddr(strings.Trim(value, "."))
+	if err != nil || !addr.Is4() {
+		return netip.Addr{}, false
+	}
+	return addr, true
 }
 
 func resolveSiteTrafficSampleInterval() time.Duration {
@@ -939,17 +1037,26 @@ func (s *siteTrafficStore) UpsertConnections(entries []siteTrafficConnection, no
 		return err
 	}
 	bucketAt := deviceTrafficHistoryBucketAt(now)
+	retentionBase := time.Now().UTC()
+	if parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(now)); err == nil {
+		retentionBase = parsed.UTC()
+	}
 
 	for _, entry := range entries {
-		var prevBytes, prevPackets uint64
-		_ = tx.QueryRow(`
+		var prevBytes sql.NullInt64
+		var prevPackets sql.NullInt64
+		err := tx.QueryRow(`
 			SELECT bytes, packets
 			FROM site_traffic_connections
 			WHERE conn_key = ?
 		`, entry.Key).Scan(&prevBytes, &prevPackets)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			_ = tx.Rollback()
+			return err
+		}
 
-		deltaBytes := counterDelta(entry.Bytes, prevBytes)
-		deltaPackets := counterDelta(entry.Packets, prevPackets)
+		deltaBytes := counterDelta(entry.Bytes, nullInt64ToUint64(prevBytes))
+		deltaPackets := counterDelta(entry.Packets, nullInt64ToUint64(prevPackets))
 
 		if _, err := tx.Exec(`
 			INSERT INTO site_traffic_connections (conn_key, domain, bytes, packets, last_seen)
@@ -1055,12 +1162,12 @@ func (s *siteTrafficStore) UpsertConnections(entries []siteTrafficConnection, no
 		}
 	}
 
-	cutoff := time.Now().UTC().Add(-siteTrafficConnectionRetention).Format(time.RFC3339)
+	cutoff := retentionBase.Add(-siteTrafficConnectionRetention).Format(time.RFC3339)
 	if _, err := tx.Exec(`DELETE FROM site_traffic_connections WHERE last_seen < ?`, cutoff); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
-	historyCutoff := time.Now().UTC().Add(-trafficHistoryRetention).Format(time.RFC3339)
+	historyCutoff := retentionBase.Add(-trafficHistoryRetention).Format(time.RFC3339)
 	if _, err := tx.Exec(`DELETE FROM device_traffic_history WHERE bucket_at < ?`, historyCutoff); err != nil {
 		_ = tx.Rollback()
 		return err
