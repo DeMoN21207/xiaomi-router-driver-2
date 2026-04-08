@@ -15,6 +15,7 @@ import (
 	"xiomi-router-driver/internal/automation"
 	"xiomi-router-driver/internal/blacklist"
 	"xiomi-router-driver/internal/config"
+	"xiomi-router-driver/internal/dnsproxy"
 	"xiomi-router-driver/internal/domains"
 	"xiomi-router-driver/internal/events"
 	"xiomi-router-driver/internal/openvpn"
@@ -62,6 +63,18 @@ func main() {
 		log.Fatalf("prepare blacklist script: %v", err)
 	}
 
+	dnsProxyServer := ""
+	if dnsproxy.EnabledFromEnv() {
+		proxy, err := dnsproxy.Start(context.Background(), dnsproxy.ConfigFromEnv())
+		if err != nil {
+			log.Printf("dns proxy disabled: %v", err)
+		} else {
+			defer proxy.Close()
+			dnsProxyServer = proxy.DnsmasqServer()
+			log.Printf("dns proxy listening on %s for routed domains", dnsProxyServer)
+		}
+	}
+
 	stateManager := config.NewManager(db, filepath.Join(paths.DataDir, "vpn-state.json"))
 	domainManager := domains.NewManager(db, filepath.Join(paths.DataDir, ".vpn-manager", "domains.list"), filepath.Join(paths.DataDir, "domains.list"))
 	eventStore := events.NewStore(db, filepath.Join(paths.DataDir, "events.json"))
@@ -69,6 +82,7 @@ func main() {
 		_, _ = eventStore.Add(level, kind, message)
 	}
 	routingRunner := routing.NewRunner(routingScriptPath)
+	routingRunner.SetDNSProxyServer(dnsProxyServer)
 	automationManager := automation.NewManager(paths.AppDir, executablePath, port)
 	openvpnManager := openvpn.NewManager(paths.AppDir, paths.DataDir, db, routingRunner, recordEvent)
 	subscriptionManager := subscription.NewManager(paths.AppDir, paths.DataDir, db, routingRunner, recordEvent)
@@ -106,13 +120,13 @@ func main() {
 	}
 
 	apiHandler := api.NewHandler(api.Dependencies{
-		State:         stateManager,
-		Domains:       domainManager,
-		Events:        eventStore,
-		Routing:       routingRunner,
-		Automation:    automationManager,
-		OpenVPN:       openvpnManager,
-		Subscriptions: subscriptionManager,
+		State:           stateManager,
+		Domains:         domainManager,
+		Events:          eventStore,
+		Routing:         routingRunner,
+		Automation:      automationManager,
+		OpenVPN:         openvpnManager,
+		Subscriptions:   subscriptionManager,
 		Status:          statusService,
 		Blacklist:       blacklistManager,
 		BlacklistRunner: blacklistRunner,

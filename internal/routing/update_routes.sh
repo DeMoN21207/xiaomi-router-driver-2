@@ -17,6 +17,7 @@ FW_ZONE_CHAIN="${FW_ZONE_CHAIN:-zone_lan_forward}" # The firewall chain for the 
 IPSET_NAME="${IPSET_NAME:-vpn_hosts}"
 FWMARK="${FWMARK:-0x1}"
 DNSMASQ_CONFIG_FILE="${DNSMASQ_CONFIG_FILE:-/tmp/dnsmasq.d/vpn_dns.conf}"
+DNS_PROXY_SERVER="${DNS_PROXY_SERVER:-}"
 DOMAIN_STATS_CHAIN="${DOMAIN_STATS_CHAIN:-VDS_${IPSET_NAME}}"
 LEGACY_DOMAIN_STATS_CHAIN="${LEGACY_DOMAIN_STATS_CHAIN:-VPN_DOM_STATS_${IPSET_NAME}}"
 DNSMASQ_RESTART_LOG="${DNSMASQ_RESTART_LOG:-/tmp/vpn-manager-dnsmasq-restart.log}"
@@ -231,6 +232,9 @@ render_dnsmasq_config() {
 
         # Shared ipset for routing
         echo "ipset=/$domain/$IPSET_NAME" >> "$DNSMASQ_CONFIG_FILE"
+        if [ -n "$DNS_PROXY_SERVER" ]; then
+            echo "server=/$domain/$DNS_PROXY_SERVER" >> "$DNSMASQ_CONFIG_FILE"
+        fi
 
         if [ "$ENABLE_DOMAIN_STATS" = "1" ]; then
             # Per-domain ipset for traffic accounting

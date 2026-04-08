@@ -13,8 +13,9 @@ import (
 )
 
 type Runner struct {
-	scriptPath string
-	workingDir string
+	scriptPath     string
+	workingDir     string
+	dnsProxyServer string
 }
 
 type RunOptions struct {
@@ -32,6 +33,10 @@ func NewRunner(scriptPath string) *Runner {
 		scriptPath: scriptPath,
 		workingDir: workingDir,
 	}
+}
+
+func (r *Runner) SetDNSProxyServer(server string) {
+	r.dnsProxyServer = strings.TrimSpace(server)
 }
 
 func (r *Runner) Run(ctx context.Context, action string, settings config.RoutingSettings) error {
@@ -63,7 +68,7 @@ func (r *Runner) RunWithOptions(ctx context.Context, action string, options RunO
 
 	cmd := exec.CommandContext(ctx, shell, scriptPath, action)
 	cmd.Dir = r.workingDir
-	cmd.Env = withEnvMap(os.Environ(), map[string]string{
+	envValues := map[string]string{
 		"DOMAIN_LIST":               domainListPath,
 		"DOMAIN_STATS_MAX_DOMAINS":  strconv.Itoa(DomainStatsMaxDomains()),
 		"VPN_GATEWAY":               options.Settings.VPNGateway,
@@ -78,7 +83,11 @@ func (r *Runner) RunWithOptions(ctx context.Context, action string, options RunO
 		"DNSMASQ_CONFIG_FILE":       options.Settings.DNSMasqConfigFile,
 		"DOMAIN_STATS_CHAIN":        DomainStatsChainName(options.Settings.IPSetName),
 		"LEGACY_DOMAIN_STATS_CHAIN": LegacyDomainStatsChainName(options.Settings.IPSetName),
-	})
+	}
+	if r.dnsProxyServer != "" {
+		envValues["DNS_PROXY_SERVER"] = r.dnsProxyServer
+	}
+	cmd.Env = withEnvMap(os.Environ(), envValues)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		message := strings.TrimSpace(string(output))
