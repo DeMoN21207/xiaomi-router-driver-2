@@ -136,6 +136,7 @@ func main() {
 	go supervisor.Run(context.Background())
 	go statusService.RunTrafficSampler(context.Background())
 	go statusService.RunDomainTrafficSampler(context.Background())
+	go statusService.RunDomainHealthSampler(context.Background())
 	go statusService.RunSiteTrafficSampler(context.Background())
 
 	staticFS, err := fs.Sub(ui.Files, "static")

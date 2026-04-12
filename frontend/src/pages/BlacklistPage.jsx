@@ -15,6 +15,7 @@ export default function BlacklistPage() {
   const [toastError, setToastError] = useState(false);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [pendingDelete, setPendingDelete] = useState("");
   const fileInputRef = useRef(null);
 
   const showToast = useCallback((msg, isError = false) => {
@@ -144,7 +145,7 @@ export default function BlacklistPage() {
       <div className="rounded-2xl border border-outline-variant/10 bg-surface-container-lowest p-6">
         <form onSubmit={addEntries} className="space-y-3">
           <textarea
-            className="w-full resize-y rounded-lg border-none bg-surface-container-highest px-3 py-2 font-mono text-sm text-on-surface placeholder:text-outline-variant focus:ring-1 focus:ring-primary"
+            className="w-full resize-y rounded-lg border-none bg-surface-container-highest px-3 py-2 text-sm text-on-surface placeholder:text-outline-variant focus:ring-1 focus:ring-primary"
             rows={4}
             value={textInput}
             onChange={(e) => setTextInput(e.target.value)}
@@ -215,14 +216,34 @@ export default function BlacklistPage() {
                 {entry.type === "ip" && <Icon name="language" className="h-3 w-3 opacity-60" />}
                 {entry.type === "domain" && <Icon name="dns" className="h-3 w-3 opacity-60" />}
                 {entry.value}
-                <button
-                  type="button"
-                  onClick={() => deleteEntry(entry.value)}
-                  disabled={busy}
-                  className="ml-0.5 text-outline-variant transition-colors hover:text-error disabled:opacity-40"
-                >
-                  <Icon name="close" className="h-3 w-3" />
-                </button>
+                {pendingDelete === entry.value ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => { setPendingDelete(""); deleteEntry(entry.value); }}
+                      disabled={busy}
+                      className="ml-0.5 rounded bg-error/20 px-1 text-[10px] font-bold text-error transition-colors hover:bg-error/30 disabled:opacity-40"
+                    >
+                      ✕
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPendingDelete("")}
+                      className="text-outline-variant transition-colors hover:text-on-surface"
+                    >
+                      <Icon name="undo" className="h-3 w-3" />
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setPendingDelete(entry.value)}
+                    disabled={busy}
+                    className="ml-0.5 text-outline-variant transition-colors hover:text-error disabled:opacity-40"
+                  >
+                    <Icon name="close" className="h-3 w-3" />
+                  </button>
+                )}
               </span>
             ))}
           </div>

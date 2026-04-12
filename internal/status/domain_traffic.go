@@ -61,6 +61,18 @@ func readIptablesChainCounters(chainName string) ([]DomainTrafficStat, error) {
 
 var commentRegex = regexp.MustCompile(`/\*\s*(.+?)\s*\*/`)
 
+// splitDomainDirection parses comment tags like "example.com|up" / "example.com|dn"
+// into the plain domain and direction. Untagged comments return direction == "".
+func splitDomainDirection(raw string) (domain, direction string) {
+	if idx := strings.LastIndex(raw, "|"); idx >= 0 {
+		suffix := raw[idx+1:]
+		if suffix == "up" || suffix == "dn" {
+			return raw[:idx], suffix
+		}
+	}
+	return raw, ""
+}
+
 func parseIptablesOutput(output string) ([]DomainTrafficStat, error) {
 	var stats []DomainTrafficStat
 	lines := strings.Split(output, "\n")
@@ -251,9 +263,15 @@ func (s *domainTrafficStore) Upsert(stats []DomainTrafficStat, now string) error
 			continue
 		}
 
+		// Counter snapshots are tracked per direction so upload and download
+		// deltas don't overwrite each other. The accumulated totals are merged
+		// under the plain domain name — that's what users see in the UI.
+		domainName, _ := splitDomainDirection(stat.Domain)
+		counterKey := stat.Domain
+
 		// Get previous counter value to compute delta
 		var prevBytes, prevPackets uint64
-		_ = tx.QueryRow(`SELECT bytes, packets FROM domain_traffic_counters WHERE domain = ?`, stat.Domain).Scan(&prevBytes, &prevPackets)
+		_ = tx.QueryRow(`SELECT bytes, packets FROM domain_traffic_counters WHERE domain = ?`, counterKey).Scan(&prevBytes, &prevPackets)
 
 		// Compute delta (handle counter reset)
 		deltaBytes := counterDelta(stat.Bytes, prevBytes)
@@ -264,12 +282,12 @@ func (s *domainTrafficStore) Upsert(stats []DomainTrafficStat, now string) error
 			INSERT INTO domain_traffic_counters (domain, bytes, packets)
 			VALUES (?, ?, ?)
 			ON CONFLICT(domain) DO UPDATE SET bytes = excluded.bytes, packets = excluded.packets
-		`, stat.Domain, stat.Bytes, stat.Packets); err != nil {
+		`, counterKey, stat.Bytes, stat.Packets); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
 
-		// Accumulate deltas
+		// Accumulate deltas under the plain domain name (sum of up + dn).
 		if deltaBytes > 0 || deltaPackets > 0 {
 			if _, err := tx.Exec(`
 				INSERT INTO domain_traffic (domain, bytes, packets, updated_at)
@@ -278,7 +296,7 @@ func (s *domainTrafficStore) Upsert(stats []DomainTrafficStat, now string) error
 					bytes = domain_traffic.bytes + excluded.bytes,
 					packets = domain_traffic.packets + excluded.packets,
 					updated_at = excluded.updated_at
-			`, stat.Domain, deltaBytes, deltaPackets, now); err != nil {
+			`, domainName, deltaBytes, deltaPackets, now); err != nil {
 				_ = tx.Rollback()
 				return err
 			}

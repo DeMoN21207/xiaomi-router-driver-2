@@ -22,6 +22,7 @@ export default function TrafficStatsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [siteSortBy, setSiteSortBy] = useState("bytes");
+  const [siteSortDir, setSiteSortDir] = useState("desc");
   const [scope, setScope] = useState("all");
   const [siteSearch, setSiteSearch] = useState("");
   const [selectedDeviceIp, setSelectedDeviceIp] = useState("");
@@ -33,10 +34,42 @@ export default function TrafficStatsPage() {
   const [resetting, setResetting] = useState(false);
   const [collecting, setCollecting] = useState(false);
   const [autoRefreshMs, setAutoRefreshMs] = useState(() => readDashboardRefreshInterval());
+  const [routesConfig, setRoutesConfig] = useState(null);
+  const [addToProxy, setAddToProxy] = useState(null);
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef(null);
+
+  const showToast = useCallback((message, isError = false) => {
+    setToast({ message, error: isError });
+    if (toastTimer.current) {
+      window.clearTimeout(toastTimer.current);
+    }
+    toastTimer.current = window.setTimeout(() => setToast(null), 3200);
+  }, []);
+
+  useEffect(() => () => {
+    if (toastTimer.current) {
+      window.clearTimeout(toastTimer.current);
+    }
+  }, []);
+
+  const loadRoutesConfig = useCallback(async () => {
+    try {
+      const config = await fetchJSON("/api/config");
+      setRoutesConfig(config);
+      return config;
+    } catch (err) {
+      showToast(err.message, true);
+      return null;
+    }
+  }, [showToast]);
 
   const buildSitesURL = useCallback(() => {
     const query = new URLSearchParams();
     query.set("sort", siteSortBy);
+    if (siteSortDir !== "desc") {
+      query.set("order", siteSortDir);
+    }
     query.set("page", String(sitePage));
     query.set("pageSize", String(sitePageSize));
     if (scope !== "all") {
@@ -57,7 +90,7 @@ export default function TrafficStatsPage() {
       return `/api/traffic/sites/history?${query.toString()}`;
     }
     return `/api/traffic/sites?${query.toString()}`;
-  }, [deviceHistoryFrom, deviceHistoryRange, deviceHistoryTo, scope, selectedDeviceIp, sitePage, siteSearch, siteSortBy]);
+  }, [deviceHistoryFrom, deviceHistoryRange, deviceHistoryTo, scope, selectedDeviceIp, sitePage, siteSearch, siteSortBy, siteSortDir]);
 
   const buildDevicesURL = useCallback(() => {
     const query = new URLSearchParams();
@@ -119,8 +152,74 @@ export default function TrafficStatsPage() {
   }, [refresh]);
 
   useEffect(() => {
+    void loadRoutesConfig();
+  }, [loadRoutesConfig]);
+
+  const openAddToProxy = useCallback((item, target) => {
+    if (item.viaTunnel) {
+      showToast(t("trafficStats.addToProxyAlreadyTunneled"), true);
+      return;
+    }
+    const domain = item.domain || "";
+    const ip = item.lastIp || "";
+    if (!domain && !ip) return;
+    setAddToProxy({
+      domain,
+      ip,
+      defaultTarget: target === "ip" && ip ? "ip" : (domain ? "domain" : "ip"),
+      item,
+    });
+    void loadRoutesConfig();
+  }, [loadRoutesConfig, showToast, t]);
+
+  const closeAddToProxy = useCallback(() => setAddToProxy(null), []);
+
+  const submitAddToProxy = useCallback(async (ruleId, valuesToAdd) => {
+    if (!addToProxy || !routesConfig) return;
+    const rule = (routesConfig.rules || []).find((r) => r.id === ruleId);
+    if (!rule) return;
+    const provider = (routesConfig.providers || []).find((p) => p.id === rule.providerId);
+    if (!provider) return;
+
+    const cleanValues = (valuesToAdd || []).filter(Boolean);
+    if (cleanValues.length === 0) return;
+
+    const merged = Array.from(new Set([...(rule.domains || []), ...cleanValues]));
+    try {
+      await fetchJSON(`/api/rules/${encodeURIComponent(rule.id)}?apply=1`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: rule.name,
+          providerId: provider.id,
+          selectedLocation: rule.selectedLocation || "",
+          domains: merged.join(","),
+          enabled: rule.enabled,
+        }),
+      });
+      const routeLabel = rule.selectedLocation || rule.name || provider.name;
+      showToast(t("trafficStats.addToProxySuccess", { value: cleanValues.join(", "), route: routeLabel }));
+      setAddToProxy(null);
+      await loadRoutesConfig();
+      await refresh(false);
+    } catch (err) {
+      showToast(err.message, true);
+      throw err;
+    }
+  }, [addToProxy, loadRoutesConfig, refresh, routesConfig, showToast, t]);
+
+  const handleSortChange = useCallback((key) => {
+    if (key === siteSortBy) {
+      setSiteSortDir((d) => (d === "desc" ? "asc" : "desc"));
+    } else {
+      setSiteSortBy(key);
+      setSiteSortDir("desc");
+    }
+  }, [siteSortBy]);
+
+  useEffect(() => {
     setSitePage(1);
-  }, [scope, siteSortBy, siteSearch, selectedDeviceIp]);
+  }, [scope, siteSortBy, siteSortDir, siteSearch, selectedDeviceIp]);
 
   useEffect(() => {
     if (siteData && siteData.totalPages > 0 && sitePage > siteData.totalPages) {
@@ -400,7 +499,7 @@ export default function TrafficStatsPage() {
               <button
                 key={option}
                 type="button"
-                onClick={() => setSiteSortBy(option)}
+                onClick={() => handleSortChange(option)}
                 className={`rounded-full border px-3 py-1.5 text-xs font-bold uppercase tracking-wider transition-colors ${
                   siteSortBy === option
                     ? "border-primary/30 bg-primary/10 text-primary"
@@ -408,6 +507,7 @@ export default function TrafficStatsPage() {
                 }`}
               >
                 {t(`trafficStats.sort.${option}`)}
+                {siteSortBy === option && (siteSortDir === "asc" ? " ▲" : " ▼")}
               </button>
             ))}
           </div>
@@ -426,39 +526,69 @@ export default function TrafficStatsPage() {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-outline-variant/10 bg-surface-container text-left">
-                      <th className="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-outline">#</th>
-                      <th className="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-outline">{t("trafficStats.domain")}</th>
-                      <th className="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-outline">{t("trafficStats.route")}</th>
-                      <th className="px-5 py-3 text-right text-[10px] font-bold uppercase tracking-widest text-outline">{t("trafficStats.traffic")}</th>
-                      <th className="hidden px-5 py-3 text-right text-[10px] font-bold uppercase tracking-widest text-outline lg:table-cell">{t("trafficStats.packets")}</th>
-                      <th className="hidden px-5 py-3 text-right text-[10px] font-bold uppercase tracking-widest text-outline xl:table-cell">{t("trafficStats.share")}</th>
-                      <th className="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-outline" style={{ minWidth: 140 }}></th>
+                      <th className="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant">#</th>
+                      <SortableTh sortKey="domain" current={siteSortBy} dir={siteSortDir} onSort={handleSortChange}>{t("trafficStats.domain")}</SortableTh>
+                      <th className="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant">{t("trafficStats.route")}</th>
+                      <SortableTh sortKey="bytes" current={siteSortBy} dir={siteSortDir} onSort={handleSortChange} align="right">{t("trafficStats.traffic")}</SortableTh>
+                      <SortableTh sortKey="packets" current={siteSortBy} dir={siteSortDir} onSort={handleSortChange} align="right" className="hidden lg:table-cell">{t("trafficStats.packets")}</SortableTh>
+                      <SortableTh sortKey="bytes" current={siteSortBy} dir={siteSortDir} onSort={handleSortChange} align="right" className="hidden xl:table-cell">{t("trafficStats.share")}</SortableTh>
+                      <SortableTh sortKey="updated" current={siteSortBy} dir={siteSortDir} onSort={handleSortChange} className="hidden md:table-cell">{t("trafficStats.updated")}</SortableTh>
+                      <th className="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant" style={{ minWidth: 140 }}></th>
                     </tr>
                   </thead>
                   <tbody>
                     {sites.map((item, index) => {
                       const share = totalBytes > 0 ? (item.bytes / totalBytes) * 100 : 0;
                       const barWidth = maxSiteBytes > 0 ? Math.max(2, (item.bytes / maxSiteBytes) * 100) : 0;
+                      const clickable = !item.viaTunnel;
+                      const domainBaseClass = "font-medium text-on-surface text-left";
+                      const ipBaseClass = "font-mono text-[11px] text-on-surface-variant text-left";
+                      const interactiveClass = "cursor-pointer underline-offset-2 transition-colors hover:text-primary hover:underline";
                       return (
                         <tr key={`${item.domain}-${item.lastIp}`} className="border-b border-outline-variant/5 transition-colors hover:bg-surface-container/50">
-                          <td className="px-5 py-3 font-mono text-xs text-outline">
+                          <td className="px-5 py-3 font-mono text-xs text-on-surface-variant">
                             {(siteData.page - 1) * siteData.pageSize + index + 1}
                           </td>
                           <td className="px-5 py-3">
-                            <div className="flex flex-col gap-1">
-                              <span className="font-medium text-on-surface">{item.domain}</span>
-                              <span className="font-mono text-[11px] text-outline-variant">{item.lastIp || "-"}</span>
+                            <div className="flex flex-col items-start gap-1">
+                              {clickable ? (
+                                <button
+                                  type="button"
+                                  onClick={() => openAddToProxy(item, "domain")}
+                                  className={`${domainBaseClass} ${interactiveClass}`}
+                                  title={t("trafficStats.addToProxyTitle")}
+                                >
+                                  {item.domain}
+                                </button>
+                              ) : (
+                                <span className={domainBaseClass}>{item.domain}</span>
+                              )}
+                              {clickable && item.lastIp ? (
+                                <button
+                                  type="button"
+                                  onClick={() => openAddToProxy(item, "ip")}
+                                  className={`${ipBaseClass} ${interactiveClass}`}
+                                  title={t("trafficStats.addToProxyTitle")}
+                                >
+                                  {item.lastIp}
+                                </button>
+                              ) : (
+                                <span className={ipBaseClass}>{item.lastIp || "-"}</span>
+                              )}
                             </div>
                           </td>
                           <td className="px-5 py-3">
                             <RouteBadge item={item} t={t} />
                           </td>
                           <td className="px-5 py-3 text-right font-mono text-on-surface">{formatBytes(item.bytes)}</td>
-                          <td className="hidden px-5 py-3 text-right font-mono text-outline-variant lg:table-cell">
+                          <td className="hidden px-5 py-3 text-right font-mono text-on-surface-variant lg:table-cell">
                             {item.packets.toLocaleString()}
                           </td>
-                          <td className="hidden px-5 py-3 text-right font-mono text-outline-variant xl:table-cell">
+                          <td className="hidden px-5 py-3 text-right font-mono text-on-surface-variant xl:table-cell">
                             {share.toFixed(1)}%
+                          </td>
+                          <td className="hidden px-5 py-3 font-mono text-[11px] text-on-surface-variant md:table-cell whitespace-nowrap">
+                            {formatDateFull(item.updatedAt) || "—"}
                           </td>
                           <td className="px-5 py-3">
                             <div className="h-2 overflow-hidden rounded-full bg-surface-container-highest/50">
@@ -490,7 +620,216 @@ export default function TrafficStatsPage() {
           )}
         </div>
       </section>
+
+      {addToProxy ? (
+        <AddToProxyModal
+          state={addToProxy}
+          rules={routesConfig?.rules ?? []}
+          providers={routesConfig?.providers ?? []}
+          onClose={closeAddToProxy}
+          onSubmit={submitAddToProxy}
+          t={t}
+        />
+      ) : null}
+
+      {toast ? (
+        <div
+          className={`fixed right-6 bottom-6 z-50 rounded-xl px-5 py-3 text-sm font-medium shadow-2xl ${
+            toast.error ? "bg-error-container text-on-error" : "bg-secondary-container text-on-secondary"
+          }`}
+        >
+          {toast.message}
+        </div>
+      ) : null}
     </div>
+  );
+}
+
+function AddToProxyModal({ state, rules, providers, onClose, onSubmit, t }) {
+  const providerById = useMemo(() => {
+    const map = new Map();
+    for (const provider of providers || []) {
+      map.set(provider.id, provider);
+    }
+    return map;
+  }, [providers]);
+  const sortedRules = useMemo(() => {
+    return [...(rules || [])].sort((left, right) => {
+      const leftLabel = (left.selectedLocation || left.name || "").toLowerCase();
+      const rightLabel = (right.selectedLocation || right.name || "").toLowerCase();
+      return leftLabel.localeCompare(rightLabel);
+    });
+  }, [rules]);
+
+  const [selectedRuleId, setSelectedRuleId] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [includeDomain, setIncludeDomain] = useState(() => Boolean(state.domain) && state.defaultTarget === "domain");
+  const [includeIp, setIncludeIp] = useState(() => Boolean(state.ip) && state.defaultTarget === "ip");
+
+  useEffect(() => {
+    if (sortedRules.length > 0 && !selectedRuleId) {
+      setSelectedRuleId(sortedRules[0].id);
+    }
+  }, [selectedRuleId, sortedRules]);
+
+  const selectedValues = [
+    includeDomain ? state.domain : "",
+    includeIp ? state.ip : "",
+  ].filter(Boolean);
+
+  async function handleConfirm() {
+    if (!selectedRuleId || selectedValues.length === 0) return;
+    setSubmitting(true);
+    try {
+      await onSubmit(selectedRuleId, selectedValues);
+    } catch {
+      // error already surfaced via toast in parent
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
+      <div
+        className="w-full max-w-lg rounded-2xl border border-outline-variant/20 bg-surface-container-low p-6 shadow-2xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="mb-4 flex items-start justify-between gap-3">
+          <div>
+            <h3 className="font-headline text-xl font-bold text-on-surface">{t("trafficStats.addToProxyTitle")}</h3>
+            <p className="mt-1 text-sm text-on-surface-variant">{t("trafficStats.addToProxyHint")}</p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-full p-1.5 text-on-surface-variant transition-colors hover:bg-surface-container-highest hover:text-on-surface"
+            aria-label={t("trafficStats.addToProxyCancel")}
+          >
+            <Icon name="close" className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="mb-4">
+          <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-outline">
+            {t("trafficStats.addToProxyTarget")}
+          </div>
+          <div className="space-y-2">
+            <ProxyTargetToggle
+              label={t("trafficStats.addToProxyDomain")}
+              value={state.domain}
+              checked={includeDomain}
+              disabled={!state.domain}
+              onChange={setIncludeDomain}
+            />
+            <ProxyTargetToggle
+              label={t("trafficStats.addToProxyIp")}
+              value={state.ip}
+              checked={includeIp}
+              disabled={!state.ip}
+              onChange={setIncludeIp}
+            />
+          </div>
+        </div>
+
+        {sortedRules.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-outline-variant/20 bg-surface-container p-4 text-sm text-on-surface-variant">
+            {t("trafficStats.addToProxyNoRoutes")}
+          </div>
+        ) : (
+          <div className="mb-4">
+            <label className="mb-2 block text-[10px] font-bold uppercase tracking-widest text-outline">
+              {t("trafficStats.addToProxyRoute")}
+            </label>
+            <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
+              {sortedRules.map((rule) => {
+                const provider = providerById.get(rule.providerId);
+                const label = rule.selectedLocation || rule.name || (provider?.name ?? rule.id);
+                const active = selectedRuleId === rule.id;
+                return (
+                  <button
+                    key={rule.id}
+                    type="button"
+                    onClick={() => setSelectedRuleId(rule.id)}
+                    className={`flex w-full items-center justify-between gap-3 rounded-xl border px-4 py-3 text-left transition-colors ${
+                      active
+                        ? "border-primary/40 bg-primary/10 text-on-surface"
+                        : "border-outline-variant/15 bg-surface-container hover:border-primary/25 hover:bg-surface-container-high"
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <Icon name="location_on" className="h-4 w-4 text-primary" />
+                        <span className="truncate font-medium text-on-surface">{label}</span>
+                      </div>
+                      <div className="mt-1 truncate text-xs text-on-surface-variant">
+                        {provider ? provider.name : "—"}
+                        {rule.domains?.length ? ` · ${rule.domains.length}` : ""}
+                      </div>
+                    </div>
+                    <span
+                      className={`inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border ${
+                        active ? "border-primary bg-primary" : "border-outline-variant"
+                      }`}
+                    >
+                      {active ? <span className="h-1.5 w-1.5 rounded-full bg-white" /> : null}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        <div className="flex items-center justify-end gap-3">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={submitting}
+            className="rounded-xl border border-outline-variant/20 bg-surface-container-high px-5 py-2.5 text-sm font-medium text-on-surface transition-colors hover:bg-surface-variant disabled:opacity-50"
+          >
+            {t("trafficStats.addToProxyCancel")}
+          </button>
+          <button
+            type="button"
+            onClick={handleConfirm}
+            disabled={submitting || sortedRules.length === 0 || !selectedRuleId || selectedValues.length === 0}
+            className="rounded-xl bg-gradient-to-r from-primary to-primary-container px-5 py-2.5 text-sm font-bold text-on-primary shadow-lg shadow-primary/10 transition-all active:scale-95 disabled:opacity-50"
+          >
+            {submitting ? t("trafficStats.addToProxySubmitting") : t("trafficStats.addToProxySubmit")}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProxyTargetToggle({ label, value, checked, disabled, onChange }) {
+  const interactive = !disabled;
+  return (
+    <label
+      className={`flex items-center gap-3 rounded-xl border px-4 py-3 transition-colors ${
+        disabled
+          ? "border-outline-variant/10 bg-surface-container/40 opacity-50"
+          : checked
+            ? "cursor-pointer border-primary/40 bg-primary/10"
+            : "cursor-pointer border-outline-variant/15 bg-surface-container hover:border-primary/25 hover:bg-surface-container-high"
+      }`}
+    >
+      <input
+        type="checkbox"
+        className="h-4 w-4 cursor-pointer accent-primary disabled:cursor-default"
+        checked={checked && interactive}
+        disabled={disabled}
+        onChange={(event) => interactive && onChange(event.target.checked)}
+      />
+      <div className="min-w-0 flex-1">
+        <div className="text-[10px] font-bold uppercase tracking-widest text-outline">{label}</div>
+        <div className="mt-0.5 break-all font-mono text-sm font-medium text-on-surface">
+          {value || "—"}
+        </div>
+      </div>
+    </label>
   );
 }
 
@@ -990,6 +1329,27 @@ function ChartTooltip({ svgRef, points, range, renderContent, mode = "proximity"
       </p>
       {renderContent(active)}
     </div>
+  );
+}
+
+function SortableTh({ sortKey, current, dir, onSort, children, align = "left", className = "" }) {
+  const isActive = current === sortKey;
+  const justify = align === "right" ? "justify-end" : "justify-start";
+  const textAlign = align === "right" ? "text-right" : "text-left";
+  const arrow = isActive && dir === "asc" ? "▲" : "▼";
+  return (
+    <th className={`px-5 py-3 ${textAlign} text-[10px] font-bold uppercase tracking-widest text-on-surface-variant ${className}`}>
+      <button
+        type="button"
+        onClick={() => onSort(sortKey)}
+        className={`inline-flex items-center gap-1 ${justify} w-full transition-colors hover:text-on-surface ${
+          isActive ? "text-primary" : ""
+        }`}
+      >
+        <span>{children}</span>
+        <span className={`text-[9px] ${isActive ? "opacity-100" : "opacity-20"}`}>{arrow}</span>
+      </button>
+    </th>
   );
 }
 

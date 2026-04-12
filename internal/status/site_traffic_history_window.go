@@ -7,26 +7,26 @@ import (
 	"time"
 )
 
-func (s *Service) SiteTrafficHistory(scope string, sortBy string, sourceIP string, search string, page int, pageSize int, rangeName string) (SiteTrafficResponse, error) {
+func (s *Service) SiteTrafficHistory(scope string, sortBy string, order string, sourceIP string, search string, page int, pageSize int, rangeName string) (SiteTrafficResponse, error) {
 	spec, err := parseDeviceTrafficHistoryRange(rangeName)
 	if err != nil {
 		return SiteTrafficResponse{}, err
 	}
 
 	now := time.Now().UTC()
-	return s.siteTrafficHistoryWindow(scope, sortBy, sourceIP, search, page, pageSize, now.Add(-spec.Lookback), now)
+	return s.siteTrafficHistoryWindow(scope, sortBy, order, sourceIP, search, page, pageSize, now.Add(-spec.Lookback), now)
 }
 
-func (s *Service) SiteTrafficHistoryCustom(scope string, sortBy string, sourceIP string, search string, page int, pageSize int, fromStr string, toStr string) (SiteTrafficResponse, error) {
+func (s *Service) SiteTrafficHistoryCustom(scope string, sortBy string, order string, sourceIP string, search string, page int, pageSize int, fromStr string, toStr string) (SiteTrafficResponse, error) {
 	_, from, to, err := parseDeviceTrafficHistoryCustomRange(fromStr, toStr)
 	if err != nil {
 		return SiteTrafficResponse{}, err
 	}
 
-	return s.siteTrafficHistoryWindow(scope, sortBy, sourceIP, search, page, pageSize, from, to)
+	return s.siteTrafficHistoryWindow(scope, sortBy, order, sourceIP, search, page, pageSize, from, to)
 }
 
-func (s *Service) siteTrafficHistoryWindow(scope string, sortBy string, sourceIP string, search string, page int, pageSize int, from time.Time, to time.Time) (SiteTrafficResponse, error) {
+func (s *Service) siteTrafficHistoryWindow(scope string, sortBy string, order string, sourceIP string, search string, page int, pageSize int, from time.Time, to time.Time) (SiteTrafficResponse, error) {
 	page = normalizeTrafficPage(page)
 	pageSize = normalizeTrafficPageSize(pageSize, defaultSiteTrafficPageSize)
 	sourceIP = strings.TrimSpace(sourceIP)
@@ -46,7 +46,7 @@ func (s *Service) siteTrafficHistoryWindow(scope string, sortBy string, sourceIP
 		}, nil
 	}
 
-	result, err := s.siteTraffic.ListHistory(scope, sortBy, sourceIP, search, page, pageSize, from, to)
+	result, err := s.siteTraffic.ListHistory(scope, sortBy, order, sourceIP, search, page, pageSize, from, to)
 	if err != nil {
 		return SiteTrafficResponse{}, err
 	}
@@ -63,7 +63,7 @@ func (s *Service) siteTrafficHistoryWindow(scope string, sortBy string, sourceIP
 	}, nil
 }
 
-func (s *siteTrafficStore) ListHistory(scope string, sortBy string, sourceIP string, search string, page int, pageSize int, from time.Time, to time.Time) (pagedSiteTrafficResult, error) {
+func (s *siteTrafficStore) ListHistory(scope string, sortBy string, order string, sourceIP string, search string, page int, pageSize int, from time.Time, to time.Time) (pagedSiteTrafficResult, error) {
 	if err := s.ensureReady(); err != nil {
 		return pagedSiteTrafficResult{}, err
 	}
@@ -125,7 +125,7 @@ func (s *siteTrafficStore) ListHistory(scope string, sortBy string, sourceIP str
 			COALESCE(MAX(route_label), '') AS route_label
 		FROM device_site_traffic_history` + where + `
 		GROUP BY domain
-		ORDER BY ` + siteTrafficOrderClause(sortBy) + `
+		ORDER BY ` + siteTrafficOrderClause(sortBy, order) + `
 		LIMIT ? OFFSET ?`
 	queryArgs := append(append([]any{}, args...), pageSize, (page-1)*pageSize)
 

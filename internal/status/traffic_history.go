@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	defaultTrafficSampleInterval       = 10 * time.Minute
+	defaultTrafficSampleInterval       = 5 * time.Minute
 	defaultDomainTrafficSampleInterval = 30 * time.Second
 	trafficHistoryRetention            = 30 * 24 * time.Hour
 )

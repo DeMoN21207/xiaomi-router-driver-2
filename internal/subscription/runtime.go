@@ -101,6 +101,16 @@ type legacyManagedInstance struct {
 	PID            int                    `json:"pid"`
 }
 
+var runSubscriptionRoutingTeardown = func(r *routing.Runner, ctx context.Context, settings config.RoutingSettings) error {
+	if r == nil {
+		return nil
+	}
+
+	return r.RunWithOptions(ctx, "del", routing.RunOptions{
+		Settings: settings,
+	})
+}
+
 func NewManager(appDir string, dataDir string, db *sql.DB, routingRunner *routing.Runner, recordEvent func(level string, kind string, message string)) *Manager {
 	singBoxBinary := runtimebin.Resolve(os.Getenv("VPN_MANAGER_SINGBOX_BIN"), "sing-box", appDir, dataDir)
 
@@ -343,6 +353,7 @@ func (m *Manager) watchInstance(key string, cmd *exec.Cmd) {
 	_ = m.deleteInstanceLocked(key)
 	removeIfExists(current.domainListPath)
 	removeIfExists(current.ConfigPath)
+	_ = runSubscriptionRoutingTeardown(m.routing, context.Background(), current.Settings)
 	_ = m.pruneRuntimeFilesLocked()
 
 	if err != nil {

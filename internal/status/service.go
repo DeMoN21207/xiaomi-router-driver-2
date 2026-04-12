@@ -100,9 +100,11 @@ type Service struct {
 	wanProbe                    string
 	history                     *trafficHistoryStore
 	domainTraffic               *domainTrafficStore
+	domainHealth                *domainHealthStore
 	siteTraffic                 *siteTrafficStore
 	trafficSampleInterval       time.Duration
 	domainTrafficSampleInterval time.Duration
+	domainHealthSampleInterval  time.Duration
 	siteTrafficSampleInterval   time.Duration
 }
 
@@ -138,9 +140,11 @@ func NewService(
 		wanProbe:                    wanProbe,
 		history:                     newTrafficHistoryStore(db, legacyTrafficPath, trafficHistoryRetention),
 		domainTraffic:               newDomainTrafficStore(db),
+		domainHealth:                newDomainHealthStore(db),
 		siteTraffic:                 newSiteTrafficStore(db),
 		trafficSampleInterval:       resolveTrafficSampleInterval(),
 		domainTrafficSampleInterval: resolveDomainTrafficSampleInterval(),
+		domainHealthSampleInterval:  resolveDomainHealthSampleInterval(),
 		siteTrafficSampleInterval:   resolveSiteTrafficSampleInterval(),
 	}
 }

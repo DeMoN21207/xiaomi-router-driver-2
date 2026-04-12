@@ -220,7 +220,7 @@ func (s *Service) SampleSiteTraffic() error {
 	return s.siteTraffic.UpsertConnections(entries, now)
 }
 
-func (s *Service) SiteTraffic(scope string, sortBy string, sourceIP string, search string, page int, pageSize int) (SiteTrafficResponse, error) {
+func (s *Service) SiteTraffic(scope string, sortBy string, order string, sourceIP string, search string, page int, pageSize int) (SiteTrafficResponse, error) {
 	page = normalizeTrafficPage(page)
 	pageSize = normalizeTrafficPageSize(pageSize, defaultSiteTrafficPageSize)
 
@@ -235,7 +235,7 @@ func (s *Service) SiteTraffic(scope string, sortBy string, sourceIP string, sear
 		}, nil
 	}
 
-	result, err := s.siteTraffic.List(scope, sortBy, sourceIP, search, page, pageSize)
+	result, err := s.siteTraffic.List(scope, sortBy, order, sourceIP, search, page, pageSize)
 	if err != nil {
 		return SiteTrafficResponse{}, err
 	}
@@ -1180,7 +1180,7 @@ func (s *siteTrafficStore) UpsertConnections(entries []siteTrafficConnection, no
 	return tx.Commit()
 }
 
-func (s *siteTrafficStore) List(scope string, sortBy string, sourceIP string, search string, page int, pageSize int) (pagedSiteTrafficResult, error) {
+func (s *siteTrafficStore) List(scope string, sortBy string, order string, sourceIP string, search string, page int, pageSize int) (pagedSiteTrafficResult, error) {
 	if err := s.ensureReady(); err != nil {
 		return pagedSiteTrafficResult{}, err
 	}
@@ -1227,7 +1227,7 @@ func (s *siteTrafficStore) List(scope string, sortBy string, sourceIP string, se
 	}
 
 	query := `SELECT domain, bytes, packets, updated_at, last_ip, via_tunnel, route_label FROM ` + tableName + where +
-		` ORDER BY ` + siteTrafficOrderClause(sortBy) + ` LIMIT ? OFFSET ?`
+		` ORDER BY ` + siteTrafficOrderClause(sortBy, order) + ` LIMIT ? OFFSET ?`
 	queryArgs := append(append([]any{}, args...), pageSize, (page-1)*pageSize)
 
 	rows, err := s.db.Query(query, queryArgs...)
@@ -1450,14 +1450,21 @@ func (s *siteTrafficStore) listDeviceOptions(scope string) ([]DeviceTrafficOptio
 	return options, rows.Err()
 }
 
-func siteTrafficOrderClause(sortBy string) string {
+func siteTrafficOrderClause(sortBy, order string) string {
+	asc := strings.ToLower(strings.TrimSpace(order)) == "asc"
+	d := "DESC"
+	if asc {
+		d = "ASC"
+	}
 	switch strings.TrimSpace(sortBy) {
 	case "domain":
-		return "LOWER(domain) ASC, bytes DESC"
+		return "LOWER(domain) " + d + ", bytes DESC"
 	case "packets":
-		return "packets DESC, bytes DESC, LOWER(domain) ASC"
+		return "packets " + d + ", bytes DESC, LOWER(domain) ASC"
+	case "updated":
+		return "updated_at " + d + ", bytes DESC, LOWER(domain) ASC"
 	default:
-		return "bytes DESC, packets DESC, LOWER(domain) ASC"
+		return "bytes " + d + ", packets DESC, LOWER(domain) ASC"
 	}
 }
 

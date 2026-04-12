@@ -15,6 +15,7 @@ export default function EventsPage() {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [clearing, setClearing] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
   const [error, setError] = useState("");
 
   const levelFilters = useMemo(
@@ -77,6 +78,14 @@ export default function EventsPage() {
   const filtered = filter ? events.filter((event) => event.level === filter) : events;
   const hasMore = events.length < total;
 
+  const levelCounts = useMemo(() => {
+    const counts = { info: 0, warn: 0, error: 0 };
+    for (const e of events) {
+      if (e.level in counts) counts[e.level]++;
+    }
+    return counts;
+  }, [events]);
+
   return (
     <div className="space-y-8">
       <div className="flex flex-col justify-between gap-6 md:flex-row md:items-end">
@@ -94,15 +103,36 @@ export default function EventsPage() {
         </div>
         <div className="flex items-center gap-2">
           {events.length > 0 && (
-            <button
-              type="button"
-              onClick={clearAll}
-              disabled={clearing}
-              className="flex items-center gap-2 rounded-lg border border-error/20 px-4 py-2 text-xs font-bold uppercase tracking-wider text-error transition-colors duration-100 hover:bg-error/10 active:scale-95 disabled:opacity-50"
-            >
-              <Icon name="delete_sweep" className="h-4 w-4" />
-              {clearing ? t("events.clearing") : t("events.clear")}
-            </button>
+            confirmClear ? (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-on-surface-variant">{t("events.clearConfirm")}</span>
+                <button
+                  type="button"
+                  onClick={() => { setConfirmClear(false); void clearAll(); }}
+                  disabled={clearing}
+                  className="rounded-lg border border-error/30 bg-error/10 px-3 py-2 text-xs font-bold uppercase tracking-wider text-error transition-colors hover:bg-error/20 disabled:opacity-50"
+                >
+                  {t("events.clearYes")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmClear(false)}
+                  className="rounded-lg border border-outline-variant/20 px-3 py-2 text-xs font-bold uppercase tracking-wider text-on-surface-variant transition-colors hover:bg-surface-container"
+                >
+                  {t("connections.cancel")}
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmClear(true)}
+                disabled={clearing}
+                className="flex items-center gap-2 rounded-lg border border-error/20 px-4 py-2 text-xs font-bold uppercase tracking-wider text-error transition-colors duration-100 hover:bg-error/10 active:scale-95 disabled:opacity-50"
+              >
+                <Icon name="delete_sweep" className="h-4 w-4" />
+                {t("events.clear")}
+              </button>
+            )
           )}
           <button
             type="button"
@@ -127,6 +157,7 @@ export default function EventsPage() {
             error: { active: "border-error/30 bg-error/10", icon: "text-error", text: "text-error" },
           };
           const c = colorMap[item.color];
+          const count = item.value === "" ? total : levelCounts[item.value] ?? 0;
           return (
             <button
               key={item.value}
@@ -140,7 +171,10 @@ export default function EventsPage() {
                 <Icon name={item.icon} className={`h-5 w-5 ${isActive ? c.icon : "text-outline"}`} />
                 <span className="font-headline text-[10px] uppercase tracking-widest text-outline">{t("events.filter")}</span>
               </div>
-              <span className={`font-headline font-bold ${isActive ? c.text : "text-on-surface"}`}>{item.label}</span>
+              <div className="flex items-baseline gap-2">
+                <span className={`font-headline font-bold ${isActive ? c.text : "text-on-surface"}`}>{item.label}</span>
+                {!loading && <span className={`font-mono text-xs ${isActive ? c.text : "text-outline"}`}>{count}</span>}
+              </div>
             </button>
           );
         })}

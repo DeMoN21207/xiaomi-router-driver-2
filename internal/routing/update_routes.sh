@@ -188,6 +188,7 @@ cleanup_domain_stats() {
     for stats_chain in "$DOMAIN_STATS_CHAIN" "$LEGACY_DOMAIN_STATS_CHAIN"; do
         if [ -z "$stats_chain" ]; then continue; fi
         iptables -D FORWARD -o "$VPN_IFACE" -j "$stats_chain" >/dev/null 2>&1
+        iptables -D FORWARD -i "$VPN_IFACE" -j "$stats_chain" >/dev/null 2>&1
         iptables -F "$stats_chain" >/dev/null 2>&1
         iptables -X "$stats_chain" >/dev/null 2>&1
     done
@@ -244,8 +245,11 @@ render_dnsmasq_config() {
             ipset create "$dom_set" hash:ip family inet timeout 3600 2>/dev/null
             echo "ipset=/$domain/$dom_set" >> "$DNSMASQ_CONFIG_FILE"
 
-            # Add iptables accounting rule with domain name in comment
-            iptables -A "$DOMAIN_STATS_CHAIN" -m set --match-set "$dom_set" dst -m comment --comment "$domain" >/dev/null 2>&1
+            # Accounting rules: upload (LAN->VPN, dst=server) and download (VPN->LAN, src=server).
+            # Comment suffix tags the direction so the Go parser can track snapshots per direction
+            # and sum them into a single user-visible domain row.
+            iptables -A "$DOMAIN_STATS_CHAIN" -m set --match-set "$dom_set" dst -m comment --comment "${domain}|up" >/dev/null 2>&1
+            iptables -A "$DOMAIN_STATS_CHAIN" -m set --match-set "$dom_set" src -m comment --comment "${domain}|dn" >/dev/null 2>&1
         fi
     done
 }
@@ -302,10 +306,11 @@ add_routes() {
         fi
     fi
 
-    # 5b. Insert domain stats accounting chain into FORWARD
+    # 5b. Insert domain stats accounting chain into FORWARD (both directions)
     if [ "$ENABLE_DOMAIN_STATS" = "1" ]; then
         echo "--> Inserting domain stats accounting jump..."
         iptables -I FORWARD -o "$VPN_IFACE" -j "$DOMAIN_STATS_CHAIN" 2>/dev/null
+        iptables -I FORWARD -i "$VPN_IFACE" -j "$DOMAIN_STATS_CHAIN" 2>/dev/null
     fi
 
     # 6. Create a new routing table for the VPN gateway
@@ -372,6 +377,7 @@ sync_routes() {
     if [ "$ENABLE_DOMAIN_STATS" = "1" ]; then
         echo "--> Restoring domain stats accounting jump..."
         iptables -I FORWARD -o "$VPN_IFACE" -j "$DOMAIN_STATS_CHAIN" 2>/dev/null
+        iptables -I FORWARD -i "$VPN_IFACE" -j "$DOMAIN_STATS_CHAIN" 2>/dev/null
     fi
 
     ip route flush cache

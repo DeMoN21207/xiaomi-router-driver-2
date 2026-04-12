@@ -241,6 +241,8 @@ const iconMap = {
     </>
   ),
   expand_more: <path d="m7 10 5 5 5-5" />,
+  chevron_left: <path d="m15 6-6 6 6 6" />,
+  chevron_right: <path d="m9 6 6 6-6 6" />,
   hourglass_empty: (
     <>
       <path d="M7 4h10v3a5 5 0 0 1-5 5 5 5 0 0 1-5-5V4Z" />
@@ -317,6 +319,84 @@ const iconMap = {
       <path d="M14.1 9.9a3 3 0 1 1-4.2 4.2" />
       <path d="M1 1l22 22" />
       <path d="M9.9 4.2A9.1 9.1 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.2 3.1" />
+    </>
+  ),
+  swap_horiz: (
+    <>
+      <path d="M7 16H3l4-4" />
+      <path d="M3 16h14" />
+      <path d="M17 8h4l-4 4" />
+      <path d="M21 8H7" />
+    </>
+  ),
+  undo: (
+    <>
+      <path d="M3 10h10a5 5 0 0 1 0 10H9" />
+      <path d="M3 10l4-4" />
+      <path d="M3 10l4 4" />
+    </>
+  ),
+  content_copy: (
+    <>
+      <rect x="9" y="9" width="12" height="12" rx="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </>
+  ),
+  location_on: (
+    <>
+      <path d="M12 3a6 6 0 0 1 6 6c0 5.25-6 12-6 12S6 14.25 6 9a6 6 0 0 1 6-6Z" />
+      <circle cx="12" cy="9" r="2" />
+    </>
+  ),
+  expand_less: <path d="m17 14-5-5-5 5" />,
+  travel_explore: (
+    <>
+      <circle cx="9.5" cy="9.5" r="6.5" />
+      <path d="M3 9.5A6.5 6.5 0 0 0 9.5 16" />
+      <path d="M9.5 3a10 6.5 0 0 1 0 13" />
+      <path d="M3.5 9.5h12" />
+      <path d="m14 14 5.5 5.5" />
+    </>
+  ),
+  check: <path d="m4 12 5 5L20 7" />,
+  arrow_drop_up: <path d="m8 14 4-5 4 5" />,
+  arrow_drop_down: <path d="m8 10 4 5 4-5" />,
+  restart_alt: (
+    <>
+      <path d="M4 12a8 8 0 1 1 2.1 5.5" />
+      <path d="M4 20v-5h5" />
+    </>
+  ),
+  memory: (
+    <>
+      <rect x="3" y="7" width="18" height="10" rx="2" />
+      <path d="M7 7V5" />
+      <path d="M11 7V5" />
+      <path d="M15 7V5" />
+      <path d="M7 17v2" />
+      <path d="M11 17v2" />
+      <path d="M15 17v2" />
+      <path d="M9 11h6" />
+    </>
+  ),
+  apps: (
+    <>
+      <rect x="3" y="3" width="4" height="4" rx="0.5" />
+      <rect x="10" y="3" width="4" height="4" rx="0.5" />
+      <rect x="17" y="3" width="4" height="4" rx="0.5" />
+      <rect x="3" y="10" width="4" height="4" rx="0.5" />
+      <rect x="10" y="10" width="4" height="4" rx="0.5" />
+      <rect x="17" y="10" width="4" height="4" rx="0.5" />
+      <rect x="3" y="17" width="4" height="4" rx="0.5" />
+      <rect x="10" y="17" width="4" height="4" rx="0.5" />
+      <rect x="17" y="17" width="4" height="4" rx="0.5" />
+    </>
+  ),
+  error_outline: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 8v5" />
+      <path d="M12 16.5h.01" />
     </>
   ),
   pending: <circle cx="12" cy="12" r="9" />,

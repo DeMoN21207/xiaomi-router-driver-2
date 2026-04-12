@@ -21,6 +21,7 @@ const (
 	defaultAddr       = "127.0.0.1:15353"
 	defaultTimeout    = 8 * time.Second
 	defaultMaxMessage = 65535
+	defaultMaxIdleConnsPerHost = 8
 )
 
 var defaultUpstreams = []string{
@@ -45,6 +46,11 @@ type Server struct {
 	tcpLn      net.Listener
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
+}
+
+type resolveResult struct {
+	response []byte
+	err      error
 }
 
 func EnabledFromEnv() bool {
@@ -96,6 +102,7 @@ func New(config Config) (*Server, error) {
 	config = normalizeConfig(config)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = http.ProxyFromEnvironment
+	transport.MaxIdleConnsPerHost = max(defaultMaxIdleConnsPerHost, len(config.Upstreams))
 
 	return &Server{
 		addr:       config.Addr,
@@ -234,10 +241,12 @@ func (s *Server) serveTCP(ctx context.Context) {
 
 func (s *Server) handleTCPConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(s.timeout))
 
 	for {
 		var lengthHeader [2]byte
+		if s.timeout > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(s.timeout))
+		}
 		if _, err := io.ReadFull(conn, lengthHeader[:]); err != nil {
 			return
 		}
@@ -248,6 +257,9 @@ func (s *Server) handleTCPConn(ctx context.Context, conn net.Conn) {
 		}
 
 		query := make([]byte, length)
+		if s.timeout > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(s.timeout))
+		}
 		if _, err := io.ReadFull(conn, query); err != nil {
 			return
 		}
@@ -258,8 +270,14 @@ func (s *Server) handleTCPConn(ctx context.Context, conn net.Conn) {
 		}
 
 		binary.BigEndian.PutUint16(lengthHeader[:], uint16(len(response)))
+		if s.timeout > 0 {
+			_ = conn.SetWriteDeadline(time.Now().Add(s.timeout))
+		}
 		if _, err := conn.Write(lengthHeader[:]); err != nil {
 			return
+		}
+		if s.timeout > 0 {
+			_ = conn.SetWriteDeadline(time.Now().Add(s.timeout))
 		}
 		if _, err := conn.Write(response); err != nil {
 			return
@@ -279,18 +297,41 @@ func (s *Server) resolveOrServFail(ctx context.Context, query []byte) []byte {
 }
 
 func (s *Server) resolve(ctx context.Context, query []byte) ([]byte, error) {
-	var lastErr error
+	if len(s.upstreams) == 0 {
+		return nil, errors.New("no DNS-over-HTTPS upstreams configured")
+	}
+
+	queryCtx, cancel := s.withQueryTimeout(ctx)
+	defer cancel()
+
+	raceCtx, raceCancel := context.WithCancel(queryCtx)
+	defer raceCancel()
+
+	results := make(chan resolveResult, len(s.upstreams))
 	for _, upstream := range s.upstreams {
-		response, err := s.resolveOnce(ctx, upstream, query)
-		if err == nil {
-			return response, nil
+		upstream := upstream
+		go func() {
+			response, err := s.resolveOnce(raceCtx, upstream, query)
+			results <- resolveResult{response: response, err: err}
+		}()
+	}
+
+	errs := make([]error, 0, len(s.upstreams)+1)
+	for range s.upstreams {
+		select {
+		case <-queryCtx.Done():
+			errs = append(errs, queryCtx.Err())
+			return nil, errors.Join(errs...)
+		case result := <-results:
+			if result.err == nil {
+				raceCancel()
+				return result.response, nil
+			}
+			errs = append(errs, result.err)
 		}
-		lastErr = err
 	}
-	if lastErr == nil {
-		lastErr = errors.New("no DNS-over-HTTPS upstreams configured")
-	}
-	return nil, lastErr
+
+	return nil, errors.Join(errs...)
 }
 
 func (s *Server) resolveOnce(ctx context.Context, upstream string, query []byte) ([]byte, error) {
@@ -409,4 +450,14 @@ func splitList(value string) []string {
 		return r == ',' || r == ';' || r == '\n' || r == '\r' || r == '\t' || r == ' '
 	})
 	return normalizeUpstreams(parts)
+}
+
+func (s *Server) withQueryTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if s.timeout <= 0 {
+		return ctx, func() {}
+	}
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= s.timeout {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, s.timeout)
 }

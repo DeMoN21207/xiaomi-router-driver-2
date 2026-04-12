@@ -11,10 +11,166 @@ const DOMAIN_PREVIEW_LIMIT = 80;
 const DOMAIN_SEARCH_RESULT_LIMIT = 200;
 const ROUTING_ENTRIES_EXAMPLE = "# Example routing entries\n# Lines starting with # are ignored\n# Domains, IPv4 addresses and IPv4 CIDR ranges are supported\n\nyoutube.com\ngooglevideo.com\ndiscord.com\ngateway.discord.gg\n149.154.160.0/20\n91.108.56.0/22\n";
 
+function createDomainHealthMap(payload) {
+  return new Map((payload?.domains ?? []).map((entry) => [entry.domain, entry]));
+}
+
+function getDomainHealthRecord(domainHealthMap, domain) {
+  return domainHealthMap?.get?.(domain) ?? {
+    domain,
+    directDnsStatus: "unknown",
+    directTransportStatus: "unknown",
+    vpnDnsStatus: "unknown",
+    vpnTransportStatus: "unknown",
+    decision: "review",
+    consecutiveDirectDnsFailures: 0,
+    consecutiveDirectTransportFailures: 0,
+    consecutiveVpnDnsFailures: 0,
+    consecutiveVpnTransportFailures: 0,
+    checksTotal: 0,
+    successTotal: 0,
+    lastCheckedAt: "",
+    lastDirectOkAt: "",
+    lastVpnOkAt: "",
+    directLastError: "",
+    vpnLastError: "",
+    lastDirectIps: [],
+    lastVpnIps: [],
+  };
+}
+
+function isDomainPathHealthy(dnsStatus, transportStatus) {
+  if (dnsStatus === "static") {
+    return true;
+  }
+  if (dnsStatus !== "ok") {
+    return false;
+  }
+  return ["ok", "unknown", "static"].includes(transportStatus);
+}
+
+function matchesDomainHealthFilter(record, filter) {
+  const directHealthy = isDomainPathHealthy(record.directDnsStatus, record.directTransportStatus);
+  const vpnHealthy = isDomainPathHealthy(record.vpnDnsStatus, record.vpnTransportStatus);
+
+  switch (String(filter || "all")) {
+    case "both":
+      return directHealthy && vpnHealthy;
+    case "direct_only":
+      return directHealthy && !vpnHealthy;
+    case "vpn_only":
+      return !directHealthy && vpnHealthy;
+    case "neither":
+      return !directHealthy && !vpnHealthy;
+    case "candidates":
+      return record.decision === "delete_candidate";
+    case "unchecked":
+      return record.directDnsStatus === "unknown" && record.vpnDnsStatus === "unknown";
+    default:
+      return true;
+  }
+}
+
+function getDomainDnsMeta(status, t) {
+  switch (String(status || "unknown")) {
+    case "ok":
+      return { label: t("connections.domainStatusOk"), className: "bg-secondary/10 text-secondary" };
+    case "static":
+      return { label: t("connections.domainStatusStatic"), className: "bg-outline-variant/15 text-on-surface-variant" };
+    case "nxdomain":
+      return { label: t("connections.domainStatusNxdomain"), className: "bg-error/10 text-error" };
+    case "timeout":
+      return { label: t("connections.domainStatusTimeout"), className: "bg-tertiary/10 text-tertiary" };
+    case "servfail":
+      return { label: t("connections.domainStatusServfail"), className: "bg-tertiary/10 text-tertiary" };
+    case "noanswer":
+      return { label: t("connections.domainStatusNoanswer"), className: "bg-tertiary/10 text-tertiary" };
+    case "error":
+      return { label: t("connections.domainStatusError"), className: "bg-error/10 text-error" };
+    case "runtime_down":
+      return { label: t("connections.domainStatusRuntimeDown"), className: "bg-error/10 text-error" };
+    default:
+      return { label: t("connections.domainStatusUnknown"), className: "bg-outline-variant/10 text-on-surface-variant" };
+  }
+}
+
+function getDomainTransportMeta(status, t) {
+  switch (String(status || "unknown")) {
+    case "ok":
+      return { label: t("connections.domainTransportStatusOk"), className: "bg-secondary/10 text-secondary" };
+    case "static":
+      return { label: t("connections.domainTransportStatusStatic"), className: "bg-outline-variant/15 text-on-surface-variant" };
+    case "timeout":
+      return { label: t("connections.domainTransportStatusTimeout"), className: "bg-tertiary/10 text-tertiary" };
+    case "refused":
+      return { label: t("connections.domainTransportStatusRefused"), className: "bg-tertiary/10 text-tertiary" };
+    case "unreachable":
+      return { label: t("connections.domainTransportStatusUnreachable"), className: "bg-error/10 text-error" };
+    case "error":
+      return { label: t("connections.domainTransportStatusError"), className: "bg-error/10 text-error" };
+    case "runtime_down":
+      return { label: t("connections.domainTransportStatusRuntimeDown"), className: "bg-error/10 text-error" };
+    default:
+      return { label: t("connections.domainTransportStatusUnknown"), className: "bg-outline-variant/10 text-on-surface-variant" };
+  }
+}
+
+function getDomainDecisionMeta(decision, t) {
+  switch (String(decision || "review")) {
+    case "keep":
+      return { label: t("connections.domainDecisionKeep"), className: "bg-secondary/10 text-secondary" };
+    case "delete_candidate":
+      return { label: t("connections.domainDecisionDelete"), className: "bg-error/10 text-error" };
+    default:
+      return { label: t("connections.domainDecisionReview"), className: "bg-tertiary/10 text-tertiary" };
+  }
+}
+
+function formatDomainHealthTime(value) {
+  if (!value) {
+    return "";
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return parsed.toLocaleString();
+}
+
+function DomainPathStatus({ label, dnsStatus, transportStatus, dnsFailures, transportFailures, lastError, t }) {
+  const dnsMeta = getDomainDnsMeta(dnsStatus, t);
+  const transportMeta = getDomainTransportMeta(transportStatus, t);
+
+  return (
+    <div className="space-y-1.5">
+      <div className="text-[10px] font-bold uppercase tracking-wide text-outline">{label}</div>
+      <div className="flex flex-wrap gap-1.5">
+        <span className={`inline-flex rounded-full px-2 py-1 text-[10px] font-bold uppercase tracking-wide ${dnsMeta.className}`}>
+          DNS {dnsMeta.label}
+        </span>
+        <span className={`inline-flex rounded-full px-2 py-1 text-[10px] font-bold uppercase tracking-wide ${transportMeta.className}`}>
+          TCP {transportMeta.label}
+        </span>
+      </div>
+      {(dnsFailures > 0 || transportFailures > 0) ? (
+        <div className="text-[10px] text-outline-variant">
+          {`DNS x${dnsFailures} · TCP x${transportFailures}`}
+        </div>
+      ) : null}
+      {lastError ? (
+        <div className="max-w-[220px] truncate text-[10px] text-error/80" title={lastError}>
+          {lastError}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export default function ConnectionsPage() {
   const { t } = useI18n();
   const [config, setConfig] = useState(null);
   const [status, setStatus] = useState(null);
+  const [domainHealthMap, setDomainHealthMap] = useState(() => new Map());
   const [form, setForm] = useState(defaultForm);
   const [showForm, setShowForm] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -40,12 +196,14 @@ export default function ConnectionsPage() {
 
   const refresh = useCallback(async () => {
     try {
-      const [nextConfig, nextStatus] = await Promise.all([
+      const [nextConfig, nextStatus, nextDomainHealth] = await Promise.all([
         fetchJSON("/api/config"),
         fetchJSON("/api/status"),
+        fetchJSON("/api/domains/health"),
       ]);
       setConfig(nextConfig);
       setStatus(nextStatus);
+      setDomainHealthMap(createDomainHealthMap(nextDomainHealth));
       setPageError("");
     } catch (error) {
       setPageError(error.message);
@@ -330,6 +488,7 @@ export default function ConnectionsPage() {
               isOnline={isOnline}
               providerRules={providerRules}
               busy={busy}
+              domainHealthMap={domainHealthMap}
               onDelete={() => remove(provider.id)}
               onToggleEnabled={(nextEnabled) => updateProvider(provider, { enabled: nextEnabled })}
               onDomainsChange={refresh}
@@ -361,7 +520,7 @@ export default function ConnectionsPage() {
   );
 }
 
-function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, isOnline, providerRules, busy, onDelete, onToggleEnabled, onDomainsChange, showToast, setPageError, t }) {
+function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, isOnline, providerRules, busy, domainHealthMap, onDelete, onToggleEnabled, onDomainsChange, showToast, setPageError, t }) {
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [probing, setProbing] = useState(false);
@@ -674,9 +833,13 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
                 provider={provider}
                 allRules={rules}
                 allProviders={providers}
+                probeLocations={probeLocations}
+                probing={probing}
                 saving={saving}
                 setSaving={setSaving}
+                domainHealthMap={domainHealthMap}
                 onDeleteRule={() => deleteRule(rule.id)}
+                onDomainsChange={onDomainsChange}
                 showToast={showToast}
                 setPageError={setPageError}
                 t={t}
@@ -824,10 +987,10 @@ function LocationsBrowser({ locations, selectedLocation = "", onSelect, usedLoca
                       </div>
                     </div>
                     <div
-                      className="px-3 py-2.5 text-right font-mono text-xs text-on-surface-variant"
+                      className="px-3 py-2.5 text-right font-mono text-xs"
                       title={loc.latencyError || undefined}
                     >
-                      {formatLocationLatency(loc, t)}
+                      <LocationLatency location={loc} t={t} />
                     </div>
                   </button>
                 );
@@ -920,12 +1083,19 @@ function compareText(left, right) {
   });
 }
 
-function formatLocationLatency(location, t) {
-  if (location?.latencyMs > 0) {
-    return formatLatencyMs(location.latencyMs, t);
+function LocationLatency({ location, t }) {
+  const ms = location?.latencyMs;
+  if (!(ms > 0)) {
+    return <span className="text-on-surface-variant">—</span>;
   }
-
-  return "—";
+  const colorClass = ms < 50 ? "text-secondary" : ms < 150 ? "text-tertiary" : "text-error";
+  const dot = ms < 50 ? "●" : ms < 150 ? "●" : "●";
+  return (
+    <span className={`inline-flex items-center justify-end gap-1 ${colorClass}`}>
+      <span className="text-[8px] opacity-70">{dot}</span>
+      {formatLatencyMs(ms, t)}
+    </span>
+  );
 }
 
 function formatLocationType(type) {
@@ -985,9 +1155,41 @@ function findRuleDomainConflict(rule, provider, domains, allRules, allProviders)
   return "";
 }
 
-function RuleBlock({ rule, provider, allRules, allProviders, saving, setSaving, onDeleteRule, showToast, setPageError, t }) {
+function RuleBlock({ rule, provider, allRules, allProviders, probeLocations, probing, saving, setSaving, domainHealthMap, onDeleteRule, onDomainsChange, showToast, setPageError, t }) {
   const [domainInput, setDomainInput] = useState("");
+  const [changingLocation, setChangingLocation] = useState(false);
+  const [newLocation, setNewLocation] = useState("");
   const fileInputRef = useRef(null);
+
+  async function applyLocationChange() {
+    if (!newLocation || newLocation === rule.selectedLocation) {
+      setChangingLocation(false);
+      return;
+    }
+    setSaving(true);
+    try {
+      await fetchJSON(`/api/rules/${encodeURIComponent(rule.id)}?apply=1`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: rule.name,
+          providerId: provider.id,
+          selectedLocation: newLocation,
+          domains: rule.domains.join(","),
+          enabled: rule.enabled,
+        }),
+      });
+      setChangingLocation(false);
+      setNewLocation("");
+      showToast(t("connections.locationUpdated"));
+      await onDomainsChange();
+    } catch (error) {
+      setPageError(error.message);
+      showToast(error.message, true);
+    } finally {
+      setSaving(false);
+    }
+  }
 
   async function saveDomains(merged) {
     const conflict = findRuleDomainConflict(rule, provider, merged, allRules, allProviders);
@@ -1084,13 +1286,44 @@ function RuleBlock({ rule, provider, allRules, allProviders, saving, setSaving, 
     }
   }
 
+  async function checkDomainsHealth(domainsToCheck) {
+    if (!Array.isArray(domainsToCheck) || domainsToCheck.length === 0) {
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const result = await fetchJSON("/api/domains/health/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domains: domainsToCheck }),
+      });
+      await onDomainsChange();
+      showToast(t("connections.domainHealthCheckedNow", { count: String(result?.count ?? domainsToCheck.length) }));
+    } catch (error) {
+      setPageError(error.message);
+      showToast(error.message, true);
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <div className="rounded-lg border border-outline-variant/10 bg-surface-container p-4">
       <div className="mb-3 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Icon name="location_on" className="h-4 w-4 text-primary" />
+        <div className="flex items-center gap-2 min-w-0">
+          <Icon name="location_on" className="h-4 w-4 shrink-0 text-primary" />
           <span className="font-headline text-sm font-bold text-on-surface">{rule.selectedLocation || rule.name}</span>
-          <span className="text-xs text-on-surface-variant">· {rule.domains.length} {t("connections.domainsFor")}</span>
+          <span className="text-xs text-on-surface-variant shrink-0">· {rule.domains.length} {t("connections.domainsFor")}</span>
+          <button
+            type="button"
+            onClick={() => { setChangingLocation((v) => !v); setNewLocation(rule.selectedLocation || ""); }}
+            disabled={saving}
+            title={t("connections.changeLocation")}
+            className={`shrink-0 rounded px-1.5 py-0.5 text-xs font-medium transition-colors disabled:opacity-40 ${changingLocation ? "bg-primary/15 text-primary" : "bg-surface-container-highest text-on-surface-variant hover:bg-primary/10 hover:text-primary"}`}
+          >
+            <Icon name="swap_horiz" className="h-4 w-4" />
+          </button>
         </div>
         <button
           type="button"
@@ -1103,16 +1336,56 @@ function RuleBlock({ rule, provider, allRules, allProviders, saving, setSaving, 
         </button>
       </div>
 
-      <form onSubmit={addDomains} className="mb-3 space-y-2">
-        <div className="rounded-lg border border-outline-variant/10 bg-surface-container-high px-3 py-2 text-xs text-on-surface-variant">
-          Domains, IPv4 and CIDR are supported here. Example: <span className="font-mono text-on-surface">149.154.160.0/20</span>
+      {changingLocation && (
+        <div className="mb-3 rounded-lg border border-primary/20 bg-surface-container-high p-3">
+          <p className="mb-2 text-xs font-bold uppercase tracking-widest text-outline">{t("connections.changeLocation")}</p>
+          {probing && !probeLocations ? (
+            <div className="flex items-center gap-2 py-2 text-sm text-on-surface-variant">
+              <Icon name="travel_explore" className="h-4 w-4 animate-spin text-primary" />
+              {t("connections.probing")}
+            </div>
+          ) : probeLocations && probeLocations.length > 0 ? (
+            <>
+              <LocationsBrowser
+                locations={probeLocations}
+                selectedLocation={newLocation}
+                onSelect={setNewLocation}
+                usedLocations={new Set()}
+                disabled={saving}
+                t={t}
+              />
+              <div className="mt-2 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setChangingLocation(false)}
+                  disabled={saving}
+                  className="rounded-lg px-3 py-1.5 text-sm text-on-surface-variant transition-colors hover:text-on-surface disabled:opacity-40"
+                >
+                  {t("connections.cancel")}
+                </button>
+                <button
+                  type="button"
+                  onClick={applyLocationChange}
+                  disabled={saving || !newLocation || newLocation === rule.selectedLocation}
+                  className="rounded-lg bg-primary/10 px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-40"
+                >
+                  {saving ? t("connections.changingLocation") : t("connections.applyLocation")}
+                </button>
+              </div>
+            </>
+          ) : (
+            <p className="py-2 text-sm text-on-surface-variant">{t("connections.probeEmpty")}</p>
+          )}
         </div>
+      )}
+
+      <form onSubmit={addDomains} className="mb-3 space-y-2">
         <textarea
-          className="w-full resize-y rounded-lg border-none bg-surface-container-highest px-3 py-2 font-mono text-sm text-on-surface placeholder:text-outline-variant focus:ring-1 focus:ring-primary"
-          rows={2}
+          className="w-full resize-y rounded-lg border-none bg-surface-container-highest px-3 py-2 font-mono text-sm leading-relaxed text-on-surface placeholder:font-mono placeholder:text-on-surface-variant/80 focus:ring-1 focus:ring-primary"
+          rows={4}
           value={domainInput}
           onChange={(e) => setDomainInput(e.target.value)}
-          placeholder={`${t("connections.domainsPlaceholder")}\nIPv4/CIDR: 149.154.160.0/20`}
+          placeholder={t("connections.domainsPlaceholder")}
           disabled={saving}
         />
         <div className="flex gap-2">
@@ -1158,8 +1431,10 @@ function RuleBlock({ rule, provider, allRules, allProviders, saving, setSaving, 
         <RuleDomainsPanel
           domains={rule.domains}
           saving={saving}
+          domainHealthMap={domainHealthMap}
           onRemoveDomain={removeDomain}
           onRemoveDomains={removeDomains}
+          onCheckDomains={checkDomainsHealth}
           onExport={() => {
             const blob = new Blob([rule.domains.join("\n") + "\n"], { type: "text/plain" });
             const url = URL.createObjectURL(blob);
@@ -1190,22 +1465,30 @@ function RuleBlock({ rule, provider, allRules, allProviders, saving, setSaving, 
   );
 }
 
-function RuleDomainsPanel({ domains, saving, onRemoveDomain, onRemoveDomains, onExport, onClearAll, t }) {
+function RuleDomainsPanel({ domains, saving, domainHealthMap, onRemoveDomain, onRemoveDomains, onCheckDomains, onExport, onClearAll, t }) {
   const [query, setQuery] = useState("");
+  const [healthFilter, setHealthFilter] = useState("all");
   const [selected, setSelected] = useState(() => new Set());
   const deferredQuery = useDeferredValue(query);
   const normalizedQuery = deferredQuery.trim().toLowerCase();
 
   const filteredDomains = useMemo(() => {
-    if (!normalizedQuery) return domains;
-    return domains.filter((domain) => domain.toLowerCase().includes(normalizedQuery));
-  }, [domains, normalizedQuery]);
+    return domains.filter((domain) => {
+      if (normalizedQuery && !domain.toLowerCase().includes(normalizedQuery)) {
+        return false;
+      }
+      return matchesDomainHealthFilter(getDomainHealthRecord(domainHealthMap, domain), healthFilter);
+    });
+  }, [domainHealthMap, domains, healthFilter, normalizedQuery]);
 
   const visibleDomains = useMemo(() => {
     return filteredDomains.slice(0, DOMAIN_SEARCH_RESULT_LIMIT);
   }, [filteredDomains]);
 
   const hiddenCount = Math.max(0, filteredDomains.length - visibleDomains.length);
+  const candidateCount = useMemo(() => {
+    return filteredDomains.filter((domain) => getDomainHealthRecord(domainHealthMap, domain).decision === "delete_candidate").length;
+  }, [domainHealthMap, filteredDomains]);
 
   const allVisibleSelected = visibleDomains.length > 0 && visibleDomains.every((d) => selected.has(d));
 
@@ -1236,6 +1519,21 @@ function RuleDomainsPanel({ domains, saving, onRemoveDomain, onRemoveDomains, on
     await onRemoveDomains(toRemove);
   }, [selected, onRemoveDomains]);
 
+  const handleCheckDomains = useCallback(async () => {
+    const targets = selected.size > 0
+      ? filteredDomains.filter((domain) => selected.has(domain))
+      : filteredDomains;
+    if (targets.length === 0) {
+      return;
+    }
+    await onCheckDomains(targets);
+  }, [filteredDomains, onCheckDomains, selected]);
+
+  const handleSelectCandidates = useCallback(() => {
+    const nextSelection = filteredDomains.filter((domain) => getDomainHealthRecord(domainHealthMap, domain).decision === "delete_candidate");
+    setSelected((prev) => new Set([...prev, ...nextSelection]));
+  }, [domainHealthMap, filteredDomains]);
+
   // Clear selection when domains list changes (after delete)
   useEffect(() => {
     setSelected((prev) => {
@@ -1258,6 +1556,38 @@ function RuleDomainsPanel({ domains, saving, onRemoveDomain, onRemoveDomains, on
             disabled={saving}
           />
         </label>
+        <select
+          value={healthFilter}
+          onChange={(event) => setHealthFilter(event.target.value)}
+          disabled={saving}
+          className="rounded-lg border-none bg-surface-container-highest px-3 py-2 text-sm text-on-surface focus:ring-1 focus:ring-primary"
+        >
+          <option value="all">{t("connections.domainHealthFilterAll")}</option>
+          <option value="both">{t("connections.domainHealthFilterBoth")}</option>
+          <option value="direct_only">{t("connections.domainHealthFilterDirectOnly")}</option>
+          <option value="vpn_only">{t("connections.domainHealthFilterVpnOnly")}</option>
+          <option value="neither">{t("connections.domainHealthFilterNeither")}</option>
+          <option value="candidates">{t("connections.domainHealthFilterCandidates")}</option>
+          <option value="unchecked">{t("connections.domainHealthFilterUnchecked")}</option>
+        </select>
+        <button
+          type="button"
+          disabled={saving || filteredDomains.length === 0}
+          onClick={handleCheckDomains}
+          className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-2 text-xs font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-40"
+        >
+          <Icon name="health_and_safety" className="h-3.5 w-3.5" />
+          {t("connections.checkDomains")}
+        </button>
+        <button
+          type="button"
+          disabled={saving || candidateCount === 0}
+          onClick={handleSelectCandidates}
+          className="flex items-center gap-1.5 rounded-lg bg-tertiary/10 px-3 py-2 text-xs font-medium text-tertiary transition-colors hover:bg-tertiary/20 disabled:opacity-40"
+        >
+          <Icon name="rule" className="h-3.5 w-3.5" />
+          {t("connections.selectCandidates", { count: String(candidateCount) })}
+        </button>
         {selected.size > 0 && (
           <button
             type="button"
@@ -1290,7 +1620,7 @@ function RuleDomainsPanel({ domains, saving, onRemoveDomain, onRemoveDomains, on
       </div>
 
       <div className="overflow-hidden rounded-lg border border-outline-variant/15">
-        <div className="max-h-[420px] overflow-y-auto">
+        <div className="max-h-[420px] overflow-auto">
           <table className="w-full text-left text-sm">
             <thead className="sticky top-0 z-10 bg-surface-container text-xs uppercase tracking-wider text-outline">
               <tr>
@@ -1305,40 +1635,83 @@ function RuleDomainsPanel({ domains, saving, onRemoveDomain, onRemoveDomains, on
                 </th>
                 <th className="w-12 px-3 py-2 text-right">#</th>
                 <th className="px-3 py-2">{t("connections.domainColumn")}</th>
+                <th className="w-56 px-3 py-2">{t("connections.domainDirectColumn")}</th>
+                <th className="w-56 px-3 py-2">{t("connections.domainVpnColumn")}</th>
+                <th className="w-36 px-3 py-2">{t("connections.domainDecisionColumn")}</th>
                 <th className="w-12 px-3 py-2" />
               </tr>
             </thead>
             <tbody className="divide-y divide-outline-variant/10">
-              {visibleDomains.map((domain, idx) => (
-                <tr key={domain} className={`transition-colors hover:bg-surface-container-highest/60${selected.has(domain) ? " bg-primary/5" : ""}`}>
-                  <td className="px-3 py-1.5 text-center">
-                    <input
-                      type="checkbox"
-                      checked={selected.has(domain)}
-                      onChange={() => toggleOne(domain)}
-                      disabled={saving}
-                      className="h-3.5 w-3.5 cursor-pointer accent-primary"
-                    />
-                  </td>
-                  <td className="px-3 py-1.5 text-right font-mono text-xs text-outline-variant">
-                    {normalizedQuery ? idx + 1 : domains.indexOf(domain) + 1}
-                  </td>
-                  <td className="px-3 py-1.5 font-mono text-on-surface">{domain}</td>
-                  <td className="px-3 py-1.5 text-center">
-                    <button
-                      type="button"
-                      onClick={() => onRemoveDomain(domain)}
-                      disabled={saving}
-                      className="text-outline-variant transition-colors hover:text-error disabled:opacity-40"
-                    >
-                      <Icon name="close" className="h-3.5 w-3.5" />
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              {visibleDomains.map((domain, idx) => {
+                const health = getDomainHealthRecord(domainHealthMap, domain);
+                const decisionMeta = getDomainDecisionMeta(health.decision, t);
+                const lastCheckedLabel = health.lastCheckedAt
+                  ? t("connections.domainHealthChecked", { at: formatDomainHealthTime(health.lastCheckedAt) })
+                  : t("connections.domainHealthNever");
+
+                return (
+                  <tr key={domain} className={`transition-colors hover:bg-surface-container-highest/60${selected.has(domain) ? " bg-primary/5" : ""}`}>
+                    <td className="px-3 py-1.5 text-center">
+                      <input
+                        type="checkbox"
+                        checked={selected.has(domain)}
+                        onChange={() => toggleOne(domain)}
+                        disabled={saving}
+                        className="h-3.5 w-3.5 cursor-pointer accent-primary"
+                      />
+                    </td>
+                    <td className="px-3 py-1.5 text-right font-mono text-xs text-outline-variant">
+                      {normalizedQuery || healthFilter !== "all" ? idx + 1 : domains.indexOf(domain) + 1}
+                    </td>
+                    <td className="px-3 py-1.5">
+                      <div className="font-mono text-on-surface">{domain}</div>
+                      <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-on-surface-variant">
+                        <span>{lastCheckedLabel}</span>
+                      </div>
+                    </td>
+                    <td className="px-3 py-1.5 align-top">
+                      <DomainPathStatus
+                        label={t("connections.domainDirectColumn")}
+                        dnsStatus={health.directDnsStatus}
+                        transportStatus={health.directTransportStatus}
+                        dnsFailures={health.consecutiveDirectDnsFailures}
+                        transportFailures={health.consecutiveDirectTransportFailures}
+                        lastError={health.directLastError}
+                        t={t}
+                      />
+                    </td>
+                    <td className="px-3 py-1.5 align-top">
+                      <DomainPathStatus
+                        label={t("connections.domainVpnColumn")}
+                        dnsStatus={health.vpnDnsStatus}
+                        transportStatus={health.vpnTransportStatus}
+                        dnsFailures={health.consecutiveVpnDnsFailures}
+                        transportFailures={health.consecutiveVpnTransportFailures}
+                        lastError={health.vpnLastError}
+                        t={t}
+                      />
+                    </td>
+                    <td className="px-3 py-1.5 align-middle">
+                      <span className={`inline-flex rounded-full px-2 py-1 text-[10px] font-bold uppercase tracking-wide ${decisionMeta.className}`}>
+                        {decisionMeta.label}
+                      </span>
+                    </td>
+                    <td className="px-3 py-1.5 text-center">
+                      <button
+                        type="button"
+                        onClick={() => onRemoveDomain(domain)}
+                        disabled={saving}
+                        className="text-outline-variant transition-colors hover:text-error disabled:opacity-40"
+                      >
+                        <Icon name="close" className="h-3.5 w-3.5" />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
               {visibleDomains.length === 0 && (
                 <tr>
-                  <td colSpan={4} className="px-4 py-6 text-center text-sm text-on-surface-variant">
+                  <td colSpan={7} className="px-4 py-6 text-center text-sm text-on-surface-variant">
                     {t("connections.domainNoMatch")}
                   </td>
                 </tr>
@@ -1349,7 +1722,7 @@ function RuleDomainsPanel({ domains, saving, onRemoveDomain, onRemoveDomains, on
       </div>
 
       <p className="mt-2 text-xs text-on-surface-variant">
-        {normalizedQuery
+        {normalizedQuery || healthFilter !== "all"
           ? hiddenCount > 0
             ? t("connections.domainMatchesPreview", { visible: String(visibleDomains.length), total: String(filteredDomains.length) })
             : t("connections.domainMatches", { total: String(filteredDomains.length) })

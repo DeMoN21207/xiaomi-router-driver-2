@@ -123,6 +123,8 @@ func NewHandler(deps Dependencies) *Handler {
 	mux.HandleFunc("/api/rules", handler.handleRules)
 	mux.HandleFunc("/api/rules/", handler.handleRule)
 	mux.HandleFunc("/api/rules/apply", handler.handleApplyRules)
+	mux.HandleFunc("/api/domains/health", handler.handleDomainHealth)
+	mux.HandleFunc("/api/domains/health/check", handler.handleCheckDomainHealth)
 	mux.HandleFunc("/api/domains", handler.handleDomainsPreview)
 	mux.HandleFunc("/api/blacklist", handler.handleBlacklist)
 	mux.HandleFunc("/api/blacklist/apply", handler.handleApplyBlacklist)
@@ -316,13 +318,14 @@ func (h *Handler) handleSiteTraffic(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		q := r.URL.Query()
 		sortBy := q.Get("sort")
+		order := q.Get("order")
 		scope := q.Get("scope")
 		search := q.Get("query")
 		sourceIP := q.Get("sourceIp")
 		pageSize := parsePositiveQueryIntWithLegacy(q, "pageSize", "limit", 20)
 		page := parsePositiveQueryInt(q, "page", 1)
 
-		result, err := h.status.SiteTraffic(scope, sortBy, sourceIP, search, page, pageSize)
+		result, err := h.status.SiteTraffic(scope, sortBy, order, sourceIP, search, page, pageSize)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -333,6 +336,7 @@ func (h *Handler) handleSiteTraffic(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		q := r.URL.Query()
 		sortBy := q.Get("sort")
+		order := q.Get("order")
 		scope := q.Get("scope")
 		search := q.Get("query")
 		sourceIP := q.Get("sourceIp")
@@ -344,7 +348,7 @@ func (h *Handler) handleSiteTraffic(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		result, err := h.status.SiteTraffic(scope, sortBy, sourceIP, search, page, pageSize)
+		result, err := h.status.SiteTraffic(scope, sortBy, order, sourceIP, search, page, pageSize)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -369,6 +373,7 @@ func (h *Handler) handleSiteTrafficHistory(w http.ResponseWriter, r *http.Reques
 	case http.MethodGet, http.MethodPost:
 		q := r.URL.Query()
 		sortBy := q.Get("sort")
+		order := q.Get("order")
 		scope := q.Get("scope")
 		search := q.Get("query")
 		sourceIP := strings.TrimSpace(q.Get("sourceIp"))
@@ -395,9 +400,9 @@ func (h *Handler) handleSiteTrafficHistory(w http.ResponseWriter, r *http.Reques
 			err    error
 		)
 		if fromStr != "" && toStr != "" {
-			result, err = h.status.SiteTrafficHistoryCustom(scope, sortBy, sourceIP, search, page, pageSize, fromStr, toStr)
+			result, err = h.status.SiteTrafficHistoryCustom(scope, sortBy, order, sourceIP, search, page, pageSize, fromStr, toStr)
 		} else {
-			result, err = h.status.SiteTrafficHistory(scope, sortBy, sourceIP, search, page, pageSize, q.Get("range"))
+			result, err = h.status.SiteTrafficHistory(scope, sortBy, order, sourceIP, search, page, pageSize, q.Get("range"))
 		}
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -1285,6 +1290,63 @@ func (h *Handler) handleDomainsPreview(w http.ResponseWriter, r *http.Request) {
 		"domains": list,
 		"count":   len(list),
 	})
+}
+
+func (h *Handler) handleDomainHealth(w http.ResponseWriter, r *http.Request) {
+	if h.status == nil {
+		writeError(w, http.StatusNotImplemented, errors.New("status service is not configured"))
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+
+	response, err := h.status.DomainHealth()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) handleCheckDomainHealth(w http.ResponseWriter, r *http.Request) {
+	if h.status == nil {
+		writeError(w, http.StatusNotImplemented, errors.New("status service is not configured"))
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+
+	var request struct {
+		Domains []string `json:"domains"`
+	}
+
+	if r.Body != nil {
+		defer r.Body.Close()
+		payload, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if strings.TrimSpace(string(payload)) != "" {
+			if err := json.Unmarshal(payload, &request); err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+		}
+	}
+
+	response, err := h.status.CheckDomainHealth(r.Context(), request.Domains)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) handleBlacklist(w http.ResponseWriter, r *http.Request) {
