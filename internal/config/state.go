@@ -48,12 +48,21 @@ type RoutingSettings struct {
 	IPSetName         string `json:"ipSetName"`
 	FWMark            string `json:"fwMark"`
 	DNSMasqConfigFile string `json:"dnsMasqConfigFile"`
+	MSSClamp          bool   `json:"mssClamp"`
+	MSSValue          int    `json:"mssValue"`
+	DNSHijack         bool   `json:"dnsHijack"`
+	IPv6Mode          string `json:"ipv6Mode"`
+	LoadProfile       string `json:"loadProfile"`
 }
 
 type AutomationSettings struct {
-	InstallService     bool `json:"installService"`
-	AutoRecover        bool `json:"autoRecover"`
-	TrafficCleanupDays int  `json:"trafficCleanupDays"`
+	InstallService         bool   `json:"installService"`
+	AutoRecover            bool   `json:"autoRecover"`
+	ProviderFailover       bool   `json:"providerFailover"`
+	FailoverFailureSeconds int    `json:"failoverFailureSeconds"`
+	FailoverRestoreSeconds int    `json:"failoverRestoreSeconds"`
+	FailoverAllDownMode    string `json:"failoverAllDownMode"`
+	TrafficCleanupDays     int    `json:"trafficCleanupDays"`
 }
 
 type State struct {
@@ -102,14 +111,23 @@ func DefaultRoutingSettings() RoutingSettings {
 		IPSetName:         "vpn_hosts",
 		FWMark:            "0x1",
 		DNSMasqConfigFile: "/tmp/dnsmasq.d/vpn_dns.conf",
+		MSSClamp:          true,
+		MSSValue:          0,
+		DNSHijack:         true,
+		IPv6Mode:          "warn",
+		LoadProfile:       DefaultRoutingLoadProfile(),
 	}
 }
 
 func DefaultAutomationSettings() AutomationSettings {
 	return AutomationSettings{
-		InstallService:     false,
-		AutoRecover:        false,
-		TrafficCleanupDays: 0,
+		InstallService:         false,
+		AutoRecover:            false,
+		ProviderFailover:       true,
+		FailoverFailureSeconds: 120,
+		FailoverRestoreSeconds: 60,
+		FailoverAllDownMode:    "keep",
+		TrafficCleanupDays:     14,
 	}
 }
 
@@ -311,14 +329,23 @@ func ensureStateSchema(db *sql.DB) error {
 			fw_zone_chain TEXT NOT NULL,
 			ip_set_name TEXT NOT NULL,
 			fw_mark TEXT NOT NULL,
-			dnsmasq_config_file TEXT NOT NULL
+			dnsmasq_config_file TEXT NOT NULL,
+			mss_clamp INTEGER NOT NULL DEFAULT 1,
+			mss_value INTEGER NOT NULL DEFAULT 0,
+			dns_hijack INTEGER NOT NULL DEFAULT 1,
+			ipv6_mode TEXT NOT NULL DEFAULT 'warn',
+			load_profile TEXT NOT NULL DEFAULT 'normal'
 		)`,
 		`CREATE TABLE IF NOT EXISTS automation_settings (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
 			install_service INTEGER NOT NULL,
 			auto_recover INTEGER NOT NULL,
-			traffic_cleanup_days INTEGER NOT NULL DEFAULT 0
-		)`,
+			provider_failover INTEGER NOT NULL DEFAULT 1,
+			failover_failure_seconds INTEGER NOT NULL DEFAULT 120,
+			failover_restore_seconds INTEGER NOT NULL DEFAULT 60,
+			failover_all_down_mode TEXT NOT NULL DEFAULT 'keep',
+			traffic_cleanup_days INTEGER NOT NULL DEFAULT 14
+			)`,
 		`CREATE TABLE IF NOT EXISTS app_meta (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -332,8 +359,17 @@ func ensureStateSchema(db *sql.DB) error {
 		}
 	}
 
-	// Add traffic_cleanup_days column if missing (existing databases).
-	_, _ = db.Exec(`ALTER TABLE automation_settings ADD COLUMN traffic_cleanup_days INTEGER NOT NULL DEFAULT 0`)
+	// Add columns if missing (existing databases).
+	_, _ = db.Exec(`ALTER TABLE routing_settings ADD COLUMN mss_clamp INTEGER NOT NULL DEFAULT 1`)
+	_, _ = db.Exec(`ALTER TABLE routing_settings ADD COLUMN mss_value INTEGER NOT NULL DEFAULT 0`)
+	_, _ = db.Exec(`ALTER TABLE routing_settings ADD COLUMN dns_hijack INTEGER NOT NULL DEFAULT 1`)
+	_, _ = db.Exec(`ALTER TABLE routing_settings ADD COLUMN ipv6_mode TEXT NOT NULL DEFAULT 'warn'`)
+	_, _ = db.Exec(`ALTER TABLE routing_settings ADD COLUMN load_profile TEXT NOT NULL DEFAULT 'normal'`)
+	_, _ = db.Exec(`ALTER TABLE automation_settings ADD COLUMN traffic_cleanup_days INTEGER NOT NULL DEFAULT 14`)
+	_, _ = db.Exec(`ALTER TABLE automation_settings ADD COLUMN provider_failover INTEGER NOT NULL DEFAULT 1`)
+	_, _ = db.Exec(`ALTER TABLE automation_settings ADD COLUMN failover_failure_seconds INTEGER NOT NULL DEFAULT 120`)
+	_, _ = db.Exec(`ALTER TABLE automation_settings ADD COLUMN failover_restore_seconds INTEGER NOT NULL DEFAULT 60`)
+	_, _ = db.Exec(`ALTER TABLE automation_settings ADD COLUMN failover_all_down_mode TEXT NOT NULL DEFAULT 'keep'`)
 
 	return nil
 }
@@ -393,7 +429,7 @@ func loadLegacyState(path string) (State, error) {
 		return DefaultState(), nil
 	}
 
-	var state State
+	state := DefaultState()
 	if err := json.Unmarshal(data, &state); err != nil {
 		return State{}, err
 	}
@@ -437,8 +473,9 @@ func saveStateTx(tx *sql.Tx, state State) error {
 	if _, err := tx.Exec(`
 		INSERT INTO routing_settings (
 			id, vpn_gateway, vpn_route_mode, vpn_masquerade, lan_iface, vpn_iface,
-			table_num, fw_zone_chain, ip_set_name, fw_mark, dnsmasq_config_file
-		) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			table_num, fw_zone_chain, ip_set_name, fw_mark, dnsmasq_config_file,
+			mss_clamp, mss_value, dns_hijack, ipv6_mode, load_profile
+		) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			vpn_gateway = excluded.vpn_gateway,
 			vpn_route_mode = excluded.vpn_route_mode,
@@ -449,19 +486,30 @@ func saveStateTx(tx *sql.Tx, state State) error {
 			fw_zone_chain = excluded.fw_zone_chain,
 			ip_set_name = excluded.ip_set_name,
 			fw_mark = excluded.fw_mark,
-			dnsmasq_config_file = excluded.dnsmasq_config_file
-	`, state.Routing.VPNGateway, state.Routing.VPNRouteMode, boolToInt(state.Routing.VPNMasquerade), state.Routing.LANIface, state.Routing.VPNIface, state.Routing.TableNum, state.Routing.FWZoneChain, state.Routing.IPSetName, state.Routing.FWMark, state.Routing.DNSMasqConfigFile); err != nil {
+			dnsmasq_config_file = excluded.dnsmasq_config_file,
+			mss_clamp = excluded.mss_clamp,
+			mss_value = excluded.mss_value,
+			dns_hijack = excluded.dns_hijack,
+			ipv6_mode = excluded.ipv6_mode,
+			load_profile = excluded.load_profile
+	`, state.Routing.VPNGateway, state.Routing.VPNRouteMode, boolToInt(state.Routing.VPNMasquerade), state.Routing.LANIface, state.Routing.VPNIface, state.Routing.TableNum, state.Routing.FWZoneChain, state.Routing.IPSetName, state.Routing.FWMark, state.Routing.DNSMasqConfigFile, boolToInt(state.Routing.MSSClamp), state.Routing.MSSValue, boolToInt(state.Routing.DNSHijack), state.Routing.IPv6Mode, state.Routing.LoadProfile); err != nil {
 		return err
 	}
 
 	if _, err := tx.Exec(`
-		INSERT INTO automation_settings (id, install_service, auto_recover, traffic_cleanup_days)
-		VALUES (1, ?, ?, ?)
+		INSERT INTO automation_settings (
+			id, install_service, auto_recover, provider_failover,
+			failover_failure_seconds, failover_restore_seconds, failover_all_down_mode, traffic_cleanup_days
+		) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			install_service = excluded.install_service,
 			auto_recover = excluded.auto_recover,
+			provider_failover = excluded.provider_failover,
+			failover_failure_seconds = excluded.failover_failure_seconds,
+			failover_restore_seconds = excluded.failover_restore_seconds,
+			failover_all_down_mode = excluded.failover_all_down_mode,
 			traffic_cleanup_days = excluded.traffic_cleanup_days
-	`, boolToInt(state.Automation.InstallService), boolToInt(state.Automation.AutoRecover), state.Automation.TrafficCleanupDays); err != nil {
+	`, boolToInt(state.Automation.InstallService), boolToInt(state.Automation.AutoRecover), boolToInt(state.Automation.ProviderFailover), state.Automation.FailoverFailureSeconds, state.Automation.FailoverRestoreSeconds, state.Automation.FailoverAllDownMode, state.Automation.TrafficCleanupDays); err != nil {
 		return err
 	}
 
@@ -566,16 +614,21 @@ func (m *Manager) loadUnlocked() (State, error) {
 	}
 
 	var routing RoutingSettings
-	var vpnMasquerade int
+	var vpnMasquerade, mssClamp, mssValue, dnsHijack int
 	err = m.db.QueryRow(`
 		SELECT vpn_gateway, vpn_route_mode, vpn_masquerade, lan_iface, vpn_iface,
-		       table_num, fw_zone_chain, ip_set_name, fw_mark, dnsmasq_config_file
+		       table_num, fw_zone_chain, ip_set_name, fw_mark, dnsmasq_config_file,
+		       COALESCE(mss_clamp, 1), COALESCE(mss_value, 0), COALESCE(dns_hijack, 1),
+		       COALESCE(ipv6_mode, 'warn'), COALESCE(load_profile, 'normal')
 		FROM routing_settings
 		WHERE id = 1
-	`).Scan(&routing.VPNGateway, &routing.VPNRouteMode, &vpnMasquerade, &routing.LANIface, &routing.VPNIface, &routing.TableNum, &routing.FWZoneChain, &routing.IPSetName, &routing.FWMark, &routing.DNSMasqConfigFile)
+	`).Scan(&routing.VPNGateway, &routing.VPNRouteMode, &vpnMasquerade, &routing.LANIface, &routing.VPNIface, &routing.TableNum, &routing.FWZoneChain, &routing.IPSetName, &routing.FWMark, &routing.DNSMasqConfigFile, &mssClamp, &mssValue, &dnsHijack, &routing.IPv6Mode, &routing.LoadProfile)
 	switch {
 	case err == nil:
 		routing.VPNMasquerade = intToBool(vpnMasquerade)
+		routing.MSSClamp = intToBool(mssClamp)
+		routing.MSSValue = mssValue
+		routing.DNSHijack = intToBool(dnsHijack)
 		state.Routing = routing
 	case errors.Is(err, sql.ErrNoRows):
 	default:
@@ -583,16 +636,26 @@ func (m *Manager) loadUnlocked() (State, error) {
 	}
 
 	var automation AutomationSettings
-	var installService, autoRecover, trafficCleanupDays int
+	var installService, autoRecover, providerFailover, failoverFailureSeconds, failoverRestoreSeconds, trafficCleanupDays int
+	var failoverAllDownMode string
 	err = m.db.QueryRow(`
-		SELECT install_service, auto_recover, COALESCE(traffic_cleanup_days, 0)
+		SELECT install_service, auto_recover,
+		       COALESCE(provider_failover, 1),
+		       COALESCE(failover_failure_seconds, 120),
+		       COALESCE(failover_restore_seconds, 60),
+		COALESCE(failover_all_down_mode, 'keep'),
+		       COALESCE(traffic_cleanup_days, 14)
 		FROM automation_settings
 		WHERE id = 1
-	`).Scan(&installService, &autoRecover, &trafficCleanupDays)
+	`).Scan(&installService, &autoRecover, &providerFailover, &failoverFailureSeconds, &failoverRestoreSeconds, &failoverAllDownMode, &trafficCleanupDays)
 	switch {
 	case err == nil:
 		automation.InstallService = intToBool(installService)
 		automation.AutoRecover = intToBool(autoRecover)
+		automation.ProviderFailover = intToBool(providerFailover)
+		automation.FailoverFailureSeconds = failoverFailureSeconds
+		automation.FailoverRestoreSeconds = failoverRestoreSeconds
+		automation.FailoverAllDownMode = failoverAllDownMode
 		automation.TrafficCleanupDays = trafficCleanupDays
 		state.Automation = automation
 	case errors.Is(err, sql.ErrNoRows):
@@ -762,10 +825,59 @@ func normalizeRoutingSettings(settings RoutingSettings) RoutingSettings {
 		settings.DNSMasqConfigFile = defaults.DNSMasqConfigFile
 	}
 
+	if settings.MSSValue < 0 {
+		settings.MSSValue = 0
+	}
+	if settings.MSSValue > 1460 {
+		settings.MSSValue = 1460
+	}
+
+	settings.IPv6Mode = strings.ToLower(strings.TrimSpace(settings.IPv6Mode))
+	switch settings.IPv6Mode {
+	case "warn", "allow", "disable":
+	default:
+		settings.IPv6Mode = defaults.IPv6Mode
+	}
+
+	settings.LoadProfile = NormalizeRoutingLoadProfile(settings.LoadProfile)
+
 	return settings
 }
 
 func normalizeAutomationSettings(settings AutomationSettings) AutomationSettings {
+	defaults := DefaultAutomationSettings()
+
+	if settings.FailoverFailureSeconds <= 0 {
+		settings.FailoverFailureSeconds = defaults.FailoverFailureSeconds
+	}
+	if settings.FailoverFailureSeconds < 30 {
+		settings.FailoverFailureSeconds = 30
+	}
+	if settings.FailoverFailureSeconds > 3600 {
+		settings.FailoverFailureSeconds = 3600
+	}
+
+	if settings.FailoverRestoreSeconds <= 0 {
+		settings.FailoverRestoreSeconds = defaults.FailoverRestoreSeconds
+	}
+	if settings.FailoverRestoreSeconds < 10 {
+		settings.FailoverRestoreSeconds = 10
+	}
+	if settings.FailoverRestoreSeconds > 3600 {
+		settings.FailoverRestoreSeconds = 3600
+	}
+
+	settings.FailoverAllDownMode = strings.ToLower(strings.TrimSpace(settings.FailoverAllDownMode))
+	switch settings.FailoverAllDownMode {
+	case "direct", "keep":
+	default:
+		settings.FailoverAllDownMode = defaults.FailoverAllDownMode
+	}
+
+	if settings.TrafficCleanupDays < 0 {
+		settings.TrafficCleanupDays = 0
+	}
+
 	return settings
 }
 

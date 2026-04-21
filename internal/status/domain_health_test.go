@@ -30,12 +30,12 @@ func TestRecommendDomainDecision(t *testing.T) {
 
 	t.Run("candidate after repeated dns failures on both paths", func(t *testing.T) {
 		decision := recommendDomainDecision(DomainHealthRecord{
-			DirectDNSStatus:                domainDNSStatusNXDOMAIN,
-			VPNDNSStatus:                   domainDNSStatusNXDOMAIN,
-			ConsecutiveDirectDNSFailures:   domainHealthDNSCandidateFailures,
-			ConsecutiveVPNDNSFailures:      domainHealthDNSCandidateFailures,
-			DirectTransportStatus:          domainTransportStatusUnknown,
-			VPNTransportStatus:             domainTransportStatusUnknown,
+			DirectDNSStatus:              domainDNSStatusNXDOMAIN,
+			VPNDNSStatus:                 domainDNSStatusNXDOMAIN,
+			ConsecutiveDirectDNSFailures: domainHealthDNSCandidateFailures,
+			ConsecutiveVPNDNSFailures:    domainHealthDNSCandidateFailures,
+			DirectTransportStatus:        domainTransportStatusUnknown,
+			VPNTransportStatus:           domainTransportStatusUnknown,
 		})
 		if decision != domainDecisionDeleteCandidate {
 			t.Fatalf("expected delete candidate, got %q", decision)
@@ -62,6 +62,29 @@ func TestResolveDomainHealthSampleInterval(t *testing.T) {
 		t.Setenv("VPN_MANAGER_DOMAIN_HEALTH_INTERVAL", "24")
 		if got := resolveDomainHealthSampleInterval(); got != 24*time.Hour {
 			t.Fatalf("expected 24h, got %v", got)
+		}
+	})
+
+	t.Run("allow off", func(t *testing.T) {
+		t.Setenv("VPN_MANAGER_DOMAIN_HEALTH_INTERVAL", "off")
+		if got := resolveDomainHealthSampleInterval(); got != 0 {
+			t.Fatalf("expected disabled interval, got %v", got)
+		}
+	})
+}
+
+func TestDomainHealthInitialSampleEnabled(t *testing.T) {
+	t.Run("enabled by default", func(t *testing.T) {
+		t.Setenv("VPN_MANAGER_DOMAIN_HEALTH_INITIAL_SAMPLE", "")
+		if !domainHealthInitialSampleEnabled() {
+			t.Fatalf("expected initial sample enabled by default")
+		}
+	})
+
+	t.Run("explicit off disables initial sample", func(t *testing.T) {
+		t.Setenv("VPN_MANAGER_DOMAIN_HEALTH_INITIAL_SAMPLE", "off")
+		if domainHealthInitialSampleEnabled() {
+			t.Fatalf("expected initial sample disabled")
 		}
 	})
 }

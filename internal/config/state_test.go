@@ -60,8 +60,41 @@ func TestManagerRoundTripSQLite(t *testing.T) {
 	if !loaded.Automation.InstallService || !loaded.Automation.AutoRecover {
 		t.Fatalf("unexpected automation settings: %+v", loaded.Automation)
 	}
+	if loaded.Routing.LoadProfile != DefaultRoutingLoadProfile() {
+		t.Fatalf("expected default load profile %q, got %q", DefaultRoutingLoadProfile(), loaded.Routing.LoadProfile)
+	}
 	if loaded.UpdatedAt == "" {
 		t.Fatalf("expected updatedAt to be set")
+	}
+}
+
+func TestDefaultAutomationSettingsTrafficCleanup(t *testing.T) {
+	if got := DefaultAutomationSettings().TrafficCleanupDays; got != 14 {
+		t.Fatalf("expected default traffic cleanup 14 days, got %d", got)
+	}
+	if got := DefaultAutomationSettings().FailoverAllDownMode; got != "keep" {
+		t.Fatalf("expected default all-down mode keep, got %q", got)
+	}
+}
+
+func TestManagerPersistsRoutingLoadProfile(t *testing.T) {
+	db := openTestDB(t)
+	manager := NewManager(db, filepath.Join(t.TempDir(), "vpn-state.json"))
+
+	state := DefaultState()
+	state.Routing.LoadProfile = RoutingLoadProfileDetailed
+
+	if _, err := manager.Save(state); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	loaded, err := manager.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if loaded.Routing.LoadProfile != RoutingLoadProfileDetailed {
+		t.Fatalf("expected load profile %q, got %q", RoutingLoadProfileDetailed, loaded.Routing.LoadProfile)
 	}
 }
 

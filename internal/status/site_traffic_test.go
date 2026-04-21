@@ -55,7 +55,7 @@ func TestSiteTrafficStoreListSupportsSourceIPFilterAndPagination(t *testing.T) {
 		t.Fatalf("UpsertConnections() error = %v", err)
 	}
 
-	result, err := store.List("all", "bytes", "", "", 1, 2)
+	result, err := store.List("all", "bytes", "", "", "", 1, 2)
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
@@ -72,7 +72,7 @@ func TestSiteTrafficStoreListSupportsSourceIPFilterAndPagination(t *testing.T) {
 		t.Fatalf("expected total bytes 14336, got %d", result.TotalBytes)
 	}
 
-	filtered, err := store.List("tunneled", "domain", "192.168.31.10", "", 1, 10)
+	filtered, err := store.List("tunneled", "domain", "asc", "192.168.31.10", "", 1, 10)
 	if err != nil {
 		t.Fatalf("List() with source filter error = %v", err)
 	}
@@ -135,7 +135,7 @@ func TestSiteTrafficStoreListDevicesSupportsSearchPaginationAndOptions(t *testin
 		t.Fatalf("UpsertConnections() error = %v", err)
 	}
 
-	result, err := store.ListDevices("all", "bytes", "", "", 1, 1, 1)
+	result, err := store.ListDevices("all", "bytes", "", "", "", 1, 1, 1)
 	if err != nil {
 		t.Fatalf("ListDevices() error = %v", err)
 	}
@@ -155,7 +155,7 @@ func TestSiteTrafficStoreListDevicesSupportsSearchPaginationAndOptions(t *testin
 		t.Fatalf("expected 2 device options, got %d", len(result.Options))
 	}
 
-	filtered, err := store.ListDevices("tunneled", "name", "", "chatgpt", 1, 10, 10)
+	filtered, err := store.ListDevices("tunneled", "name", "", "", "chatgpt", 1, 10, 10)
 	if err != nil {
 		t.Fatalf("ListDevices() with search error = %v", err)
 	}
@@ -169,7 +169,7 @@ func TestSiteTrafficStoreListDevicesSupportsSearchPaginationAndOptions(t *testin
 		t.Fatalf("expected tunneled bytes 6144, got %d", filtered.Devices[0].TunneledBytes)
 	}
 
-	sourceFiltered, err := store.ListDevices("all", "bytes", "192.168.31.10", "", 1, 10, 10)
+	sourceFiltered, err := store.ListDevices("all", "bytes", "", "192.168.31.10", "", 1, 10, 10)
 	if err != nil {
 		t.Fatalf("ListDevices() with source filter error = %v", err)
 	}
@@ -181,6 +181,28 @@ func TestSiteTrafficStoreListDevicesSupportsSearchPaginationAndOptions(t *testin
 	}
 	if sourceFiltered.TotalBytes != 6144 {
 		t.Fatalf("expected source-filtered bytes 6144, got %d", sourceFiltered.TotalBytes)
+	}
+
+	secondPage, err := store.ListDevices("all", "bytes", "", "", "", 2, 1, 1)
+	if err != nil {
+		t.Fatalf("ListDevices() page 2 error = %v", err)
+	}
+	if secondPage.TotalCount != 2 {
+		t.Fatalf("expected total device count on page 2 to stay 2, got %d", secondPage.TotalCount)
+	}
+	if len(secondPage.Devices) != 1 || secondPage.Devices[0].SourceIP != "192.168.31.10" {
+		t.Fatalf("unexpected second page devices: %#v", secondPage.Devices)
+	}
+
+	ascending, err := store.ListDevices("all", "bytes", "asc", "", "", 1, 10, 10)
+	if err != nil {
+		t.Fatalf("ListDevices() ascending bytes error = %v", err)
+	}
+	if len(ascending.Devices) != 2 {
+		t.Fatalf("expected 2 ascending devices, got %d", len(ascending.Devices))
+	}
+	if ascending.Devices[0].SourceIP != "192.168.31.10" || ascending.Devices[1].SourceIP != "192.168.31.20" {
+		t.Fatalf("unexpected ascending devices: %#v", ascending.Devices)
 	}
 }
 
@@ -350,6 +372,7 @@ func TestSiteTrafficStoreListHistoryAggregatesDeviceDomainsInRange(t *testing.T)
 	result, err := store.ListHistory(
 		"all",
 		"bytes",
+		"",
 		"192.168.31.10",
 		"",
 		1,

@@ -8,9 +8,11 @@ import { formatBytes, formatBytesPerSecond, formatDate, formatDateFull } from ".
 
 const scopeOptions = ["all", "tunneled", "direct"];
 const siteSortOptions = ["bytes", "packets", "domain"];
+const deviceSortOptions = ["bytes", "packets", "name"];
 const deviceHistoryRangeOptions = ["1h", "3h", "1d", "3d", "7d", "30d"];
-const deviceSiteLimit = 1;
-const devicePageSize = 1;
+const deviceSiteLimit = 3;
+const focusedDeviceSiteLimit = 5;
+const devicePageSize = 10;
 const sitePageSize = 20;
 
 export default function TrafficStatsPage() {
@@ -25,9 +27,14 @@ export default function TrafficStatsPage() {
   const [siteSortDir, setSiteSortDir] = useState("desc");
   const [scope, setScope] = useState("all");
   const [siteSearch, setSiteSearch] = useState("");
+  const [deviceSortBy, setDeviceSortBy] = useState("bytes");
+  const [deviceSortDir, setDeviceSortDir] = useState("desc");
+  const [deviceSearch, setDeviceSearch] = useState("");
   const [selectedDeviceIp, setSelectedDeviceIp] = useState("");
   const [sitePage, setSitePage] = useState(1);
+  const [devicePage, setDevicePage] = useState(1);
   const [deviceHistoryData, setDeviceHistoryData] = useState(null);
+  const [selectedDeviceData, setSelectedDeviceData] = useState(null);
   const [deviceHistoryRange, setDeviceHistoryRange] = useState("1h");
   const [deviceHistoryFrom, setDeviceHistoryFrom] = useState("");
   const [deviceHistoryTo, setDeviceHistoryTo] = useState("");
@@ -94,15 +101,35 @@ export default function TrafficStatsPage() {
 
   const buildDevicesURL = useCallback(() => {
     const query = new URLSearchParams();
-    query.set("sort", "name");
-    query.set("page", "1");
+    query.set("sort", deviceSortBy);
+    query.set("order", deviceSortDir);
+    query.set("page", String(devicePage));
     query.set("pageSize", String(devicePageSize));
     query.set("siteLimit", String(deviceSiteLimit));
-    if (selectedDeviceIp) {
-      query.set("sourceIp", selectedDeviceIp);
+    if (scope !== "all") {
+      query.set("scope", scope);
+    }
+    if (deviceSearch.trim()) {
+      query.set("query", deviceSearch.trim());
     }
     return `/api/traffic/devices?${query.toString()}`;
-  }, [selectedDeviceIp]);
+  }, [devicePage, deviceSearch, deviceSortBy, deviceSortDir, scope]);
+
+  const buildSelectedDeviceURL = useCallback(() => {
+    if (!selectedDeviceIp) {
+      return "";
+    }
+
+    const query = new URLSearchParams();
+    query.set("sourceIp", selectedDeviceIp);
+    query.set("page", "1");
+    query.set("pageSize", "1");
+    query.set("siteLimit", String(focusedDeviceSiteLimit));
+    if (scope !== "all") {
+      query.set("scope", scope);
+    }
+    return `/api/traffic/devices?${query.toString()}`;
+  }, [scope, selectedDeviceIp]);
 
   const buildDeviceHistoryURL = useCallback(() => {
     if (!selectedDeviceIp) {
@@ -127,13 +154,15 @@ export default function TrafficStatsPage() {
     }
 
     try {
-      const [sitesResult, devicesResult, deviceHistoryResult] = await Promise.all([
+      const [sitesResult, devicesResult, selectedDeviceResult, deviceHistoryResult] = await Promise.all([
         fetchJSON(buildSitesURL()),
         fetchJSON(buildDevicesURL()),
+        selectedDeviceIp ? fetchJSON(buildSelectedDeviceURL()) : Promise.resolve(null),
         selectedDeviceIp ? fetchJSON(buildDeviceHistoryURL()) : Promise.resolve(null),
       ]);
       setSiteData(sitesResult);
       setDeviceData(devicesResult);
+      setSelectedDeviceData(selectedDeviceResult);
       setDeviceHistoryData(deviceHistoryResult);
       setError("");
     } catch (err) {
@@ -143,7 +172,7 @@ export default function TrafficStatsPage() {
         setLoading(false);
       }
     }
-  }, [buildDeviceHistoryURL, buildDevicesURL, buildSitesURL, selectedDeviceIp]);
+  }, [buildDeviceHistoryURL, buildDevicesURL, buildSelectedDeviceURL, buildSitesURL, selectedDeviceIp]);
 
   useEffect(() => {
     const initial = initialLoadRef.current;
@@ -217,15 +246,34 @@ export default function TrafficStatsPage() {
     }
   }, [siteSortBy]);
 
+  const handleDeviceSortChange = useCallback((key) => {
+    if (key === deviceSortBy) {
+      setDeviceSortDir((d) => (d === "desc" ? "asc" : "desc"));
+    } else {
+      setDeviceSortBy(key);
+      setDeviceSortDir(key === "name" ? "asc" : "desc");
+    }
+  }, [deviceSortBy]);
+
   useEffect(() => {
     setSitePage(1);
   }, [scope, siteSortBy, siteSortDir, siteSearch, selectedDeviceIp]);
+
+  useEffect(() => {
+    setDevicePage(1);
+  }, [deviceSearch, deviceSortBy, deviceSortDir, scope]);
 
   useEffect(() => {
     if (siteData && siteData.totalPages > 0 && sitePage > siteData.totalPages) {
       setSitePage(siteData.totalPages);
     }
   }, [siteData, sitePage]);
+
+  useEffect(() => {
+    if (deviceData && deviceData.totalPages > 0 && devicePage > deviceData.totalPages) {
+      setDevicePage(deviceData.totalPages);
+    }
+  }, [deviceData, devicePage]);
 
   useEffect(() => {
     const syncPreference = () => setAutoRefreshMs(readDashboardRefreshInterval());
@@ -262,6 +310,7 @@ export default function TrafficStatsPage() {
 
   useEffect(() => {
     if (!selectedDeviceIp) {
+      setSelectedDeviceData(null);
       setDeviceHistoryData(null);
     }
   }, [selectedDeviceIp]);
@@ -269,13 +318,15 @@ export default function TrafficStatsPage() {
   async function handleCollectNow() {
     setCollecting(true);
     try {
-      const [sitesResult, devicesResult, deviceHistoryResult] = await Promise.all([
+      const [sitesResult, devicesResult, selectedDeviceResult, deviceHistoryResult] = await Promise.all([
         fetchJSON(buildSitesURL(), { method: "POST" }),
         fetchJSON(buildDevicesURL()),
+        selectedDeviceIp ? fetchJSON(buildSelectedDeviceURL()) : Promise.resolve(null),
         selectedDeviceIp ? fetchJSON(buildDeviceHistoryURL()) : Promise.resolve(null),
       ]);
       setSiteData(sitesResult);
       setDeviceData(devicesResult);
+      setSelectedDeviceData(selectedDeviceResult);
       setDeviceHistoryData(deviceHistoryResult);
       setError("");
     } catch (err) {
@@ -303,18 +354,27 @@ export default function TrafficStatsPage() {
   }
 
   const sites = siteData?.sites ?? [];
+  const devices = deviceData?.devices ?? [];
   const totalBytes = siteData?.totalBytes ?? 0;
   const siteTotal = siteData?.total ?? 0;
-  const deviceTotal = deviceData?.total ?? 0;
+  const deviceTotal = deviceOptions.length > 0 ? deviceOptions.length : (deviceData?.total ?? 0);
   const maxSiteBytes = useMemo(
     () => sites.reduce((maxValue, item) => Math.max(maxValue, item.bytes), 0),
     [sites],
   );
+  const maxDeviceBytes = useMemo(
+    () => devices.reduce((maxValue, item) => Math.max(maxValue, item.bytes), 0),
+    [devices],
+  );
   const selectedDevice = selectedDeviceIp
-    ? deviceOptions.find((item) => item.sourceIp === selectedDeviceIp) ?? null
+    ? deviceOptions.find((item) => item.sourceIp === selectedDeviceIp)
+      ?? selectedDeviceData?.devices?.[0]
+      ?? null
     : null;
   const selectedDeviceStats = selectedDeviceIp
-    ? deviceData?.devices?.find((item) => item.sourceIp === selectedDeviceIp) ?? null
+    ? selectedDeviceData?.devices?.[0]
+      ?? devices.find((item) => item.sourceIp === selectedDeviceIp)
+      ?? null
     : null;
   const selectedDeviceHistory = selectedDeviceIp ? deviceHistoryData : null;
 
@@ -409,6 +469,196 @@ export default function TrafficStatsPage() {
         ))}
       </div>
 
+      <section id="traffic-devices" className="space-y-4">
+        <div>
+          <h2 className="font-headline text-2xl font-bold tracking-tight text-primary">
+            {t("trafficStats.devicesTitle")}
+          </h2>
+          <p className="mt-1 text-sm text-on-surface-variant">{t("trafficStats.devicesSubtitle")}</p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-4">
+          <div className="relative min-w-[260px] flex-1">
+            <Icon name="search" className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-outline" />
+            <input
+              type="text"
+              value={deviceSearch}
+              onChange={(event) => setDeviceSearch(event.target.value)}
+              placeholder={t("trafficStats.deviceSearchPlaceholder")}
+              className="w-full rounded-xl border border-outline-variant/20 bg-surface-container-lowest/50 py-2.5 pl-10 pr-4 text-sm text-on-surface outline-none transition-colors focus:border-primary/40"
+            />
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            {scopeOptions.map((option) => (
+              <button
+                key={`device-scope-${option}`}
+                type="button"
+                onClick={() => setScope(option)}
+                className={`rounded-full border px-3 py-1.5 text-xs font-bold uppercase tracking-wider transition-colors ${
+                  scope === option
+                    ? "border-secondary/30 bg-secondary/10 text-secondary"
+                    : "border-outline-variant/20 bg-surface-container-high text-on-surface-variant hover:border-secondary/30 hover:text-on-surface"
+                }`}
+              >
+                {t(`trafficStats.scope.${option}`)}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            {deviceSortOptions.map((option) => (
+              <button
+                key={`device-sort-${option}`}
+                type="button"
+                onClick={() => handleDeviceSortChange(option)}
+                className={`rounded-full border px-3 py-1.5 text-xs font-bold uppercase tracking-wider transition-colors ${
+                  deviceSortBy === option
+                    ? "border-primary/30 bg-primary/10 text-primary"
+                    : "border-outline-variant/20 bg-surface-container-high text-on-surface-variant hover:border-primary/30 hover:text-on-surface"
+                }`}
+              >
+                {t(`trafficStats.deviceSort.${option}`)}
+                {deviceSortBy === option && (deviceSortDir === "asc" ? " ▲" : " ▼")}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="overflow-hidden rounded-2xl border border-outline-variant/10 bg-surface-container-low shadow-xl">
+          {loading && !deviceData ? (
+            <div className="p-8 text-center text-sm text-on-surface-variant">...</div>
+          ) : devices.length === 0 ? (
+            <div className="p-8 text-center text-sm text-on-surface-variant">
+              {deviceSearch.trim() ? t("trafficStats.noResults") : t("trafficStats.devicesEmpty")}
+            </div>
+          ) : (
+            <>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-outline-variant/10 bg-surface-container text-left">
+                      <th className="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant">#</th>
+                      <SortableTh sortKey="name" current={deviceSortBy} dir={deviceSortDir} onSort={handleDeviceSortChange}>
+                        {t("trafficStats.deviceFilter")}
+                      </SortableTh>
+                      <SortableTh sortKey="bytes" current={deviceSortBy} dir={deviceSortDir} onSort={handleDeviceSortChange} align="right">
+                        {t("trafficStats.traffic")}
+                      </SortableTh>
+                      <SortableTh sortKey="packets" current={deviceSortBy} dir={deviceSortDir} onSort={handleDeviceSortChange} align="right" className="hidden lg:table-cell">
+                        {t("trafficStats.packets")}
+                      </SortableTh>
+                      <th className="hidden px-5 py-3 text-right text-[10px] font-bold uppercase tracking-widest text-on-surface-variant md:table-cell">
+                        {t("trafficStats.tunneled")}
+                      </th>
+                      <th className="hidden px-5 py-3 text-right text-[10px] font-bold uppercase tracking-widest text-on-surface-variant xl:table-cell">
+                        {t("trafficStats.direct")}
+                      </th>
+                      <th className="hidden px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant md:table-cell">
+                        {t("trafficStats.updated")}
+                      </th>
+                      <th className="hidden px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant xl:table-cell">
+                        {t("trafficStats.deviceTopSites")}
+                      </th>
+                      <th className="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {devices.map((item, index) => {
+                      const isSelected = selectedDeviceIp === item.sourceIp;
+                      const barWidth = maxDeviceBytes > 0 ? Math.max(2, (item.bytes / maxDeviceBytes) * 100) : 0;
+                      return (
+                        <tr
+                          key={item.sourceIp}
+                          className={`border-b border-outline-variant/5 transition-colors hover:bg-surface-container/50 ${
+                            isSelected ? "bg-primary/5" : ""
+                          }`}
+                        >
+                          <td className="px-5 py-4 font-mono text-xs text-on-surface-variant">
+                            {(deviceData.page - 1) * deviceData.pageSize + index + 1}
+                          </td>
+                          <td className="px-5 py-4">
+                            <div className="flex flex-col gap-1">
+                              <span className="font-medium text-on-surface">{deviceLabel(item)}</span>
+                              <span className="font-mono text-[11px] text-on-surface-variant">
+                                {item.sourceIp}
+                                {item.deviceMac ? ` / ${item.deviceMac}` : ""}
+                              </span>
+                              <div className="mt-1 h-2 overflow-hidden rounded-full bg-surface-container-highest/50 md:hidden">
+                                <div
+                                  className="h-full rounded-full bg-gradient-to-r from-primary via-secondary to-tertiary transition-[width] duration-500"
+                                  style={{ width: `${barWidth}%` }}
+                                />
+                              </div>
+                            </div>
+                          </td>
+                          <td className="px-5 py-4 text-right font-mono text-on-surface">{formatBytes(item.bytes)}</td>
+                          <td className="hidden px-5 py-4 text-right font-mono text-on-surface-variant lg:table-cell">
+                            {item.packets.toLocaleString()}
+                          </td>
+                          <td className="hidden px-5 py-4 text-right font-mono text-on-surface-variant md:table-cell">
+                            {formatBytes(item.tunneledBytes)}
+                          </td>
+                          <td className="hidden px-5 py-4 text-right font-mono text-on-surface-variant xl:table-cell">
+                            {formatBytes(item.directBytes)}
+                          </td>
+                          <td className="hidden px-5 py-4 font-mono text-[11px] whitespace-nowrap text-on-surface-variant md:table-cell">
+                            {formatDateFull(item.updatedAt) || "—"}
+                          </td>
+                          <td className="hidden px-5 py-4 xl:table-cell">
+                            {item.sites?.length > 0 ? (
+                              <div className="flex flex-wrap gap-2">
+                                {item.sites.map((site) => (
+                                  <span
+                                    key={`${item.sourceIp}-${site.domain}`}
+                                    className={`inline-flex max-w-[220px] items-center gap-2 rounded-full px-2.5 py-1 text-[10px] font-bold ${
+                                      site.viaTunnel
+                                        ? "bg-secondary/10 text-secondary"
+                                        : "bg-surface-container-high text-on-surface-variant"
+                                    }`}
+                                    title={`${site.domain} · ${formatBytes(site.bytes)}`}
+                                  >
+                                    <span className="truncate">{site.domain}</span>
+                                    <span className="font-mono opacity-80">{formatBytes(site.bytes)}</span>
+                                  </span>
+                                ))}
+                              </div>
+                            ) : (
+                              <span className="text-xs text-on-surface-variant">{t("trafficStats.deviceSitesEmpty")}</span>
+                            )}
+                          </td>
+                          <td className="px-5 py-4 text-right">
+                            <button
+                              type="button"
+                              onClick={() => setSelectedDeviceIp(item.sourceIp)}
+                              className={`rounded-xl border px-4 py-2 text-sm font-medium transition-colors ${
+                                isSelected
+                                  ? "border-primary/30 bg-primary/10 text-primary"
+                                  : "border-outline-variant/20 bg-surface-container-high text-on-surface hover:border-primary/30 hover:text-primary"
+                              }`}
+                            >
+                              {t("trafficStats.selectDevice")}
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              <PaginationControls
+                page={deviceData.page}
+                pageSize={deviceData.pageSize}
+                total={deviceData.total}
+                totalPages={deviceData.totalPages}
+                onPageChange={setDevicePage}
+                t={t}
+              />
+            </>
+          )}
+        </div>
+      </section>
+
       {selectedDevice ? (
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-primary/20 bg-primary/10 px-5 py-4 shadow-lg">
           <div className="min-w-0">
@@ -476,23 +726,6 @@ export default function TrafficStatsPage() {
               </option>
             ))}
           </select>
-
-          <div className="flex flex-wrap gap-2">
-            {scopeOptions.map((option) => (
-              <button
-                key={option}
-                type="button"
-                onClick={() => setScope(option)}
-                className={`rounded-full border px-3 py-1.5 text-xs font-bold uppercase tracking-wider transition-colors ${
-                  scope === option
-                    ? "border-secondary/30 bg-secondary/10 text-secondary"
-                    : "border-outline-variant/20 bg-surface-container-high text-on-surface-variant hover:border-secondary/30 hover:text-on-surface"
-                }`}
-              >
-                {t(`trafficStats.scope.${option}`)}
-              </button>
-            ))}
-          </div>
 
           <div className="flex flex-wrap gap-2">
             {siteSortOptions.map((option) => (

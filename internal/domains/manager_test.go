@@ -81,7 +81,6 @@ func TestNormalizeEntriesSanitizesImportedDomains(t *testing.T) {
 
 	want := []string{
 		"www.canva.com",
-		"auth.openai.com",
 		"telegram.org",
 		"openai.com",
 		"rc.bwa.to",
@@ -107,6 +106,29 @@ func TestNormalizeEntriesAcceptsIPv4AndCIDR(t *testing.T) {
 		"149.154.167.41",
 		"149.154.160.0/20",
 		"91.108.56.0/22",
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("NormalizeEntries() = %+v, want %+v", got, want)
+	}
+}
+
+func TestNormalizeEntriesCollapseCoveredDomains(t *testing.T) {
+	got := NormalizeEntries([]string{
+		"www.youtube.com",
+		"youtube.com",
+		"m.youtube.com",
+		"149.154.167.41",
+		"149.154.160.0/20",
+		"googlevideo.com",
+		"r3---sn.googlevideo.com",
+	})
+
+	want := []string{
+		"youtube.com",
+		"149.154.167.41",
+		"149.154.160.0/20",
+		"googlevideo.com",
 	}
 
 	if !reflect.DeepEqual(got, want) {

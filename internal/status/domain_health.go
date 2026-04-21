@@ -207,24 +207,59 @@ func (s *Service) SampleDomainHealth(ctx context.Context) error {
 }
 
 func (s *Service) RunDomainHealthSampler(ctx context.Context) {
-	if s.domainHealth == nil || s.domainHealthSampleInterval <= 0 {
+	if s.domainHealth == nil {
 		return
 	}
 
-	initial := time.NewTimer(domainHealthInitialDelay)
-	ticker := time.NewTicker(s.domainHealthSampleInterval)
-	defer initial.Stop()
-	defer ticker.Stop()
+	enabled := false
+	initialDeadline := time.Time{}
 
 	for {
+		interval := s.effectiveDomainHealthSampleInterval()
+		if interval <= 0 {
+			enabled = false
+			initialDeadline = time.Time{}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(disabledSamplerPollInterval):
+				continue
+			}
+		}
+
+		if !enabled {
+			enabled = true
+			if s.effectiveDomainHealthInitialSampleEnabled() {
+				initialDeadline = time.Now().Add(domainHealthInitialDelay)
+			} else {
+				initialDeadline = time.Time{}
+			}
+		}
+
+		wait := interval
+		fireInitial := false
+		if !initialDeadline.IsZero() {
+			untilInitial := time.Until(initialDeadline)
+			if untilInitial <= 0 {
+				wait = 0
+				fireInitial = true
+			} else if untilInitial < wait {
+				wait = untilInitial
+				fireInitial = true
+			}
+		}
+
 		select {
 		case <-ctx.Done():
 			return
-		case <-initial.C:
-			if err := s.SampleDomainHealth(ctx); err != nil {
-				log.Printf("domain health initial sample failed: %v", err)
+		case <-time.After(wait):
+			if fireInitial && !initialDeadline.IsZero() && !time.Now().Before(initialDeadline) {
+				initialDeadline = time.Time{}
+				if err := s.SampleDomainHealth(ctx); err != nil {
+					log.Printf("domain health initial sample failed: %v", err)
+				}
+				continue
 			}
-		case <-ticker.C:
 			if err := s.SampleDomainHealth(ctx); err != nil {
 				log.Printf("domain health sample failed: %v", err)
 			}
@@ -771,9 +806,18 @@ func firstNStrings(values []string, limit int) []string {
 }
 
 func resolveDomainHealthSampleInterval() time.Duration {
+	return resolveDomainHealthSampleIntervalWithFallback(defaultDomainHealthSampleInterval)
+}
+
+func resolveDomainHealthSampleIntervalWithFallback(fallback time.Duration) time.Duration {
 	raw := strings.TrimSpace(os.Getenv("VPN_MANAGER_DOMAIN_HEALTH_INTERVAL"))
 	if raw == "" {
-		return defaultDomainHealthSampleInterval
+		return fallback
+	}
+
+	switch strings.ToLower(raw) {
+	case "0", "off", "false", "disabled":
+		return 0
 	}
 
 	parsed, err := time.ParseDuration(raw)
@@ -785,7 +829,25 @@ func resolveDomainHealthSampleInterval() time.Duration {
 		return time.Duration(hours) * time.Hour
 	}
 
-	return defaultDomainHealthSampleInterval
+	return fallback
+}
+
+func domainHealthInitialSampleEnabled() bool {
+	return resolveDomainHealthInitialSampleEnabledWithFallback(true)
+}
+
+func resolveDomainHealthInitialSampleEnabledWithFallback(fallback bool) bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("VPN_MANAGER_DOMAIN_HEALTH_INITIAL_SAMPLE")))
+	switch raw {
+	case "":
+		return fallback
+	case "1", "on", "true", "enabled":
+		return true
+	case "0", "off", "false", "disabled":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func resolveDomainHealthVPNDNSServer() string {

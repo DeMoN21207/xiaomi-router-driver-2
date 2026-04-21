@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"xiomi-router-driver/internal/config"
@@ -98,6 +99,12 @@ type Service struct {
 	openvpnBinary               string
 	singboxBinary               string
 	wanProbe                    string
+	wanProbeTimeout             time.Duration
+	wanCacheTTL                 time.Duration
+	wanMu                       sync.Mutex
+	wanCache                    WANStatus
+	wanCacheAt                  time.Time
+	wanProbeInFlight            bool
 	history                     *trafficHistoryStore
 	domainTraffic               *domainTrafficStore
 	domainHealth                *domainHealthStore
@@ -126,6 +133,8 @@ func NewService(
 	if wanProbe == "" {
 		wanProbe = "1.1.1.1"
 	}
+	wanProbeTimeout := resolveDurationFromEnv("VPN_MANAGER_WAN_PROBE_TIMEOUT_MS", 2*time.Second)
+	wanCacheTTL := resolveDurationFromEnv("VPN_MANAGER_WAN_CACHE_TTL_MS", 15*time.Second)
 
 	return &Service{
 		state:                       state,
@@ -138,6 +147,8 @@ func NewService(
 		openvpnBinary:               openvpnBinary,
 		singboxBinary:               singboxBinary,
 		wanProbe:                    wanProbe,
+		wanProbeTimeout:             wanProbeTimeout,
+		wanCacheTTL:                 wanCacheTTL,
 		history:                     newTrafficHistoryStore(db, legacyTrafficPath, trafficHistoryRetention),
 		domainTraffic:               newDomainTrafficStore(db),
 		domainHealth:                newDomainHealthStore(db),
@@ -167,7 +178,7 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 		OpenVPN: s.hasBinary(s.openvpnBinary),
 		SingBox: s.hasBinary(s.singboxBinary),
 	}
-	wan := s.probeWAN(ctx)
+	wan := s.cachedWANStatus(ctx)
 	openvpnRuntime := []openvpn.RuntimeSnapshot{}
 	if s.openvpn != nil {
 		openvpnRuntime, err = s.openvpn.Snapshots()
@@ -277,6 +288,58 @@ func providerHealth(provider config.Provider, binaryAvailable bool, rulesCount i
 	return "ready", fmt.Sprintf("%d routes configured", rulesCount)
 }
 
+func (s *Service) cachedWANStatus(ctx context.Context) WANStatus {
+	if s == nil {
+		return WANStatus{State: "unknown", CheckedAt: time.Now().UTC().Format(time.RFC3339)}
+	}
+
+	now := time.Now()
+	s.wanMu.Lock()
+	cached := s.wanCache
+	cachedAt := s.wanCacheAt
+	cacheValid := !cachedAt.IsZero() && now.Sub(cachedAt) <= s.wanCacheTTL
+	if cacheValid {
+		s.wanMu.Unlock()
+		return cached
+	}
+	if !s.wanProbeInFlight {
+		s.wanProbeInFlight = true
+		go s.refreshWANCache()
+	}
+	if !cachedAt.IsZero() {
+		s.wanMu.Unlock()
+		return cached
+	}
+	s.wanMu.Unlock()
+
+	return WANStatus{
+		State:     "checking",
+		Probe:     s.wanProbe,
+		CheckedAt: now.UTC().Format(time.RFC3339),
+	}
+}
+
+func (s *Service) refreshWANCache() {
+	defer func() {
+		s.wanMu.Lock()
+		s.wanProbeInFlight = false
+		s.wanMu.Unlock()
+	}()
+
+	timeout := s.wanProbeTimeout
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	status := s.probeWAN(ctx)
+	s.wanMu.Lock()
+	s.wanCache = status
+	s.wanCacheAt = time.Now()
+	s.wanMu.Unlock()
+}
+
 func (s *Service) probeWAN(ctx context.Context) WANStatus {
 	status := WANStatus{
 		State:     "unknown",
@@ -294,13 +357,26 @@ func (s *Service) probeWAN(ctx context.Context) WANStatus {
 
 	args := []string{}
 	if runtime.GOOS == "windows" {
-		args = []string{"-n", "1", "-w", "1500", s.wanProbe}
+		milliseconds := int(s.wanProbeTimeout / time.Millisecond)
+		if milliseconds <= 0 {
+			milliseconds = 2000
+		}
+		args = []string{"-n", "1", "-w", strconv.Itoa(milliseconds), s.wanProbe}
 	} else {
-		args = []string{"-c", "1", "-W", "2", s.wanProbe}
+		seconds := int((s.wanProbeTimeout + time.Second - 1) / time.Second)
+		if seconds <= 0 {
+			seconds = 2
+		}
+		args = []string{"-c", "1", "-W", strconv.Itoa(seconds), s.wanProbe}
 	}
 
 	cmd := exec.CommandContext(ctx, pingBinary, args...)
 	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		status.State = "down"
+		status.LastError = "wan probe timeout"
+		return status
+	}
 	if err != nil {
 		status.State = "down"
 		status.LastError = strings.TrimSpace(string(output))
@@ -360,6 +436,34 @@ func parsePingLatency(output string) int64 {
 	}
 
 	return 0
+}
+
+func resolveDurationFromEnv(name string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	milliseconds, err := strconv.Atoi(raw)
+	if err != nil || milliseconds <= 0 {
+		return fallback
+	}
+	return time.Duration(milliseconds) * time.Millisecond
+}
+
+func resolveOptionalDurationEnv(name string, fallback time.Duration, min time.Duration) time.Duration {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	switch raw {
+	case "":
+		return fallback
+	case "0", "off", "false", "disabled":
+		return 0
+	}
+
+	parsed, err := time.ParseDuration(raw)
+	if err != nil || parsed < min {
+		return fallback
+	}
+	return parsed
 }
 
 func (s *Service) hasBinary(binary string) bool {
@@ -548,6 +652,7 @@ func (s *Service) PurgeTrafficOlderThan(cutoff time.Time) error {
 			s.siteTraffic.mu.Lock()
 			_, _ = s.siteTraffic.db.Exec(`DELETE FROM site_traffic WHERE updated_at < ?`, cutoffStr)
 			_, _ = s.siteTraffic.db.Exec(`DELETE FROM site_traffic_connections WHERE last_seen < ?`, cutoffStr)
+			_, _ = s.siteTraffic.db.Exec(`DELETE FROM site_dns_observations WHERE observed_at < ?`, cutoffStr)
 			_, _ = s.siteTraffic.db.Exec(`DELETE FROM device_traffic WHERE updated_at < ?`, cutoffStr)
 			_, _ = s.siteTraffic.db.Exec(`DELETE FROM device_site_traffic WHERE updated_at < ?`, cutoffStr)
 			_, _ = s.siteTraffic.db.Exec(`DELETE FROM device_traffic_history WHERE bucket_at < ?`, cutoffStr)

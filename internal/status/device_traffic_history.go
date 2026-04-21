@@ -71,7 +71,7 @@ func (s *Service) deviceTrafficHistoryWindow(sourceIP string, spec trafficHistor
 		SourceIP:              sourceIP,
 		Range:                 spec.Name,
 		BucketSeconds:         int(spec.Bucket.Seconds()),
-		SampleIntervalSeconds: int(s.siteTrafficSampleInterval.Seconds()),
+		SampleIntervalSeconds: int(s.effectiveSiteTrafficSampleInterval().Seconds()),
 		Points:                make([]DeviceTrafficHistoryPoint, 0),
 	}
 	if s.siteTraffic == nil {
@@ -83,7 +83,7 @@ func (s *Service) deviceTrafficHistoryWindow(sourceIP string, spec trafficHistor
 		return DeviceTrafficHistoryResponse{}, err
 	}
 
-	return aggregateDeviceTrafficHistory(samples, spec, from, to, s.siteTrafficSampleInterval, sourceIP), nil
+	return aggregateDeviceTrafficHistory(samples, spec, from, to, s.effectiveSiteTrafficSampleInterval(), sourceIP), nil
 }
 
 func parseDeviceTrafficHistoryRange(raw string) (trafficHistoryRangeSpec, error) {

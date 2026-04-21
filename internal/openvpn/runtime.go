@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"xiomi-router-driver/internal/config"
+	"xiomi-router-driver/internal/fileutil"
 	"xiomi-router-driver/internal/routing"
 	"xiomi-router-driver/internal/runtimebin"
 	"xiomi-router-driver/internal/runtimehealth"
@@ -454,7 +455,7 @@ func writeDomainList(path string, domains []string) error {
 	if content != "" {
 		content += "\n"
 	}
-	return os.WriteFile(path, []byte(content), 0o644)
+	return fileutil.WriteFileAtomic(path, []byte(content), 0o644)
 }
 
 func waitForInterface(name string, timeout time.Duration) error {

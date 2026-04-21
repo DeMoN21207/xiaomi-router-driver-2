@@ -12,6 +12,7 @@ const TRAFFIC_HISTORY_RANGES = ["1h", "3h", "1d", "3d", "7d", "30d"];
 export default function DashboardPage() {
   const { t } = useI18n();
   const [status, setStatus] = useState(null);
+  const [config, setConfig] = useState(null);
   const [events, setEvents] = useState([]);
   const [trafficHistory, setTrafficHistory] = useState(null);
   const [historyRange, setHistoryRange] = useState("7d");
@@ -40,6 +41,16 @@ export default function DashboardPage() {
     refreshInFlightRef.current = true;
     if (initial) setLoading(true);
     else if (showBusy) setBusy(true);
+    const configPromise = fetchJSON("/api/config")
+      .then((nextConfig) => {
+        setConfig(nextConfig);
+        return nextConfig;
+      })
+      .catch((err) => {
+        setError(err.message);
+        return null;
+      });
+
     try {
       const [nextStatus, nextEvents, nextTrafficHistory] = await Promise.all([
         fetchJSON("/api/status"),
@@ -53,6 +64,7 @@ export default function DashboardPage() {
     } catch (err) {
       setError(err.message);
     } finally {
+      await configPromise;
       refreshInFlightRef.current = false;
       if (initial) setLoading(false);
       else if (showBusy) setBusy(false);
@@ -88,11 +100,23 @@ export default function DashboardPage() {
     return () => window.clearInterval(timerId);
   }, [autoRefreshMs, historyRange, refresh]);
 
-  const providers = status?.providers ?? [];
+  const configProviders = (config?.providers ?? []).map((provider) => ({
+    ...provider,
+    health: "checking",
+    healthDetails: t("dashboard.statusLoading"),
+  }));
+  const providers = status?.providers ?? configProviders;
+  const configReady = Boolean(config);
+  const statusReady = Boolean(status);
+  const initialConfigLoading = loading && !configReady && !statusReady;
   const trafficRoutes = status?.trafficRoutes ?? [];
   const wanState = status?.wan?.state || "unknown";
   const activeVpns = providers.filter((provider) => provider.enabled).length;
-  const enabledRules = status?.enabledRules ?? 0;
+  const enabledRules = status?.enabledRules ?? (config?.rules ?? []).filter((rule) => {
+    if (!rule.enabled) return false;
+    const provider = (config?.providers ?? []).find((item) => item.id === rule.providerId);
+    return provider?.enabled;
+  }).length;
   const totalTrafficBytes = trafficRoutes.reduce((sum, route) => sum + (route.totalBytes || 0), 0);
 
   return (
@@ -143,15 +167,15 @@ export default function DashboardPage() {
       {error ? <InlineNotice tone="error" title={t("error.dashboard")} message={error} /> : null}
 
       <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4">
-        <KpiCard label={t("dashboard.wan")} value={t(`common.wanShort.${wanState}`)} icon="wifi" accent={wanState === "up" ? "secondary" : "error"} loading={loading} />
-        <KpiCard label={t("dashboard.activeVpns")} value={loading ? "..." : `${activeVpns} / ${providers.length}`} icon="vpn_lock" accent="primary" loading={loading} />
-        <KpiCard label={t("dashboard.routingRules")} value={loading ? "..." : `${enabledRules} ${t("dashboard.active")}`} icon="alt_route" accent="tertiary" loading={loading} />
+        <KpiCard label={t("dashboard.wan")} value={t(`common.wanShort.${wanState}`)} icon="wifi" accent={wanState === "up" ? "secondary" : "error"} loading={loading && !statusReady} />
+        <KpiCard label={t("dashboard.activeVpns")} value={`${activeVpns} / ${providers.length}`} icon="vpn_lock" accent="primary" loading={initialConfigLoading} />
+        <KpiCard label={t("dashboard.routingRules")} value={`${enabledRules} ${t("dashboard.active")}`} icon="alt_route" accent="tertiary" loading={initialConfigLoading} />
         <KpiCard
           label={t("dashboard.lastApply")}
           value={formatDate(status?.lastAppliedAt) || t("dashboard.notYet")}
           icon="schedule"
           accent="outline"
-          loading={loading}
+          loading={loading && !statusReady}
         />
       </div>
 
@@ -177,7 +201,9 @@ export default function DashboardPage() {
               {providers.length} {t("dashboard.configured")}
             </span>
           </div>
-          {providers.length === 0 ? (
+          {initialConfigLoading ? (
+            <div className="rounded-xl bg-surface-container-low p-8 text-center text-on-surface-variant">{t("common.loading")}</div>
+          ) : providers.length === 0 ? (
             <div className="rounded-xl bg-surface-container-low p-8 text-center text-on-surface-variant">{t("dashboard.noProviders")}</div>
           ) : (
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">

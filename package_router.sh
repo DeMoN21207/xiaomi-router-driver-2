@@ -65,11 +65,16 @@ if [[ ! -d node_modules ]]; then
   fi
 fi
 
+if [[ -d node_modules/.bin ]]; then
+  chmod +x node_modules/.bin/* 2>/dev/null || true
+fi
+
 npm run build
 
 echo "[2/4] Building $ROUTER_GOOS/$ROUTER_GOARCH binary..."
 cd "$ROOT_DIR"
 CGO_ENABLED=0 GOOS="$ROUTER_GOOS" GOARCH="$ROUTER_GOARCH" "$GO_EXE" build -o "$ROUTER_PACKAGE_DIR/$ROUTER_BINARY_NAME" ./cmd/vpn-manager
+chmod +x "$ROUTER_PACKAGE_DIR/$ROUTER_BINARY_NAME" 2>/dev/null || true
 
 echo "[3/4] Preparing router bundle..."
 cp "$PACKAGE_TEMPLATE_DIR/README.md" "$ROUTER_PACKAGE_DIR/README.md"
@@ -110,6 +115,10 @@ elif [[ -f "$ROUTER_PACKAGE_DIR/bin/sing-box" ]]; then
   chmod +x "$ROUTER_PACKAGE_DIR/sing-box"
   SINGBOX_BUNDLE_PATH="sing-box"
 fi
+
+chmod +x "$ROUTER_PACKAGE_DIR/bin/"* 2>/dev/null || true
+chmod +x "$ROUTER_PACKAGE_DIR/openvpn" 2>/dev/null || true
+chmod +x "$ROUTER_PACKAGE_DIR/sing-box" 2>/dev/null || true
 
 cat > "$ROUTER_PACKAGE_DIR/bundle-info.txt" <<EOF
 binary=$ROUTER_BINARY_NAME

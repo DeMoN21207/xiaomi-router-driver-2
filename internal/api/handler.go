@@ -45,6 +45,7 @@ type Dependencies struct {
 	Status          *status.Service
 	Blacklist       *blacklist.Manager
 	BlacklistRunner *blacklist.Runner
+	FailoverStatus  func() automation.FailoverStatus
 	DataDir         string
 }
 
@@ -59,6 +60,7 @@ type Handler struct {
 	status          *status.Service
 	blacklist       *blacklist.Manager
 	blacklistRunner *blacklist.Runner
+	failoverStatus  func() automation.FailoverStatus
 	dataDir         string
 	router          http.Handler
 	applyMu         sync.Mutex
@@ -100,11 +102,13 @@ func NewHandler(deps Dependencies) *Handler {
 		status:          deps.Status,
 		blacklist:       deps.Blacklist,
 		blacklistRunner: deps.BlacklistRunner,
+		failoverStatus:  deps.FailoverStatus,
 		dataDir:         deps.DataDir,
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", handler.handleStatus)
+	mux.HandleFunc("/api/failover/status", handler.handleFailoverStatus)
 	mux.HandleFunc("/api/traffic/history", handler.handleTrafficHistory)
 	mux.HandleFunc("/api/traffic/domains", handler.handleDomainTraffic)
 	mux.HandleFunc("/api/traffic/sites/history", handler.handleSiteTrafficHistory)
@@ -132,6 +136,10 @@ func NewHandler(deps Dependencies) *Handler {
 	mux.HandleFunc("/api/system/reboot", handler.handleReboot)
 	handler.router = mux
 	return handler
+}
+
+func (h *Handler) SetFailoverStatusProvider(provider func() automation.FailoverStatus) {
+	h.failoverStatus = provider
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -185,6 +193,18 @@ func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
 		"count":  len(list),
 		"total":  total,
 	})
+}
+
+func (h *Handler) handleFailoverStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	if h.failoverStatus == nil {
+		writeJSON(w, http.StatusOK, automation.FailoverStatus{})
+		return
+	}
+	writeJSON(w, http.StatusOK, h.failoverStatus())
 }
 
 func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -421,6 +441,7 @@ func (h *Handler) handleDeviceTraffic(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		q := r.URL.Query()
 		sortBy := q.Get("sort")
+		order := q.Get("order")
 		scope := q.Get("scope")
 		search := q.Get("query")
 		sourceIP := q.Get("sourceIp")
@@ -433,7 +454,7 @@ func (h *Handler) handleDeviceTraffic(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		result, err := h.status.DeviceTraffic(scope, sortBy, sourceIP, search, page, pageSize, siteLimit)
+		result, err := h.status.DeviceTraffic(scope, sortBy, order, sourceIP, search, page, pageSize, siteLimit)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -444,6 +465,7 @@ func (h *Handler) handleDeviceTraffic(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		q := r.URL.Query()
 		sortBy := q.Get("sort")
+		order := q.Get("order")
 		scope := q.Get("scope")
 		search := q.Get("query")
 		sourceIP := q.Get("sourceIp")
@@ -461,7 +483,7 @@ func (h *Handler) handleDeviceTraffic(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		result, err := h.status.DeviceTraffic(scope, sortBy, sourceIP, search, page, pageSize, siteLimit)
+		result, err := h.status.DeviceTraffic(scope, sortBy, order, sourceIP, search, page, pageSize, siteLimit)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -1086,18 +1108,33 @@ func (h *Handler) rollbackFailedRuleApply(previousState config.State) error {
 }
 
 func (h *Handler) applyCurrentRules(ctx context.Context) (applyResult, error) {
-	h.applyMu.Lock()
-	defer h.applyMu.Unlock()
-
 	state, err := h.state.Load()
 	if err != nil {
 		return applyResult{}, err
 	}
-	if err := validateActiveRuleEntries(state); err != nil {
-		state.LastError = err.Error()
-		_, _ = h.state.Save(state)
+	return h.applyStateRules(ctx, state, true)
+}
+
+func (h *Handler) ApplyRulesFromState(ctx context.Context, state config.State) error {
+	_, err := h.applyStateRules(ctx, state, false)
+	return err
+}
+
+func (h *Handler) applyStateRules(ctx context.Context, state config.State, persistState bool) (applyResult, error) {
+	h.applyMu.Lock()
+	defer h.applyMu.Unlock()
+
+	fail := func(err error) (applyResult, error) {
+		if persistState {
+			state.LastError = err.Error()
+			_, _ = h.state.Save(state)
+		}
 		h.recordEvent("error", "rules.apply_failed", err.Error())
 		return applyResult{}, err
+	}
+
+	if err := validateActiveRuleEntries(state); err != nil {
+		return fail(err)
 	}
 
 	providersByID := make(map[string]config.Provider, len(state.Providers))
@@ -1149,10 +1186,7 @@ func (h *Handler) applyCurrentRules(ctx context.Context) (applyResult, error) {
 	}
 
 	if err := h.domains.ReplaceAll(domainsToApply); err != nil {
-		state.LastError = err.Error()
-		_, _ = h.state.Save(state)
-		h.recordEvent("error", "rules.apply_failed", err.Error())
-		return applyResult{}, err
+		return fail(err)
 	}
 
 	if len(enabledRules) == 0 {
@@ -1172,11 +1206,7 @@ func (h *Handler) applyCurrentRules(ctx context.Context) (applyResult, error) {
 			}
 		}
 		if len(cleanupErrors) > 0 {
-			err := errors.Join(cleanupErrors...)
-			state.LastError = err.Error()
-			_, _ = h.state.Save(state)
-			h.recordEvent("error", "rules.apply_failed", err.Error())
-			return applyResult{}, err
+			return fail(errors.Join(cleanupErrors...))
 		}
 	} else {
 		var openvpnProvider config.Provider
@@ -1188,40 +1218,23 @@ func (h *Handler) applyCurrentRules(ctx context.Context) (applyResult, error) {
 			}
 		}
 		if openvpnProviderCount > 1 {
-			err := errors.New("simultaneous apply for multiple openvpn providers is not implemented yet")
-			state.LastError = err.Error()
-			_, _ = h.state.Save(state)
-			h.recordEvent("error", "rules.apply_failed", err.Error())
-			return applyResult{}, err
+			return fail(errors.New("simultaneous apply for multiple openvpn providers is not implemented yet"))
 		}
 
 		if len(openvpnRules) > 0 {
 			if h.openvpn == nil {
-				err := errors.New("openvpn runtime manager is not configured")
-				state.LastError = err.Error()
-				_, _ = h.state.Save(state)
-				h.recordEvent("error", "rules.apply_failed", err.Error())
-				return applyResult{}, err
+				return fail(errors.New("openvpn runtime manager is not configured"))
 			}
 			if err := h.openvpn.Apply(ctx, openvpnProvider, openvpnDomains, state.Routing); err != nil {
-				state.LastError = err.Error()
-				_, _ = h.state.Save(state)
-				h.recordEvent("error", "rules.apply_failed", err.Error())
-				return applyResult{}, err
+				return fail(err)
 			}
 		} else if h.openvpn != nil {
 			if err := h.openvpn.Cleanup(ctx); err != nil {
-				state.LastError = err.Error()
-				_, _ = h.state.Save(state)
-				h.recordEvent("error", "rules.apply_failed", err.Error())
-				return applyResult{}, err
+				return fail(err)
 			}
 		} else {
 			if err := h.routing.Run(ctx, "del", state.Routing); err != nil {
-				state.LastError = err.Error()
-				_, _ = h.state.Save(state)
-				h.recordEvent("error", "rules.apply_failed", err.Error())
-				return applyResult{}, err
+				return fail(err)
 			}
 		}
 
@@ -1230,11 +1243,7 @@ func (h *Handler) applyCurrentRules(ctx context.Context) (applyResult, error) {
 				if h.openvpn != nil {
 					_ = h.openvpn.Cleanup(ctx)
 				}
-				err := errors.New("subscription runtime manager is not configured")
-				state.LastError = err.Error()
-				_, _ = h.state.Save(state)
-				h.recordEvent("error", "rules.apply_failed", err.Error())
-				return applyResult{}, err
+				return fail(errors.New("subscription runtime manager is not configured"))
 			}
 			subscriptionState := state
 			if len(openvpnRules) > 0 {
@@ -1244,29 +1253,29 @@ func (h *Handler) applyCurrentRules(ctx context.Context) (applyResult, error) {
 				if h.openvpn != nil {
 					_ = h.openvpn.Cleanup(ctx)
 				}
-				state.LastError = err.Error()
-				_, _ = h.state.Save(state)
-				h.recordEvent("error", "rules.apply_failed", err.Error())
-				return applyResult{}, err
+				return fail(err)
 			}
 		} else if h.subscriptions != nil {
 			if err := h.subscriptions.Cleanup(ctx); err != nil {
 				if h.openvpn != nil {
 					_ = h.openvpn.Cleanup(ctx)
 				}
-				state.LastError = err.Error()
-				_, _ = h.state.Save(state)
-				h.recordEvent("error", "rules.apply_failed", err.Error())
-				return applyResult{}, err
+				return fail(err)
 			}
 		}
 	}
 
-	state.LastAppliedAt = time.Now().UTC().Format(time.RFC3339)
-	state.LastError = ""
-	_, _ = h.state.Save(state)
+	if persistState {
+		state.LastAppliedAt = time.Now().UTC().Format(time.RFC3339)
+		state.LastError = ""
+		_, _ = h.state.Save(state)
+	}
 
-	h.recordEvent("info", "rules.applied", fmt.Sprintf("Applied %d rules for %d routing entries", len(enabledRules), len(domainsToApply)))
+	eventMessage := fmt.Sprintf("Applied %d rules for %d routing entries", len(enabledRules), len(domainsToApply))
+	if !persistState {
+		eventMessage = fmt.Sprintf("Applied failover runtime state: %d rules for %d routing entries", len(enabledRules), len(domainsToApply))
+	}
+	h.recordEvent("info", "rules.applied", eventMessage)
 	return applyResult{
 		Status:       "applied",
 		RulesApplied: len(enabledRules),
@@ -1769,6 +1778,8 @@ func validateRoutingSettings(settings config.RoutingSettings) (config.RoutingSet
 	settings.IPSetName = strings.TrimSpace(settings.IPSetName)
 	settings.FWMark = strings.TrimSpace(settings.FWMark)
 	settings.DNSMasqConfigFile = strings.TrimSpace(settings.DNSMasqConfigFile)
+	settings.IPv6Mode = strings.ToLower(strings.TrimSpace(settings.IPv6Mode))
+	settings.LoadProfile = config.NormalizeRoutingLoadProfile(settings.LoadProfile)
 
 	switch settings.VPNRouteMode {
 	case "gateway", "dev":
@@ -1799,6 +1810,22 @@ func validateRoutingSettings(settings config.RoutingSettings) (config.RoutingSet
 	}
 	if settings.DNSMasqConfigFile == "" {
 		return config.RoutingSettings{}, errors.New("dnsMasqConfigFile is required")
+	}
+	if settings.MSSValue < 0 || settings.MSSValue > 1460 {
+		return config.RoutingSettings{}, errors.New("mssValue must be between 0 and 1460")
+	}
+	switch settings.IPv6Mode {
+	case "", "warn":
+		settings.IPv6Mode = "warn"
+	case "allow", "disable":
+		// accepted
+	default:
+		return config.RoutingSettings{}, errors.New("ipv6Mode must be warn, allow, or disable")
+	}
+	switch settings.LoadProfile {
+	case config.RoutingLoadProfileMinimal, config.RoutingLoadProfileNormal, config.RoutingLoadProfileDetailed:
+	default:
+		return config.RoutingSettings{}, errors.New("loadProfile must be minimal, normal, or detailed")
 	}
 
 	return settings, nil

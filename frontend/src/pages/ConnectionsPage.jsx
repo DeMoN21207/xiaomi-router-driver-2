@@ -169,7 +169,9 @@ function DomainPathStatus({ label, dnsStatus, transportStatus, dnsFailures, tran
 export default function ConnectionsPage() {
   const { t } = useI18n();
   const [config, setConfig] = useState(null);
+  const [configLoaded, setConfigLoaded] = useState(false);
   const [status, setStatus] = useState(null);
+  const [failoverStatus, setFailoverStatus] = useState(null);
   const [domainHealthMap, setDomainHealthMap] = useState(() => new Map());
   const [form, setForm] = useState(defaultForm);
   const [showForm, setShowForm] = useState(false);
@@ -185,6 +187,9 @@ export default function ConnectionsPage() {
   const providers = config?.providers ?? [];
   const rules = config?.rules ?? [];
   const runtimeMap = new Map((status?.providers ?? []).map((p) => [p.id, p]));
+  const failoverOverrideMap = new Map((failoverStatus?.activeOverrides ?? []).map((item) => [item.ruleId, item]));
+  const failoverProviderMap = new Map((failoverStatus?.providers ?? []).map((item) => [item.providerId, item]));
+  const activeFailoverOverrides = failoverStatus?.activeOverrides ?? [];
 
   const showToast = useCallback((message, error = false) => {
     setToast({ message, error });
@@ -195,20 +200,41 @@ export default function ConnectionsPage() {
   useEffect(() => () => clearTimeout(toastTimer.current), []);
 
   const refresh = useCallback(async () => {
+    let configReady = false;
     try {
-      const [nextConfig, nextStatus, nextDomainHealth] = await Promise.all([
-        fetchJSON("/api/config"),
-        fetchJSON("/api/status"),
-        fetchJSON("/api/domains/health"),
-      ]);
+      const nextConfig = await fetchJSON("/api/config");
       setConfig(nextConfig);
-      setStatus(nextStatus);
-      setDomainHealthMap(createDomainHealthMap(nextDomainHealth));
+      setConfigLoaded(true);
+      configReady = true;
       setPageError("");
     } catch (error) {
+      setConfigLoaded(true);
       setPageError(error.message);
+      return;
     }
-  }, []);
+
+    const [nextStatus, nextDomainHealth, nextFailoverStatus] = await Promise.allSettled([
+      fetchJSON("/api/status"),
+      fetchJSON("/api/domains/health"),
+      fetchJSON("/api/failover/status"),
+    ]);
+
+    if (nextStatus.status === "fulfilled") {
+      setStatus(nextStatus.value);
+    } else if (configReady) {
+      setPageError(nextStatus.reason?.message || t("error.connectionsLoad"));
+    }
+
+    if (nextDomainHealth.status === "fulfilled") {
+      setDomainHealthMap(createDomainHealthMap(nextDomainHealth.value));
+    } else if (configReady) {
+      setPageError(nextDomainHealth.reason?.message || t("error.connectionsLoad"));
+    }
+
+    if (nextFailoverStatus.status === "fulfilled") {
+      setFailoverStatus(nextFailoverStatus.value);
+    }
+  }, [t]);
 
   useEffect(() => {
     void refresh();
@@ -370,6 +396,13 @@ export default function ConnectionsPage() {
       </header>
 
       {pageError ? <InlineNotice tone="error" title={t("error.connections")} message={pageError} /> : null}
+      {activeFailoverOverrides.length > 0 ? (
+        <InlineNotice
+          tone="warn"
+          title={t("connections.failoverActive")}
+          message={formatFailoverSummary(activeFailoverOverrides, t)}
+        />
+      ) : null}
 
       {showForm && (
         <form onSubmit={submit} className="space-y-5 rounded-xl border border-outline-variant/10 bg-surface-container-low p-6">
@@ -488,6 +521,8 @@ export default function ConnectionsPage() {
               isOnline={isOnline}
               providerRules={providerRules}
               busy={busy}
+              failoverOverrides={failoverOverrideMap}
+              failoverProvider={failoverProviderMap.get(provider.id)}
               domainHealthMap={domainHealthMap}
               onDelete={() => remove(provider.id)}
               onToggleEnabled={(nextEnabled) => updateProvider(provider, { enabled: nextEnabled })}
@@ -500,7 +535,14 @@ export default function ConnectionsPage() {
         })}
       </div>
 
-      {providers.length === 0 && (
+      {!configLoaded && (
+        <div className="rounded-xl bg-surface-container-low p-12 text-center">
+          <Icon name="vpn_lock" className="mx-auto mb-4 h-12 w-12 animate-pulse text-outline-variant" />
+          <p className="text-on-surface-variant">{t("common.loading")}</p>
+        </div>
+      )}
+
+      {configLoaded && providers.length === 0 && (
         <div className="rounded-xl bg-surface-container-low p-12 text-center">
           <Icon name="vpn_lock" className="mx-auto mb-4 h-12 w-12 text-outline-variant" />
           <p className="text-on-surface-variant">{t("connections.empty")}</p>
@@ -520,7 +562,36 @@ export default function ConnectionsPage() {
   );
 }
 
-function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, isOnline, providerRules, busy, domainHealthMap, onDelete, onToggleEnabled, onDomainsChange, showToast, setPageError, t }) {
+
+function formatFailoverSummary(overrides, t) {
+  if (!Array.isArray(overrides) || overrides.length === 0) {
+    return "";
+  }
+  const preview = overrides.slice(0, 3).map((item) => {
+    const route = item.ruleName || item.ruleId || "-";
+    if (item.mode === "direct") {
+      return `${route}: ${t("connections.failoverNowDirect")}`;
+    }
+    const target = [item.activeProviderName, item.activeLocation].filter(Boolean).join(" / ");
+    return `${route}: ${target || item.activeProviderId || "-"}`;
+  });
+  const extra = Math.max(0, overrides.length - preview.length);
+  return extra > 0 ? `${preview.join("; ")}; +${extra}` : preview.join("; ");
+}
+
+function formatFailoverOverrideMessage(override, t) {
+  if (!override) {
+    return "";
+  }
+  const original = [override.originalProviderName, override.originalLocation].filter(Boolean).join(" / ");
+  if (override.mode === "direct") {
+    return t("connections.failoverDirect", { from: original || override.originalProviderId || "-" });
+  }
+  const active = [override.activeProviderName, override.activeLocation].filter(Boolean).join(" / ");
+  return t("connections.failoverProvider", { from: original || override.originalProviderId || "-", to: active || override.activeProviderId || "-" });
+}
+
+function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, isOnline, providerRules, busy, failoverOverrides, failoverProvider, domainHealthMap, onDelete, onToggleEnabled, onDomainsChange, showToast, setPageError, t }) {
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [probing, setProbing] = useState(false);
@@ -655,6 +726,12 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
                 {rule.selectedLocation}
               </span>
             ))}
+            {failoverProvider && failoverProvider.status !== "unknown" ? (
+              <span className="rounded bg-surface-container-highest px-2 py-0.5 text-[10px] text-on-surface-variant">
+                {t("connections.failoverHealth")}: {failoverProvider.status}
+                {failoverProvider.score > 0 ? ` · ${failoverProvider.score}` : ""}
+              </span>
+            ) : null}
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-3">
@@ -837,6 +914,7 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
                 probing={probing}
                 saving={saving}
                 setSaving={setSaving}
+                failoverOverride={failoverOverrides?.get(rule.id)}
                 domainHealthMap={domainHealthMap}
                 onDeleteRule={() => deleteRule(rule.id)}
                 onDomainsChange={onDomainsChange}
@@ -1155,7 +1233,7 @@ function findRuleDomainConflict(rule, provider, domains, allRules, allProviders)
   return "";
 }
 
-function RuleBlock({ rule, provider, allRules, allProviders, probeLocations, probing, saving, setSaving, domainHealthMap, onDeleteRule, onDomainsChange, showToast, setPageError, t }) {
+function RuleBlock({ rule, provider, allRules, allProviders, probeLocations, probing, saving, setSaving, failoverOverride, domainHealthMap, onDeleteRule, onDomainsChange, showToast, setPageError, t }) {
   const [domainInput, setDomainInput] = useState("");
   const [changingLocation, setChangingLocation] = useState(false);
   const [newLocation, setNewLocation] = useState("");
@@ -1335,6 +1413,19 @@ function RuleBlock({ rule, provider, allRules, allProviders, probeLocations, pro
           <Icon name="close" className="h-4 w-4" />
         </button>
       </div>
+
+      {failoverOverride ? (
+        <div className="mb-3 rounded-lg border border-tertiary/25 bg-tertiary/10 p-3 text-xs text-tertiary">
+          <div className="mb-1 flex items-center gap-1.5 font-bold uppercase tracking-wide">
+            <Icon name="swap_horiz" className="h-3.5 w-3.5" />
+            {t("connections.failoverRouteActive")}
+          </div>
+          <div className="text-on-surface-variant">{formatFailoverOverrideMessage(failoverOverride, t)}</div>
+          {failoverOverride.reason ? (
+            <div className="mt-1 font-mono text-[10px] text-outline-variant">{failoverOverride.reason}</div>
+          ) : null}
+        </div>
+      ) : null}
 
       {changingLocation && (
         <div className="mb-3 rounded-lg border border-primary/20 bg-surface-container-high p-3">

@@ -13,6 +13,29 @@ import (
 	"time"
 )
 
+func TestEnabledFromEnv(t *testing.T) {
+	t.Run("enabled by default", func(t *testing.T) {
+		t.Setenv("VPN_MANAGER_DNS_PROXY", "")
+		if !EnabledFromEnv() {
+			t.Fatalf("expected dns proxy enabled by default")
+		}
+	})
+
+	t.Run("explicit on enables proxy", func(t *testing.T) {
+		t.Setenv("VPN_MANAGER_DNS_PROXY", "on")
+		if !EnabledFromEnv() {
+			t.Fatalf("expected dns proxy enabled")
+		}
+	})
+
+	t.Run("invalid values keep proxy enabled", func(t *testing.T) {
+		t.Setenv("VPN_MANAGER_DNS_PROXY", "maybe")
+		if !EnabledFromEnv() {
+			t.Fatalf("expected dns proxy enabled for invalid value")
+		}
+	})
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {

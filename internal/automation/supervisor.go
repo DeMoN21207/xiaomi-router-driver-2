@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"xiomi-router-driver/internal/config"
@@ -16,21 +17,29 @@ import (
 
 type ApplyFunc func(ctx context.Context) error
 
+type ApplyStateFunc func(ctx context.Context, state config.State) error
+
 type Supervisor struct {
-	state        *config.Manager
-	status       *status.Service
-	apply        ApplyFunc
-	recordEvent  func(level string, kind string, message string)
-	interval     time.Duration
-	lastWAN      string
-	lastCleanup  time.Time
+	state       *config.Manager
+	status      *status.Service
+	apply       ApplyFunc
+	applyState  ApplyStateFunc
+	dataDir     string
+	recordEvent func(level string, kind string, message string)
+	interval    time.Duration
+	lastWAN     string
+	lastCleanup time.Time
+	failoverMu  sync.RWMutex
+	failover    failoverRuntime
 }
 
 func NewSupervisor(
 	state *config.Manager,
 	statusService *status.Service,
 	apply ApplyFunc,
+	applyState ApplyStateFunc,
 	recordEvent func(level string, kind string, message string),
+	dataDir string,
 ) *Supervisor {
 	interval := 20 * time.Second
 	if raw := strings.TrimSpace(os.Getenv("VPN_MANAGER_RECOVERY_INTERVAL")); raw != "" {
@@ -43,8 +52,11 @@ func NewSupervisor(
 		state:       state,
 		status:      statusService,
 		apply:       apply,
+		applyState:  applyState,
+		dataDir:     strings.TrimSpace(dataDir),
 		recordEvent: recordEvent,
 		interval:    interval,
+		failover:    newFailoverRuntime(),
 	}
 }
 
@@ -114,12 +126,21 @@ func (s *Supervisor) tick(ctx context.Context) {
 		return
 	}
 
-	if !state.Automation.AutoRecover || !hasEnabledRules(state) {
+	if !hasEnabledRules(state) {
 		return
 	}
 
+	if snapshot.WAN.State == "up" && state.Automation.ProviderFailover && s.maybeProviderFailover(ctx, state, snapshot) {
+		return
+	}
+
+	if !state.Automation.AutoRecover {
+		return
+	}
+
+	runtimeState := s.failoverAppliedState(state)
 	if previousWAN != "up" && snapshot.WAN.State == "up" {
-		if err := s.apply(ctx); err != nil {
+		if err := s.applyStateRespectingFailover(ctx, state); err != nil {
 			s.record("error", "automation.reconcile_failed", fmt.Sprintf("WAN recovery failed: %v", err))
 			log.Printf("automation WAN recovery failed: %v", err)
 			return
@@ -132,8 +153,8 @@ func (s *Supervisor) tick(ctx context.Context) {
 		return
 	}
 
-	if openvpnRecoveryNeeded(state, snapshot.OpenVPNRuntime) || subscriptionRecoveryNeeded(state, snapshot.SubscriptionRuntime) {
-		if err := s.apply(ctx); err != nil {
+	if openvpnRecoveryNeeded(runtimeState, snapshot.OpenVPNRuntime) || subscriptionRecoveryNeeded(runtimeState, snapshot.SubscriptionRuntime) {
+		if err := s.applyStateRespectingFailover(ctx, state); err != nil {
 			s.record("error", "automation.reconcile_failed", fmt.Sprintf("vpn runtime recovery failed: %v", err))
 			log.Printf("automation runtime recovery failed: %v", err)
 			return

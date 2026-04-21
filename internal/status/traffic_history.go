@@ -143,22 +143,35 @@ func (s *Service) RunTrafficSampler(ctx context.Context) {
 }
 
 func (s *Service) RunDomainTrafficSampler(ctx context.Context) {
-	if s.domainTraffic == nil || s.domainTrafficSampleInterval <= 0 {
+	if s.domainTraffic == nil {
 		return
 	}
 
-	if err := s.SampleDomainTraffic(); err != nil {
-		log.Printf("domain traffic sampler initial sample failed: %v", err)
-	}
-
-	ticker := time.NewTicker(s.domainTrafficSampleInterval)
-	defer ticker.Stop()
+	enabled := false
 
 	for {
+		interval := s.effectiveDomainTrafficSampleInterval()
+		if interval <= 0 {
+			enabled = false
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(disabledSamplerPollInterval):
+				continue
+			}
+		}
+
+		if !enabled {
+			if err := s.SampleDomainTraffic(); err != nil {
+				log.Printf("domain traffic sampler initial sample failed: %v", err)
+			}
+			enabled = true
+		}
+
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-time.After(interval):
 			if err := s.SampleDomainTraffic(); err != nil {
 				log.Printf("domain traffic sample failed: %v", err)
 			}
@@ -550,17 +563,11 @@ func resolveTrafficSampleInterval() time.Duration {
 }
 
 func resolveDomainTrafficSampleInterval() time.Duration {
-	raw := strings.TrimSpace(os.Getenv("VPN_MANAGER_DOMAIN_TRAFFIC_SAMPLE_INTERVAL"))
-	if raw == "" {
-		return defaultDomainTrafficSampleInterval
-	}
-
-	parsed, err := time.ParseDuration(raw)
-	if err != nil || parsed < 5*time.Second {
-		return defaultDomainTrafficSampleInterval
-	}
-
-	return parsed
+	return resolveOptionalDurationEnv(
+		"VPN_MANAGER_DOMAIN_TRAFFIC_SAMPLE_INTERVAL",
+		defaultDomainTrafficSampleInterval,
+		5*time.Second,
+	)
 }
 
 func (s *trafficHistoryStore) Append(sample trafficHistorySample) error {

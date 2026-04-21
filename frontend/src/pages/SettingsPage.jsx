@@ -8,13 +8,23 @@ import { formatBytes, formatDate, formatLatencyMs } from "../utils.js";
 
 const STATUS_REFRESH_MS = 10_000;
 
+const DEFAULT_AUTOMATION = {
+  installService: false,
+  autoRecover: false,
+  providerFailover: true,
+  failoverFailureSeconds: 120,
+  failoverRestoreSeconds: 60,
+  failoverAllDownMode: "keep",
+  trafficCleanupDays: 14,
+};
+
 export default function SettingsPage() {
   const { t, lang, setLang } = useI18n();
   const [status, setStatus] = useState(null);
   const [config, setConfig] = useState(null);
   const [domainTraffic, setDomainTraffic] = useState({ domains: [], totalBytes: 0, updatedAt: "" });
   const [routing, setRouting] = useState(null);
-  const [automation, setAutomation] = useState({ installService: false, autoRecover: false });
+  const [automation, setAutomation] = useState(DEFAULT_AUTOMATION);
   const [error, setError] = useState("");
   const [saveError, setSaveError] = useState("");
   const [saveMessage, setSaveMessage] = useState("");
@@ -49,7 +59,7 @@ export default function SettingsPage() {
         setConfig(nextConfig);
         setDomainTraffic(nextDomainTraffic || { domains: [], totalBytes: 0, updatedAt: "" });
         setRouting(nextConfig.routing || null);
-        setAutomation(nextConfig.automation || { installService: false, autoRecover: false });
+        setAutomation(nextConfig.automation || DEFAULT_AUTOMATION);
         setError("");
       } catch (err) {
         if (!active) return;
@@ -94,7 +104,7 @@ export default function SettingsPage() {
       setConfig(nextConfig);
       setDomainTraffic(nextDomainTraffic || { domains: [], totalBytes: 0, updatedAt: "" });
       setRouting(nextConfig.routing || null);
-      setAutomation(nextConfig.automation || { installService: false, autoRecover: false });
+      setAutomation(nextConfig.automation || DEFAULT_AUTOMATION);
       setError("");
     } catch (err) {
       setError(err.message);
@@ -136,7 +146,12 @@ export default function SettingsPage() {
         },
         body: JSON.stringify({
           ...routing,
+          loadProfile: routing.loadProfile || "normal",
           tableNum: Number(routing.tableNum),
+          mssClamp: Boolean(routing.mssClamp),
+          mssValue: Number(routing.mssValue || 0),
+          dnsHijack: Boolean(routing.dnsHijack),
+          ipv6Mode: routing.ipv6Mode || "warn",
         }),
       });
 
@@ -164,11 +179,18 @@ export default function SettingsPage() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify(automation),
+        body: JSON.stringify({
+          ...automation,
+          providerFailover: Boolean(automation.providerFailover),
+          failoverFailureSeconds: Number(automation.failoverFailureSeconds || 120),
+          failoverRestoreSeconds: Number(automation.failoverRestoreSeconds || 60),
+          failoverAllDownMode: automation.failoverAllDownMode || "keep",
+          trafficCleanupDays: Number(automation.trafficCleanupDays || 0),
+        }),
       });
 
       setConfig(saved);
-      setAutomation(saved.automation || { installService: false, autoRecover: false });
+      setAutomation(saved.automation || DEFAULT_AUTOMATION);
       setAutomationMessage(t("settings.automationSaved"));
       setError("");
     } catch (err) {
@@ -352,6 +374,18 @@ export default function SettingsPage() {
               {saveError ? <InlineNotice tone="error" title={t("error.settingsSave")} message={saveError} /> : null}
               {saveMessage ? <InlineNotice tone="info" title={t("settings.routingProfile")} message={saveMessage} /> : null}
 
+              <SelectInput
+                label={t("settings.loadProfile")}
+                hint={t("hint.loadProfile")}
+                value={routing?.loadProfile || "normal"}
+                onChange={(value) => updateRoutingField("loadProfile", value)}
+                options={[
+                  { value: "minimal", label: t("settings.loadProfileMinimal") },
+                  { value: "normal", label: t("settings.loadProfileNormal") },
+                  { value: "detailed", label: t("settings.loadProfileDetailed") },
+                ]}
+              />
+
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <TextInput label={t("settings.lanIface")} hint={t("hint.lanIface")} value={routing?.lanIface || ""} onChange={(value) => updateRoutingField("lanIface", value)} />
                 <TextInput label={t("settings.vpnIface")} hint={t("hint.vpnIface")} value={routing?.vpnIface || ""} onChange={(value) => updateRoutingField("vpnIface", value)} />
@@ -391,6 +425,39 @@ export default function SettingsPage() {
                 onChange={(value) => updateRoutingField("dnsMasqConfigFile", value)}
               />
 
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <ToggleField
+                  label={t("settings.mssClamp")}
+                  hint={t("hint.mssClamp")}
+                  checked={routing?.mssClamp !== false}
+                  onChange={(value) => updateRoutingField("mssClamp", value)}
+                />
+                <ToggleField
+                  label={t("settings.dnsHijack")}
+                  hint={t("hint.dnsHijack")}
+                  checked={routing?.dnsHijack !== false}
+                  onChange={(value) => updateRoutingField("dnsHijack", value)}
+                />
+                <TextInput
+                  label={t("settings.mssValue")}
+                  hint={t("hint.mssValue")}
+                  type="number"
+                  value={routing?.mssValue ?? 0}
+                  onChange={(value) => updateRoutingField("mssValue", value)}
+                />
+                <SelectInput
+                  label={t("settings.ipv6Mode")}
+                  hint={t("hint.ipv6Mode")}
+                  value={routing?.ipv6Mode || "warn"}
+                  onChange={(value) => updateRoutingField("ipv6Mode", value)}
+                  options={[
+                    { value: "warn", label: t("settings.ipv6ModeWarn") },
+                    { value: "allow", label: t("settings.ipv6ModeAllow") },
+                    { value: "disable", label: t("settings.ipv6ModeDisable") },
+                  ]}
+                />
+              </div>
+
               <ToggleField label={t("settings.masquerade")} hint={t("hint.masquerade")} checked={Boolean(routing?.vpnMasquerade)} onChange={(value) => updateRoutingField("vpnMasquerade", value)} />
 
               <button
@@ -419,6 +486,40 @@ export default function SettingsPage() {
                 label={t("settings.autoRecover")}
                 checked={Boolean(automation.autoRecover)}
                 onChange={(value) => updateAutomationField("autoRecover", value)}
+              />
+              <ToggleField
+                label={t("settings.providerFailover")}
+                hint={t("hint.providerFailover")}
+                checked={Boolean(automation.providerFailover)}
+                onChange={(value) => updateAutomationField("providerFailover", value)}
+              />
+
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <TextInput
+                  label={t("settings.failoverFailureSeconds")}
+                  hint={t("hint.failoverFailureSeconds")}
+                  type="number"
+                  value={automation.failoverFailureSeconds ?? 120}
+                  onChange={(value) => updateAutomationField("failoverFailureSeconds", value)}
+                />
+                <TextInput
+                  label={t("settings.failoverRestoreSeconds")}
+                  hint={t("hint.failoverRestoreSeconds")}
+                  type="number"
+                  value={automation.failoverRestoreSeconds ?? 60}
+                  onChange={(value) => updateAutomationField("failoverRestoreSeconds", value)}
+                />
+              </div>
+
+              <SelectInput
+                label={t("settings.failoverAllDownMode")}
+                hint={t("hint.failoverAllDownMode")}
+                value={automation.failoverAllDownMode || "keep"}
+                onChange={(value) => updateAutomationField("failoverAllDownMode", value)}
+                options={[
+                  { value: "keep", label: t("settings.failoverAllDownKeep") },
+                  { value: "direct", label: t("settings.failoverAllDownDirect") },
+                ]}
               />
 
               <div className="flex items-center justify-between gap-4 rounded-lg bg-surface-container p-3">

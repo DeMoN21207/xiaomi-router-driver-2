@@ -7,11 +7,12 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+
+	"xiomi-router-driver/internal/fileutil"
 )
 
 var domainPattern = regexp.MustCompile(`^[a-z0-9.-]+$`)
@@ -300,15 +301,11 @@ func (m *Manager) syncRuntimeFile(lines []string) error {
 		return nil
 	}
 
-	if err := os.MkdirAll(filepath.Dir(m.runtimePath), 0o755); err != nil {
-		return err
-	}
-
 	content := strings.Join(lines, "\n")
 	if content != "" {
 		content += "\n"
 	}
-	return os.WriteFile(m.runtimePath, []byte(content), 0o644)
+	return fileutil.WriteFileAtomic(m.runtimePath, []byte(content), 0o644)
 }
 
 func normalizeDomainList(domains []string) ([]string, error) {
@@ -325,7 +322,7 @@ func normalizeDomainList(domains []string) ([]string, error) {
 		seen[normalized] = struct{}{}
 		result = append(result, normalized)
 	}
-	return result, nil
+	return collapseCoveredDomains(result), nil
 }
 
 func sameDomainList(left []string, right []string) bool {
@@ -354,6 +351,50 @@ func NormalizeEntries(domains []string) []string {
 		seen[normalized] = struct{}{}
 		result = append(result, normalized)
 	}
+	return collapseCoveredDomains(result)
+}
+
+func collapseCoveredDomains(entries []string) []string {
+	if len(entries) < 2 {
+		return entries
+	}
+
+	domainSet := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if IsIPEntry(entry) {
+			continue
+		}
+		domainSet[entry] = struct{}{}
+	}
+
+	result := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if IsIPEntry(entry) {
+			result = append(result, entry)
+			continue
+		}
+
+		covered := false
+		current := entry
+		for {
+			nextDot := strings.IndexByte(current, '.')
+			if nextDot < 0 || nextDot >= len(current)-1 {
+				break
+			}
+
+			parent := current[nextDot+1:]
+			if _, exists := domainSet[parent]; exists {
+				covered = true
+				break
+			}
+			current = parent
+		}
+
+		if !covered {
+			result = append(result, entry)
+		}
+	}
+
 	return result
 }
 

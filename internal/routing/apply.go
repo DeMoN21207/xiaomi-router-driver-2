@@ -68,9 +68,14 @@ func (r *Runner) RunWithOptions(ctx context.Context, action string, options RunO
 
 	cmd := exec.CommandContext(ctx, shell, scriptPath, action)
 	cmd.Dir = r.workingDir
+	loadProfile := config.RoutingLoadProfileTuningFor(options.Settings.LoadProfile)
 	envValues := map[string]string{
 		"DOMAIN_LIST":               domainListPath,
-		"DOMAIN_STATS_MAX_DOMAINS":  strconv.Itoa(DomainStatsMaxDomains()),
+		"DOMAIN_STATS_MAX_DOMAINS":  strconv.Itoa(DomainStatsMaxDomainsWithFallback(loadProfile.DomainStatsMaxDomains)),
+		"VPN_MANAGER_DOMAIN_STATS":  DomainStatsModeWithFallback(loadProfile.DomainStatsMode),
+		"PRIME_MAX_DOMAINS":         strconv.Itoa(resolveIntEnvWithFallback(loadProfile.PrimeMaxDomains, "VPN_MANAGER_PRIME_MAX_DOMAINS", "PRIME_MAX_DOMAINS")),
+		"IPSET_TIMEOUT":             strconv.Itoa(resolveIntEnvWithFallback(loadProfile.IPSetTimeout, "VPN_MANAGER_IPSET_TIMEOUT", "IPSET_TIMEOUT")),
+		"IPSET_FLUSH_ON_SYNC":       boolToScriptValue(resolveBoolEnvWithFallback(loadProfile.IPSetFlushOnSync, "VPN_MANAGER_IPSET_FLUSH_ON_SYNC", "IPSET_FLUSH_ON_SYNC")),
 		"VPN_GATEWAY":               options.Settings.VPNGateway,
 		"VPN_ROUTE_MODE":            options.Settings.VPNRouteMode,
 		"VPN_MASQUERADE":            boolToScriptValue(options.Settings.VPNMasquerade),
@@ -81,6 +86,10 @@ func (r *Runner) RunWithOptions(ctx context.Context, action string, options RunO
 		"IPSET_NAME":                options.Settings.IPSetName,
 		"FWMARK":                    options.Settings.FWMark,
 		"DNSMASQ_CONFIG_FILE":       options.Settings.DNSMasqConfigFile,
+		"MSS_CLAMP":                 boolToScriptValue(options.Settings.MSSClamp),
+		"MSS_VALUE":                 strconv.Itoa(options.Settings.MSSValue),
+		"DNS_HIJACK":                boolToScriptValue(options.Settings.DNSHijack),
+		"IPV6_MODE":                 options.Settings.IPv6Mode,
 		"DOMAIN_STATS_CHAIN":        DomainStatsChainName(options.Settings.IPSetName),
 		"LEGACY_DOMAIN_STATS_CHAIN": LegacyDomainStatsChainName(options.Settings.IPSetName),
 	}
@@ -171,4 +180,37 @@ func boolToScriptValue(value bool) string {
 	}
 
 	return "0"
+}
+
+func resolveIntEnvWithFallback(fallback int, names ...string) int {
+	for _, name := range names {
+		raw := strings.TrimSpace(os.Getenv(name))
+		if raw == "" {
+			continue
+		}
+
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			continue
+		}
+		return parsed
+	}
+
+	return fallback
+}
+
+func resolveBoolEnvWithFallback(fallback bool, names ...string) bool {
+	for _, name := range names {
+		raw := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+		switch raw {
+		case "":
+			continue
+		case "1", "on", "true", "yes", "enabled":
+			return true
+		case "0", "off", "false", "no", "disabled":
+			return false
+		}
+	}
+
+	return fallback
 }

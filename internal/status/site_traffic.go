@@ -21,16 +21,19 @@ import (
 
 	"xiomi-router-driver/internal/config"
 	"xiomi-router-driver/internal/domains"
+	"xiomi-router-driver/internal/fileutil"
 )
 
 const (
-	defaultSiteTrafficSampleInterval = 10 * time.Second
-	dnsObserverConfigPath            = "/tmp/dnsmasq.d/vpn_manager_observer.conf"
-	dnsObserverLogPath               = "/tmp/dnsmasq-vpn-manager.log"
-	siteTrafficConnectionRetention   = 24 * time.Hour
-	defaultSiteTrafficPageSize       = 20
-	defaultDeviceTrafficPageSize     = 6
-	maxTrafficPageSize               = 200
+	defaultSiteTrafficSampleInterval       = 10 * time.Second
+	dnsObserverConfigPath                  = "/tmp/dnsmasq.d/vpn_manager_observer.conf"
+	dnsObserverLogPath                     = "/tmp/dnsmasq-vpn-manager.log"
+	dnsObserverLogAsyncLines               = 25
+	dnsObserverMaxLogSize            int64 = 2 * 1024 * 1024
+	siteTrafficConnectionRetention         = 24 * time.Hour
+	defaultSiteTrafficPageSize             = 20
+	defaultDeviceTrafficPageSize           = 6
+	maxTrafficPageSize                     = 200
 )
 
 type SiteTrafficStat struct {
@@ -160,22 +163,40 @@ func newSiteTrafficStore(db *sql.DB) *siteTrafficStore {
 }
 
 func (s *Service) RunSiteTrafficSampler(ctx context.Context) {
-	if s.siteTraffic == nil || s.siteTrafficSampleInterval <= 0 || runtime.GOOS != "linux" {
+	if s.siteTraffic == nil || runtime.GOOS != "linux" {
 		return
 	}
 
-	if err := s.SampleSiteTraffic(); err != nil {
-		log.Printf("site traffic sampler initial sample failed: %v", err)
-	}
-
-	ticker := time.NewTicker(s.siteTrafficSampleInterval)
-	defer ticker.Stop()
+	enabled := false
 
 	for {
+		interval := s.effectiveSiteTrafficSampleInterval()
+		if interval <= 0 {
+			if enabled {
+				if err := disableDNSObserverConfig(); err != nil {
+					log.Printf("site traffic sampler observer cleanup failed: %v", err)
+				}
+				enabled = false
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(disabledSamplerPollInterval):
+				continue
+			}
+		}
+
+		if !enabled {
+			if err := s.SampleSiteTraffic(); err != nil {
+				log.Printf("site traffic sampler initial sample failed: %v", err)
+			}
+			enabled = true
+		}
+
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-time.After(interval):
 			if err := s.SampleSiteTraffic(); err != nil {
 				log.Printf("site traffic sample failed: %v", err)
 			}
@@ -259,7 +280,7 @@ func (s *Service) ResetSiteTraffic() error {
 	return s.siteTraffic.Reset()
 }
 
-func (s *Service) DeviceTraffic(scope string, sortBy string, sourceIP string, search string, page int, pageSize int, siteLimit int) (DeviceTrafficResponse, error) {
+func (s *Service) DeviceTraffic(scope string, sortBy string, order string, sourceIP string, search string, page int, pageSize int, siteLimit int) (DeviceTrafficResponse, error) {
 	page = normalizeTrafficPage(page)
 	pageSize = normalizeTrafficPageSize(pageSize, defaultDeviceTrafficPageSize)
 
@@ -275,7 +296,7 @@ func (s *Service) DeviceTraffic(scope string, sortBy string, sourceIP string, se
 		}, nil
 	}
 
-	result, err := s.siteTraffic.ListDevices(scope, sortBy, sourceIP, search, page, pageSize, siteLimit)
+	result, err := s.siteTraffic.ListDevices(scope, sortBy, order, sourceIP, search, page, pageSize, siteLimit)
 	if err != nil {
 		return DeviceTrafficResponse{}, err
 	}
@@ -351,6 +372,12 @@ func (s *Service) ingestDNSObservationLog() error {
 		}
 	}
 
+	if currentOffset >= dnsObserverMaxLogSize {
+		if err := os.Truncate(dnsObserverLogPath, 0); err == nil {
+			return s.siteTraffic.SetLogOffset(0)
+		}
+	}
+
 	return s.siteTraffic.SetLogOffset(currentOffset)
 }
 
@@ -396,6 +423,7 @@ func ensureDNSObserverConfig() error {
 
 	desired := strings.Join([]string{
 		"log-queries=extra",
+		fmt.Sprintf("log-async=%d", dnsObserverLogAsyncLines),
 		"log-facility=" + dnsObserverLogPath,
 		"",
 	}, "\n")
@@ -412,15 +440,62 @@ func ensureDNSObserverConfig() error {
 		return fmt.Errorf("read dns observer config: %w", err)
 	}
 
-	if err := os.WriteFile(dnsObserverConfigPath, []byte(desired), 0o644); err != nil {
+	if err := fileutil.WriteFileAtomic(dnsObserverConfigPath, []byte(desired), 0o644); err != nil {
 		return fmt.Errorf("write dns observer config: %w", err)
 	}
 
-	cmd := exec.Command("/etc/init.d/dnsmasq", "restart")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("restart dnsmasq for observer config: %s", strings.TrimSpace(string(output)))
+	return reloadDNSObserver()
+}
+
+func disableDNSObserverConfig() error {
+	if err := os.Remove(dnsObserverConfigPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("remove dns observer config: %w", err)
 	}
+
+	return reloadDNSObserver()
+}
+
+func reloadDNSObserver() error {
+	if _, err := os.Stat("/etc/init.d/dnsmasq"); err == nil {
+		cmd := exec.Command("/etc/init.d/dnsmasq", "reload")
+		output, reloadErr := cmd.CombinedOutput()
+		if reloadErr == nil {
+			return nil
+		}
+
+		if pidof, err := exec.LookPath("pidof"); err == nil {
+			pidsOutput, pidErr := exec.Command(pidof, "dnsmasq").CombinedOutput()
+			if pidErr == nil {
+				pids := strings.Fields(strings.TrimSpace(string(pidsOutput)))
+				if len(pids) > 0 {
+					hup := exec.Command("kill", append([]string{"-HUP"}, pids...)...)
+					if hupOutput, hupErr := hup.CombinedOutput(); hupErr == nil {
+						return nil
+					} else if strings.TrimSpace(string(hupOutput)) != "" {
+						output = append(output, '\n')
+						output = append(output, hupOutput...)
+					}
+				}
+			}
+		}
+
+		cmd = exec.Command("/etc/init.d/dnsmasq", "restart")
+		restartOutput, restartErr := cmd.CombinedOutput()
+		if restartErr == nil {
+			return nil
+		}
+		if strings.TrimSpace(string(restartOutput)) != "" {
+			output = append(output, '\n')
+			output = append(output, restartOutput...)
+		}
+		return fmt.Errorf("reload dnsmasq for observer config: %s", strings.TrimSpace(string(output)))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("check dnsmasq init script: %w", err)
+	}
+
 	return nil
 }
 
@@ -819,17 +894,11 @@ func normalizeObservedIP(raw string) (netip.Addr, bool) {
 }
 
 func resolveSiteTrafficSampleInterval() time.Duration {
-	raw := strings.TrimSpace(os.Getenv("VPN_MANAGER_SITE_TRAFFIC_SAMPLE_INTERVAL"))
-	if raw == "" {
-		return defaultSiteTrafficSampleInterval
-	}
-
-	parsed, err := time.ParseDuration(raw)
-	if err != nil || parsed < 5*time.Second {
-		return defaultSiteTrafficSampleInterval
-	}
-
-	return parsed
+	return resolveOptionalDurationEnv(
+		"VPN_MANAGER_SITE_TRAFFIC_SAMPLE_INTERVAL",
+		defaultSiteTrafficSampleInterval,
+		5*time.Second,
+	)
 }
 
 func (s *siteTrafficStore) ensureReady() error {
@@ -919,6 +988,12 @@ func (s *siteTrafficStore) ensureReady() error {
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_site_traffic_updated_at ON site_traffic(updated_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_site_traffic_connections_last_seen ON site_traffic_connections(last_seen)`,
+		`CREATE INDEX IF NOT EXISTS idx_site_dns_observations_observed_at ON site_dns_observations(observed_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_device_site_traffic_bytes ON device_site_traffic(bytes DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_device_site_traffic_history_bucket ON device_site_traffic_history(bucket_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_device_traffic_history_bucket ON device_traffic_history(bucket_at)`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil {
 			s.initErr = err
@@ -1258,7 +1333,7 @@ func (s *siteTrafficStore) List(scope string, sortBy string, order string, sourc
 	}, nil
 }
 
-func (s *siteTrafficStore) ListDevices(scope string, sortBy string, sourceIP string, search string, page int, pageSize int, siteLimit int) (pagedDeviceTrafficResult, error) {
+func (s *siteTrafficStore) ListDevices(scope string, sortBy string, order string, sourceIP string, search string, page int, pageSize int, siteLimit int) (pagedDeviceTrafficResult, error) {
 	if err := s.ensureReady(); err != nil {
 		return pagedDeviceTrafficResult{}, err
 	}
@@ -1318,7 +1393,7 @@ func (s *siteTrafficStore) ListDevices(scope string, sortBy string, sourceIP str
 	}
 
 	query := `SELECT source_ip, device_name, device_mac, bytes, packets, updated_at, tunneled_bytes, direct_bytes FROM device_traffic` +
-		where + ` ORDER BY ` + deviceTrafficOrderClause(sortBy) + ` LIMIT ? OFFSET ?`
+		where + ` ORDER BY ` + deviceTrafficOrderClause(sortBy, order) + ` LIMIT ? OFFSET ?`
 	queryArgs := append(append([]any{}, args...), pageSize, (page-1)*pageSize)
 
 	rows, err := s.db.Query(query, queryArgs...)
@@ -1468,14 +1543,33 @@ func siteTrafficOrderClause(sortBy, order string) string {
 	}
 }
 
-func deviceTrafficOrderClause(sortBy string) string {
-	switch strings.TrimSpace(sortBy) {
+func deviceTrafficOrderClause(sortBy, order string) string {
+	sortBy = strings.TrimSpace(sortBy)
+	order = strings.ToLower(strings.TrimSpace(order))
+
+	desc := "DESC"
+	asc := "ASC"
+	switch sortBy {
 	case "name":
-		return "LOWER(CASE WHEN TRIM(device_name) <> '' THEN device_name ELSE source_ip END) ASC, source_ip ASC"
+		primary := asc
+		tie := asc
+		if order == "desc" {
+			primary = desc
+			tie = desc
+		}
+		return "LOWER(CASE WHEN TRIM(device_name) <> '' THEN device_name ELSE source_ip END) " + primary + ", source_ip " + tie
 	case "packets":
-		return "packets DESC, bytes DESC, source_ip ASC"
+		primary := desc
+		if order == "asc" {
+			primary = asc
+		}
+		return "packets " + primary + ", bytes DESC, source_ip ASC"
 	default:
-		return "bytes DESC, packets DESC, source_ip ASC"
+		primary := desc
+		if order == "asc" {
+			primary = asc
+		}
+		return "bytes " + primary + ", packets DESC, source_ip ASC"
 	}
 }
 

@@ -60,7 +60,7 @@ func (r *Runner) Run(ctx context.Context, action string, opts RunOptions) error 
 		"BLACKLIST_DOMAINS_FILE": opts.DomainsListPath,
 		"BLACKLIST_IPS_FILE":     opts.IPsListPath,
 		"BLACKLIST_DNSMASQ_FILE": dnsmasqFile,
-		"LAN_IFACE":             lanIface,
+		"LAN_IFACE":              lanIface,
 	})
 
 	output, err := cmd.CombinedOutput()

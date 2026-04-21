@@ -16,6 +16,7 @@ import (
 	"xiomi-router-driver/internal/blacklist"
 	"xiomi-router-driver/internal/config"
 	"xiomi-router-driver/internal/dnsproxy"
+	"xiomi-router-driver/internal/doctor"
 	"xiomi-router-driver/internal/domains"
 	"xiomi-router-driver/internal/events"
 	"xiomi-router-driver/internal/openvpn"
@@ -27,6 +28,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "doctor" {
+		os.Exit(doctor.Run(os.Stdout))
+	}
+
 	executablePath, err := os.Executable()
 	if err != nil {
 		log.Fatalf("resolve executable path: %v", err)
@@ -132,7 +137,8 @@ func main() {
 		BlacklistRunner: blacklistRunner,
 		DataDir:         paths.DataDir,
 	})
-	supervisor := automation.NewSupervisor(stateManager, statusService, apiHandler.ApplyCurrentRules, recordEvent)
+	supervisor := automation.NewSupervisor(stateManager, statusService, apiHandler.ApplyCurrentRules, apiHandler.ApplyRulesFromState, recordEvent, paths.DataDir)
+	apiHandler.SetFailoverStatusProvider(supervisor.FailoverStatus)
 	go supervisor.Run(context.Background())
 	go statusService.RunTrafficSampler(context.Background())
 	go statusService.RunDomainTrafficSampler(context.Background())

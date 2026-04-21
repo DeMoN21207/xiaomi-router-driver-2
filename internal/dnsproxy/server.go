@@ -18,9 +18,9 @@ import (
 )
 
 const (
-	defaultAddr       = "127.0.0.1:15353"
-	defaultTimeout    = 8 * time.Second
-	defaultMaxMessage = 65535
+	defaultAddr                = "127.0.0.1:15353"
+	defaultTimeout             = 8 * time.Second
+	defaultMaxMessage          = 65535
 	defaultMaxIdleConnsPerHost = 8
 )
 
@@ -62,6 +62,8 @@ func EnabledFromEnv() bool {
 	switch strings.ToLower(value) {
 	case "0", "false", "no", "off", "disabled":
 		return false
+	case "1", "true", "yes", "on", "enabled":
+		return true
 	default:
 		return true
 	}

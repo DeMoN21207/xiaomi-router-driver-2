@@ -150,7 +150,7 @@ func (s *Service) activeDomainStatsChains() []string {
 	// Main routing ipset -> chain
 	if s.domains != nil {
 		domainCount, countErr := s.domains.CountDomains()
-		if countErr == nil && routing.DomainStatsEnabled(domainCount) {
+		if countErr == nil && s.effectiveDomainStatsEnabled(domainCount) {
 			mainChain := routing.DomainStatsChainName(state.Routing.IPSetName)
 			if !seen[mainChain] {
 				seen[mainChain] = true
@@ -164,7 +164,7 @@ func (s *Service) activeDomainStatsChains() []string {
 		snapshots, err := s.subscriptions.Snapshots()
 		if err == nil {
 			for _, snap := range snapshots {
-				if snap.IPSetName != "" && routing.DomainStatsEnabled(snap.DomainCount) {
+				if snap.IPSetName != "" && s.effectiveDomainStatsEnabled(snap.DomainCount) {
 					chain := routing.DomainStatsChainName(snap.IPSetName)
 					if !seen[chain] {
 						seen[chain] = true

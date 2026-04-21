@@ -1,8 +1,8 @@
 package events
 
 import (
-	"database/sql"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"

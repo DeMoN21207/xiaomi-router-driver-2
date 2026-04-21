@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"xiomi-router-driver/internal/config"
+	"xiomi-router-driver/internal/fileutil"
 	"xiomi-router-driver/internal/routing"
 	"xiomi-router-driver/internal/runtimebin"
 	"xiomi-router-driver/internal/runtimehealth"
@@ -266,7 +267,7 @@ func (m *Manager) startPlannedInstance(plan applyPlan) (*managedInstance, error)
 		return nil, fmt.Errorf("write domain list for %s: %w", plan.desired.Location, err)
 	}
 
-	if err := os.WriteFile(plan.configPath, plan.configData, 0o600); err != nil {
+	if err := fileutil.WriteFileAtomic(plan.configPath, plan.configData, 0o600); err != nil {
 		removeIfExists(plan.domainListPath)
 		return nil, fmt.Errorf("write sing-box config for %s: %w", plan.desired.Location, err)
 	}
@@ -712,7 +713,7 @@ func writeDomainList(path string, domains []string) error {
 	if content != "" {
 		content += "\n"
 	}
-	return os.WriteFile(path, []byte(content), 0o644)
+	return fileutil.WriteFileAtomic(path, []byte(content), 0o644)
 }
 
 func deriveRoutingSettings(base config.RoutingSettings, hash string, index int) config.RoutingSettings {
