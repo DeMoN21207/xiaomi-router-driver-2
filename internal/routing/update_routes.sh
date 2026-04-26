@@ -24,6 +24,7 @@ LEGACY_DOMAIN_STATS_CHAIN="${LEGACY_DOMAIN_STATS_CHAIN:-VPN_DOM_STATS_${IPSET_NA
 DNSMASQ_RESTART_LOG="${DNSMASQ_RESTART_LOG:-/tmp/vpn-manager-dnsmasq-restart.log}"
 PRIME_MAX_DOMAINS="${PRIME_MAX_DOMAINS:-0}"
 DNS_PRIME_LOOKUP_TIMEOUT_SECONDS="${DNS_PRIME_LOOKUP_TIMEOUT_SECONDS:-1}"
+DNS_PRIME_SERVERS="${DNS_PRIME_SERVERS:-1.1.1.1,8.8.8.8,9.9.9.9}"
 DOMAIN_STATS_MAX_DOMAINS="${DOMAIN_STATS_MAX_DOMAINS:-128}"
 IPSET_TIMEOUT="${IPSET_TIMEOUT:-1800}"
 IPSET_FLUSH_ON_SYNC="${IPSET_FLUSH_ON_SYNC:-0}"
@@ -119,14 +120,57 @@ iptables() {
 
 resolve_domain_ips() {
     domain="$1"
+    dns_server="${2:-127.0.0.1}"
     if command -v timeout >/dev/null 2>&1 && [ "${DNS_PRIME_LOOKUP_TIMEOUT_SECONDS:-0}" -gt 0 ] 2>/dev/null; then
-        timeout "$DNS_PRIME_LOOKUP_TIMEOUT_SECONDS" nslookup "$domain" 127.0.0.1 2>/dev/null
+        timeout "$DNS_PRIME_LOOKUP_TIMEOUT_SECONDS" nslookup "$domain" "$dns_server" 2>/dev/null
     else
-        nslookup "$domain" 127.0.0.1 2>/dev/null
+        nslookup "$domain" "$dns_server" 2>/dev/null
     fi \
         | awk '/^Name:/ {capture=1; next} capture && /^Address [0-9]+: / {print $3} capture && /^Address: / {print $2}' \
         | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
         | sort -u
+}
+
+prime_domain_ips() {
+    domain="$1"
+    collected=""
+
+    for ip in $(resolve_domain_ips "$domain" "127.0.0.1"); do
+        case " $collected " in
+            *" $ip "*) ;;
+            *)
+                collected="$collected $ip"
+                ipset add "$IPSET_NAME" "$ip" timeout "$IPSET_TIMEOUT" -exist >/dev/null 2>&1
+                if [ "$ENABLE_DOMAIN_STATS" = "1" ]; then
+                    dom_hash=$(short_hash "${IPSET_NAME}:${domain}")
+                    dom_set="${compact_domain_prefix}${dom_hash}"
+                    ipset add "$dom_set" "$ip" timeout "$IPSET_TIMEOUT" -exist >/dev/null 2>&1
+                fi
+                ;;
+        esac
+    done
+
+    for dns_server in $(printf '%s\n' "$DNS_PRIME_SERVERS" | tr ',;' ' '); do
+        dns_server=$(echo "$dns_server" | tr -d '\r')
+        if [ -z "$dns_server" ] || [ "$dns_server" = "127.0.0.1" ]; then
+            continue
+        fi
+
+        for ip in $(resolve_domain_ips "$domain" "$dns_server"); do
+            case " $collected " in
+                *" $ip "*) ;;
+                *)
+                    collected="$collected $ip"
+                    ipset add "$IPSET_NAME" "$ip" timeout "$IPSET_TIMEOUT" -exist >/dev/null 2>&1
+                    if [ "$ENABLE_DOMAIN_STATS" = "1" ]; then
+                        dom_hash=$(short_hash "${IPSET_NAME}:${domain}")
+                        dom_set="${compact_domain_prefix}${dom_hash}"
+                        ipset add "$dom_set" "$ip" timeout "$IPSET_TIMEOUT" -exist >/dev/null 2>&1
+                    fi
+                    ;;
+            esac
+        done
+    done
 }
 
 domain_stats_enabled() {
@@ -247,14 +291,7 @@ prime_ipsets() {
             break
         fi
 
-        for ip in $(resolve_domain_ips "$domain"); do
-            ipset add "$IPSET_NAME" "$ip" timeout "$IPSET_TIMEOUT" -exist >/dev/null 2>&1
-            if [ "$ENABLE_DOMAIN_STATS" = "1" ]; then
-                dom_hash=$(short_hash "${IPSET_NAME}:${domain}")
-                dom_set="${compact_domain_prefix}${dom_hash}"
-                ipset add "$dom_set" "$ip" timeout "$IPSET_TIMEOUT" -exist >/dev/null 2>&1
-            fi
-        done
+        prime_domain_ips "$domain"
     done < "$DOMAIN_LIST"
 }
 

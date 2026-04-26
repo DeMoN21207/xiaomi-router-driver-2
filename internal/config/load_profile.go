@@ -70,7 +70,7 @@ func RoutingLoadProfileTuningFor(profile string) RoutingLoadProfileTuning {
 		return RoutingLoadProfileTuning{
 			DomainStatsMode:             "auto",
 			DomainStatsMaxDomains:       128,
-			PrimeMaxDomains:             0,
+			PrimeMaxDomains:             128,
 			IPSetFlushOnSync:            false,
 			IPSetTimeout:                1800,
 			DomainTrafficSampleInterval: 120 * time.Second,
