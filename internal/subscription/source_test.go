@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -114,6 +115,65 @@ func TestParseLineShadowsocks(t *testing.T) {
 	}
 	if entry.Outbound["password"] != "secret" {
 		t.Fatalf("unexpected password: %#v", entry.Outbound["password"])
+	}
+}
+
+func TestParseEntriesDropsCompatibilityPlaceholders(t *testing.T) {
+	payload := strings.Join([]string{
+		"vless://00000000-0000-0000-0000-000000000000@0.0.0.0:1?encryption=none&type=tcp&security=none#Client",
+		"vless://11111111-1111-1111-1111-111111111111@real.example.com:443?security=tls&type=tcp#Real",
+	}, "\n")
+
+	entries, err := ParseEntries(payload)
+	if err != nil {
+		t.Fatalf("ParseEntries() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("ParseEntries() returned %d entries, want 1: %+v", len(entries), entries)
+	}
+	if entries[0].Name != "Real" || entries[0].Address != "real.example.com:443" {
+		t.Fatalf("unexpected entry after placeholder filtering: %+v", entries[0])
+	}
+}
+
+func TestFetchEntriesRetriesAfterCompatibilityPlaceholderSubscription(t *testing.T) {
+	var hits atomic.Int32
+	var sawHapp atomic.Bool
+	var sawDeviceID atomic.Bool
+
+	placeholderPayload := strings.Join([]string{
+		"vless://00000000-0000-0000-0000-000000000000@0.0.0.0:1?encryption=none&type=tcp&security=none#Client",
+		"vless://00000000-0000-0000-0000-000000000000@0.0.0.0:1?encryption=none&type=tcp&security=none#Install%20HAPP",
+	}, "\n")
+	encodedPlaceholder := base64.StdEncoding.EncodeToString([]byte(placeholderPayload))
+	realPayload := testSubscriptionPayload(t, "Extra")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if strings.EqualFold(r.UserAgent(), "Happ") {
+			sawHapp.Store(true)
+			if strings.TrimSpace(r.Header.Get("X-HWID")) != "" {
+				sawDeviceID.Store(true)
+			}
+			_, _ = w.Write([]byte(realPayload))
+			return
+		}
+		_, _ = w.Write([]byte(encodedPlaceholder))
+	}))
+	defer server.Close()
+
+	entries, err := FetchEntries(server.URL)
+	if err != nil {
+		t.Fatalf("FetchEntries() error = %v", err)
+	}
+	if hits.Load() < 2 {
+		t.Fatalf("expected retry after placeholder response, got %d hit(s)", hits.Load())
+	}
+	if !sawHapp.Load() || !sawDeviceID.Load() {
+		t.Fatalf("expected retry with Happ profile and device headers, sawHapp=%v sawDeviceID=%v", sawHapp.Load(), sawDeviceID.Load())
+	}
+	if len(entries) != 1 || entries[0].Name != "Extra" {
+		t.Fatalf("unexpected entries after retry: %+v", entries)
 	}
 }
 

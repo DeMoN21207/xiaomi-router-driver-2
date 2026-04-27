@@ -40,6 +40,9 @@ func ParseEntries(raw string) ([]Entry, error) {
 		if err != nil {
 			continue
 		}
+		if isCompatibilityPlaceholderEntry(entry) {
+			continue
+		}
 
 		key := strings.TrimSpace(entry.Name)
 		if key == "" {

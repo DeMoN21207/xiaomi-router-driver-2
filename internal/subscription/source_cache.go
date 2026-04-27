@@ -352,12 +352,7 @@ func isCompatibilityPlaceholderEntry(entry Entry) bool {
 	if address != "0.0.0.0:1" && address != "[::]:1" {
 		return false
 	}
-	name := strings.ToLower(strings.TrimSpace(entry.Name))
-	return strings.Contains(name, "не поддерж") ||
-		strings.Contains(name, "unsupported") ||
-		strings.Contains(name, "happ") ||
-		strings.Contains(name, "v2raytun") ||
-		strings.Contains(name, "прилож")
+	return true
 }
 
 func looksLikeInlineSubscription(source string) bool {
