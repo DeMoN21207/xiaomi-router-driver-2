@@ -21,11 +21,12 @@ type Entry struct {
 }
 
 func FetchEntries(source string) ([]Entry, error) {
-	raw, err := fetchEntriesRaw(source)
+	normalizedSource, err := normalizeSubscriptionSource(source)
 	if err != nil {
 		return nil, err
 	}
-	return ParseEntries(raw)
+	entries, _, err := fetchEntriesLive(normalizedSource)
+	return entries, err
 }
 
 func ParseEntries(raw string) ([]Entry, error) {
@@ -52,10 +53,109 @@ func ParseEntries(raw string) ([]Entry, error) {
 	}
 
 	if len(entries) == 0 {
+		if parsedEntries, err := parseSingBoxEntries(payload); err == nil {
+			return parsedEntries, nil
+		}
 		return nil, errors.New("no supported locations found in subscription")
 	}
 
 	return entries, nil
+}
+
+func parseSingBoxEntries(payload string) ([]Entry, error) {
+	trimmed := strings.TrimSpace(payload)
+	if trimmed == "" || (!strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[")) {
+		return nil, errors.New("subscription is not sing-box JSON")
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(trimmed))
+	decoder.UseNumber()
+
+	var raw any
+	if err := decoder.Decode(&raw); err != nil {
+		return nil, fmt.Errorf("decode sing-box JSON: %w", err)
+	}
+
+	outbounds := extractSingBoxOutbounds(raw)
+	entries := make([]Entry, 0, len(outbounds))
+	seen := make(map[string]struct{}, len(outbounds))
+	for _, outbound := range outbounds {
+		entry, err := parseSingBoxOutbound(outbound)
+		if err != nil {
+			continue
+		}
+		key := strings.TrimSpace(entry.Name)
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		entries = append(entries, entry)
+	}
+
+	if len(entries) == 0 {
+		return nil, errors.New("no supported sing-box outbounds found")
+	}
+	return entries, nil
+}
+
+func extractSingBoxOutbounds(raw any) []map[string]any {
+	switch typed := raw.(type) {
+	case []any:
+		outbounds := make([]map[string]any, 0, len(typed))
+		for _, item := range typed {
+			if outbound, ok := item.(map[string]any); ok {
+				outbounds = append(outbounds, outbound)
+			}
+		}
+		return outbounds
+	case map[string]any:
+		if rawOutbounds, ok := typed["outbounds"].([]any); ok {
+			outbounds := make([]map[string]any, 0, len(rawOutbounds))
+			for _, item := range rawOutbounds {
+				if outbound, ok := item.(map[string]any); ok {
+					outbounds = append(outbounds, outbound)
+				}
+			}
+			return outbounds
+		}
+		return []map[string]any{typed}
+	default:
+		return nil
+	}
+}
+
+func parseSingBoxOutbound(raw map[string]any) (Entry, error) {
+	kind := strings.ToLower(strings.TrimSpace(stringify(raw["type"])))
+	switch kind {
+	case "", "block", "direct", "dns", "selector", "urltest":
+		return Entry{}, errors.New("sing-box outbound is not a proxy endpoint")
+	case "ss":
+		kind = "shadowsocks"
+	}
+
+	server := strings.TrimSpace(stringify(raw["server"]))
+	port := intValue(raw["server_port"])
+	if port <= 0 {
+		port = intValue(raw["serverPort"])
+	}
+	if server == "" || port <= 0 {
+		return Entry{}, errors.New("sing-box outbound is missing server or port")
+	}
+
+	outbound := cloneMap(raw)
+	outbound["type"] = kind
+	outbound["server_port"] = port
+	delete(outbound, "serverPort")
+
+	return Entry{
+		Name:     firstNonEmpty(stringify(raw["tag"]), stringify(raw["name"]), server),
+		Address:  formatAddress(server, port),
+		Type:     kind,
+		Outbound: outbound,
+	}, nil
 }
 
 func ParseLine(line string) (Entry, error) {
@@ -90,11 +190,16 @@ func decodeSubscriptionPayload(raw string) string {
 	}
 
 	candidate := strings.TrimSpace(string(decoded))
-	if !strings.Contains(candidate, "://") && !strings.Contains(candidate, "\n") {
+	if !strings.Contains(candidate, "://") && !strings.Contains(candidate, "\n") && !looksLikeStructuredSubscription(candidate) {
 		return trimmed
 	}
 
 	return candidate
+}
+
+func looksLikeStructuredSubscription(payload string) bool {
+	payload = strings.TrimSpace(payload)
+	return strings.HasPrefix(payload, "{") || strings.HasPrefix(payload, "[")
 }
 
 func parseVMess(payload string) (Entry, error) {

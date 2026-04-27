@@ -1503,14 +1503,17 @@ func buildProvider(id string, req providerRequest) (config.Provider, error) {
 		return config.Provider{}, errors.New("provider type must be openvpn or subscription")
 	}
 
-	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		return config.Provider{}, errors.New("provider name is required")
-	}
-
 	source := strings.TrimSpace(req.Source)
 	if source == "" {
 		return config.Provider{}, errors.New("provider source is required")
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = providerNameFromSource(source)
+	}
+	if name == "" {
+		return config.Provider{}, errors.New("provider name is required")
 	}
 
 	if id == "" {
@@ -1525,6 +1528,18 @@ func buildProvider(id string, req providerRequest) (config.Provider, error) {
 		SelectedLocation: strings.TrimSpace(req.SelectedLocation),
 		Enabled:          req.Enabled,
 	}, nil
+}
+
+func providerNameFromSource(source string) string {
+	parsed, err := url.Parse(strings.TrimSpace(source))
+	if err != nil {
+		return ""
+	}
+	name, err := url.QueryUnescape(strings.TrimSpace(parsed.Fragment))
+	if err != nil {
+		return strings.TrimSpace(parsed.Fragment)
+	}
+	return strings.TrimSpace(name)
 }
 
 func shiftRoutingSettings(settings config.RoutingSettings, offset int) config.RoutingSettings {

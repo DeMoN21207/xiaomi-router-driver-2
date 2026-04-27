@@ -6,6 +6,15 @@ import InlineNotice from "../components/InlineNotice.jsx";
 
 const defaultForm = { name: "", source: "", selectedLocation: "", enabled: true };
 
+function nameFromSource(source) {
+  try {
+    const parsed = new URL(source.trim());
+    return decodeURIComponent(parsed.hash.replace(/^#/, "")).trim();
+  } catch {
+    return "";
+  }
+}
+
 export default function SubscriptionsPage() {
   const { t } = useI18n();
   const [config, setConfig] = useState(null);
@@ -118,7 +127,10 @@ export default function SubscriptionsPage() {
               <input
                 className="w-full rounded-lg border-none bg-surface-container-highest px-4 py-3 font-mono text-sm text-on-surface focus:ring-1 focus:ring-primary"
                 value={form.source}
-                onChange={(e) => setForm({ ...form, source: e.target.value })}
+                onChange={(e) => {
+                  const source = e.target.value;
+                  setForm((prev) => ({ ...prev, source, name: prev.name.trim() ? prev.name : nameFromSource(source) }));
+                }}
                 placeholder={t("subscriptions.sourcePlaceholder")}
                 required
               />

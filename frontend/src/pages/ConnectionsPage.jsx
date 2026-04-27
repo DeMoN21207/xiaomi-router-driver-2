@@ -11,6 +11,15 @@ const DOMAIN_PREVIEW_LIMIT = 80;
 const DOMAIN_SEARCH_RESULT_LIMIT = 200;
 const ROUTING_ENTRIES_EXAMPLE = "# Example routing entries\n# Lines starting with # are ignored\n# Domains, IPv4 addresses and IPv4 CIDR ranges are supported\n\nyoutube.com\ngooglevideo.com\ndiscord.com\ngateway.discord.gg\n149.154.160.0/20\n91.108.56.0/22\n";
 
+function nameFromSource(source) {
+  try {
+    const parsed = new URL(source.trim());
+    return decodeURIComponent(parsed.hash.replace(/^#/, "")).trim();
+  } catch {
+    return "";
+  }
+}
+
 function createDomainHealthMap(payload) {
   return new Map((payload?.domains ?? []).map((entry) => [entry.domain, entry]));
 }
@@ -434,7 +443,11 @@ export default function ConnectionsPage() {
                 <input
                   className="w-full rounded-lg border-none bg-surface-container-highest px-4 py-3 font-mono text-sm text-on-surface focus:ring-1 focus:ring-primary"
                   value={form.source}
-                  onChange={(event) => { setForm({ ...form, source: event.target.value }); setProbeResult(null); }}
+                  onChange={(event) => {
+                    const source = event.target.value;
+                    setForm((prev) => ({ ...prev, source, name: prev.name.trim() ? prev.name : nameFromSource(source) }));
+                    setProbeResult(null);
+                  }}
                   placeholder={form.type === "openvpn" ? "profiles/de.ovpn" : "https://provider/sublink/..."}
                 />
                 {form.type === "openvpn" && (
