@@ -49,3 +49,24 @@ func TestParsePingLatency(t *testing.T) {
 		}
 	}
 }
+
+func TestMeasureLatenciesSkipsEndpointErrors(t *testing.T) {
+	locations := MeasureLatencies(t.Context(), []Location{
+		{
+			Name:          "Broken",
+			Address:       "extranetherlands:443",
+			Type:          "vless",
+			EndpointError: "endpoint host is not routable",
+		},
+	})
+
+	if len(locations) != 1 {
+		t.Fatalf("MeasureLatencies() returned %d locations, want 1", len(locations))
+	}
+	if locations[0].EndpointError == "" {
+		t.Fatalf("MeasureLatencies() cleared endpoint error: %+v", locations[0])
+	}
+	if locations[0].LatencyError != "" {
+		t.Fatalf("MeasureLatencies() set latency error for endpoint issue: %+v", locations[0])
+	}
+}

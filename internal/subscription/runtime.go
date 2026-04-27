@@ -642,6 +642,9 @@ func (m *Manager) buildDesired(state config.State, enabledRules []config.Rule) (
 		if !found {
 			return nil, fmt.Errorf("location %q not found in provider %q", group.Location, group.Provider.Name)
 		}
+		if issue := EntryEndpointIssue(entry); issue != "" {
+			return nil, fmt.Errorf("location %q in provider %q cannot be used: %s", group.Location, group.Provider.Name, issue)
+		}
 		group.Entry = entry
 		desired = append(desired, *group)
 	}

@@ -32,6 +32,9 @@ func MeasureLatencies(ctx context.Context, locations []Location) []Location {
 	hosts := make([]string, 0, len(locations))
 	seenHosts := make(map[string]struct{}, len(locations))
 	for _, location := range locations {
+		if strings.TrimSpace(location.EndpointError) != "" {
+			continue
+		}
 		host := extractHost(location.Address)
 		if host == "" {
 			continue
@@ -87,6 +90,8 @@ func MeasureLatencies(ctx context.Context, locations []Location) []Location {
 
 		host := extractHost(location.Address)
 		switch {
+		case strings.TrimSpace(location.EndpointError) != "":
+			location.LatencyError = ""
 		case host == "":
 			location.LatencyError = "host is empty"
 		default:

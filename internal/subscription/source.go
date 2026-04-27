@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 const maxSubscriptionBodySize = 2 * 1024 * 1024
@@ -179,6 +180,58 @@ func ParseLine(line string) (Entry, error) {
 	default:
 		return Entry{}, fmt.Errorf("unsupported subscription line: %q", line)
 	}
+}
+
+func EntryEndpointIssue(entry Entry) string {
+	address := strings.TrimSpace(entry.Address)
+	if address == "" {
+		return "endpoint address is empty"
+	}
+
+	host, port, err := splitHostPort(address)
+	if err != nil {
+		return fmt.Sprintf("endpoint address %q is invalid", address)
+	}
+	if port <= 0 {
+		return fmt.Sprintf("endpoint address %q has invalid port", address)
+	}
+
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return fmt.Sprintf("endpoint address %q has empty host", address)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsUnspecified() {
+			return fmt.Sprintf("endpoint host %q is not routable", host)
+		}
+		return ""
+	}
+
+	if isFullyQualifiedDomainHost(host) {
+		return ""
+	}
+
+	return fmt.Sprintf("endpoint host %q is not a fully qualified DNS name or IP address", host)
+}
+
+func isFullyQualifiedDomainHost(host string) bool {
+	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
+	if host == "" || len(host) > 253 || !strings.Contains(host, ".") {
+		return false
+	}
+
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return false
+		}
+		for _, r := range label {
+			if r == '-' || unicode.IsLetter(r) || unicode.IsDigit(r) {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 func decodeSubscriptionPayload(raw string) string {

@@ -118,6 +118,30 @@ func TestParseLineShadowsocks(t *testing.T) {
 	}
 }
 
+func TestEntryEndpointIssueRejectsSingleLabelHost(t *testing.T) {
+	entry := Entry{
+		Name:    "Netherlands",
+		Address: "extranetherlands:443",
+		Type:    "vless",
+	}
+
+	if issue := EntryEndpointIssue(entry); !strings.Contains(issue, "fully qualified") {
+		t.Fatalf("EntryEndpointIssue() = %q, want fully-qualified host issue", issue)
+	}
+}
+
+func TestEntryEndpointIssueAllowsFQDNAndIP(t *testing.T) {
+	for _, entry := range []Entry{
+		{Name: "FQDN", Address: "bucket-ru-1.extravpn.io:443", Type: "vless"},
+		{Name: "IPv4", Address: "203.0.113.10:443", Type: "vless"},
+		{Name: "IPv6", Address: "[2001:db8::10]:443", Type: "vless"},
+	} {
+		if issue := EntryEndpointIssue(entry); issue != "" {
+			t.Fatalf("EntryEndpointIssue(%q) = %q, want no issue", entry.Address, issue)
+		}
+	}
+}
+
 func TestParseEntriesDropsCompatibilityPlaceholders(t *testing.T) {
 	payload := strings.Join([]string{
 		"vless://00000000-0000-0000-0000-000000000000@0.0.0.0:1?encryption=none&type=tcp&security=none#Client",

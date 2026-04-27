@@ -12,11 +12,12 @@ import (
 
 // Location represents a single discovered endpoint from a provider source.
 type Location struct {
-	Name         string `json:"name"`
-	Address      string `json:"address,omitempty"`
-	Type         string `json:"type,omitempty"`
-	LatencyMs    int64  `json:"latencyMs,omitempty"`
-	LatencyError string `json:"latencyError,omitempty"`
+	Name          string `json:"name"`
+	Address       string `json:"address,omitempty"`
+	Type          string `json:"type,omitempty"`
+	LatencyMs     int64  `json:"latencyMs,omitempty"`
+	LatencyError  string `json:"latencyError,omitempty"`
+	EndpointError string `json:"endpointError,omitempty"`
 }
 
 // Result holds the probe outcome.
@@ -101,9 +102,10 @@ func probeSubscription(source string) Result {
 	locations := make([]Location, 0, len(entries))
 	for _, entry := range entries {
 		locations = append(locations, Location{
-			Name:    entry.Name,
-			Address: entry.Address,
-			Type:    entry.Type,
+			Name:          entry.Name,
+			Address:       entry.Address,
+			Type:          entry.Type,
+			EndpointError: subscription.EntryEndpointIssue(entry),
 		})
 	}
 

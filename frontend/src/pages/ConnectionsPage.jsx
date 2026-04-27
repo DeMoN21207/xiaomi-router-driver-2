@@ -713,6 +713,8 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
 
   // Locations already used in rules (for highlighting in chips)
   const usedLocations = new Set(providerRules.map((r) => r.selectedLocation).filter(Boolean));
+  const selectedNewRoute = probeLocations?.find((loc) => loc.name === newRouteLoc);
+  const newRouteEndpointError = selectedNewRoute?.endpointError || "";
 
   return (
     <div className="overflow-hidden rounded-xl border border-transparent bg-surface-container-low shadow-xl transition-all duration-300 hover:border-primary/20">
@@ -882,8 +884,9 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
               <div className="mt-3 flex items-center justify-between gap-3 max-sm:flex-col max-sm:items-stretch">
                 <div className="min-h-[20px] text-sm text-on-surface-variant">
                   {newRouteLoc ? (
-                    <span>
+                    <span className={newRouteEndpointError ? "text-error" : ""}>
                       {t("connections.selectedLocation")} <span className="font-medium text-on-surface">{newRouteLoc}</span>
+                      {newRouteEndpointError ? ` · ${newRouteEndpointError}` : ""}
                     </span>
                   ) : (
                     t("connections.addRoutePlaceholder")
@@ -901,7 +904,7 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
                   <button
                     type="button"
                     onClick={addRoute}
-                    disabled={saving || !newRouteLoc}
+                    disabled={saving || !newRouteLoc || Boolean(newRouteEndpointError)}
                     className="rounded-lg bg-primary/10 px-4 py-2 text-sm font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-40"
                   >
                     {t("connections.addRoute")}
@@ -1045,16 +1048,19 @@ function LocationsBrowser({ locations, selectedLocation = "", onSelect, usedLoca
                 const active = selectedLocation === loc.name;
                 const alreadyUsed = selectedSet.has(loc.name);
                 const interactive = typeof onSelect === "function";
+                const endpointError = loc.endpointError || "";
+                const canSelect = interactive && !disabled && !endpointError;
 
                 return (
                   <button
                     key={`row:${loc.type || "location"}:${loc.name}:${loc.address || ""}`}
                     type="button"
-                    onClick={interactive ? () => onSelect(loc.name) : undefined}
-                    disabled={!interactive || disabled}
+                    onClick={canSelect ? () => onSelect(loc.name) : undefined}
+                    disabled={!interactive || disabled || Boolean(endpointError)}
+                    title={endpointError || undefined}
                     className={`grid w-full grid-cols-[110px_minmax(180px,1fr)_minmax(220px,1.3fr)_110px] gap-px border-t border-outline-variant/10 text-left text-sm transition-colors ${
                       interactive ? "hover:bg-surface-container/70 disabled:cursor-default disabled:hover:bg-transparent" : "cursor-default"
-                    } ${active ? "bg-primary/8" : "bg-transparent"}`}
+                    } ${active ? "bg-primary/8" : "bg-transparent"} ${endpointError ? "opacity-60" : ""}`}
                   >
                     <div className="px-3 py-2.5 text-on-surface-variant">
                       <span className="rounded bg-surface-container-highest px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide text-on-surface">
@@ -1073,6 +1079,11 @@ function LocationsBrowser({ locations, selectedLocation = "", onSelect, usedLoca
                         {alreadyUsed ? (
                           <span className="rounded-full bg-secondary/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-secondary">
                             {t("connections.locationUsed")}
+                          </span>
+                        ) : null}
+                        {endpointError ? (
+                          <span className="rounded-full bg-error-container/40 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-error">
+                            {t("connections.locationUnavailable")}
                           </span>
                         ) : null}
                       </div>
@@ -1175,6 +1186,9 @@ function compareText(left, right) {
 }
 
 function LocationLatency({ location, t }) {
+  if (location?.endpointError) {
+    return <span className="text-error">{t("connections.locationUnavailableShort")}</span>;
+  }
   const ms = location?.latencyMs;
   if (!(ms > 0)) {
     return <span className="text-on-surface-variant">—</span>;
@@ -1251,6 +1265,8 @@ function RuleBlock({ rule, provider, allRules, allProviders, probeLocations, pro
   const [changingLocation, setChangingLocation] = useState(false);
   const [newLocation, setNewLocation] = useState("");
   const fileInputRef = useRef(null);
+  const selectedNewLocation = probeLocations?.find((loc) => loc.name === newLocation);
+  const newLocationEndpointError = selectedNewLocation?.endpointError || "";
 
   async function applyLocationChange() {
     if (!newLocation || newLocation === rule.selectedLocation) {
@@ -1470,12 +1486,15 @@ function RuleBlock({ rule, provider, allRules, allProviders, probeLocations, pro
                 <button
                   type="button"
                   onClick={applyLocationChange}
-                  disabled={saving || !newLocation || newLocation === rule.selectedLocation}
+                  disabled={saving || !newLocation || newLocation === rule.selectedLocation || Boolean(newLocationEndpointError)}
                   className="rounded-lg bg-primary/10 px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-40"
                 >
                   {saving ? t("connections.changingLocation") : t("connections.applyLocation")}
                 </button>
               </div>
+              {newLocationEndpointError ? (
+                <p className="mt-2 text-right text-xs text-error">{newLocationEndpointError}</p>
+              ) : null}
             </>
           ) : (
             <p className="py-2 text-sm text-on-surface-variant">{t("connections.probeEmpty")}</p>

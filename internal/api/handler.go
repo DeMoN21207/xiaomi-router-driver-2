@@ -1055,6 +1055,8 @@ func (h *Handler) handleApplyRules(w http.ResponseWriter, r *http.Request) {
 func writeApplyError(w http.ResponseWriter, err error) {
 	statusCode := http.StatusInternalServerError
 	switch {
+	case strings.Contains(err.Error(), "cannot be used"):
+		statusCode = http.StatusBadRequest
 	case strings.Contains(err.Error(), "not implemented yet"):
 		statusCode = http.StatusConflict
 	case strings.Contains(err.Error(), "is not configured"):
