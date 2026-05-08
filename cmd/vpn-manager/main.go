@@ -6,14 +6,13 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
+	"path/р"
 	"strings"
 	"time"
 
 	"xiomi-router-driver/internal/api"
 	"xiomi-router-driver/internal/appdir"
 	"xiomi-router-driver/internal/automation"
-	"xiomi-router-driver/internal/blacklist"
 	"xiomi-router-driver/internal/config"
 	"xiomi-router-driver/internal/dnsproxy"
 	"xiomi-router-driver/internal/doctor"
@@ -63,10 +62,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("prepare routing script: %v", err)
 	}
-	blacklistScriptPath, err := blacklist.EnsureGeneratedScript(paths.DataDir)
-	if err != nil {
-		log.Fatalf("prepare blacklist script: %v", err)
-	}
 
 	dnsProxyServer := ""
 	if dnsproxy.EnabledFromEnv() {
@@ -102,14 +97,9 @@ func main() {
 		db,
 		filepath.Join(paths.DataDir, "traffic-history.json"),
 	)
-	blacklistManager := blacklist.NewManager(db, filepath.Join(paths.DataDir, ".vpn-manager"))
-	blacklistRunner := blacklist.NewRunner(blacklistScriptPath)
 
 	if _, err := stateManager.Load(); err != nil {
 		log.Fatalf("bootstrap state store: %v", err)
-	}
-	if _, err := blacklistManager.List(); err != nil {
-		log.Fatalf("bootstrap blacklist store: %v", err)
 	}
 	if _, err := domainManager.List(); err != nil {
 		log.Fatalf("bootstrap domains store: %v", err)
@@ -125,20 +115,19 @@ func main() {
 	}
 
 	apiHandler := api.NewHandler(api.Dependencies{
-		State:           stateManager,
-		Domains:         domainManager,
-		Events:          eventStore,
-		Routing:         routingRunner,
-		Automation:      automationManager,
-		OpenVPN:         openvpnManager,
-		Subscriptions:   subscriptionManager,
-		Status:          statusService,
-		Blacklist:       blacklistManager,
-		BlacklistRunner: blacklistRunner,
-		DataDir:         paths.DataDir,
+		State:         stateManager,
+		Domains:       domainManager,
+		Events:        eventStore,
+		Routing:       routingRunner,
+		Automation:    automationManager,
+		OpenVPN:       openvpnManager,
+		Subscriptions: subscriptionManager,
+		Status:        statusService,
+		DataDir:       paths.DataDir,
 	})
 	supervisor := automation.NewSupervisor(stateManager, statusService, apiHandler.ApplyCurrentRules, apiHandler.ApplyRulesFromState, recordEvent, paths.DataDir)
 	apiHandler.SetFailoverStatusProvider(supervisor.FailoverStatus)
+	apiHandler.SetPriorityRuntime(supervisor.PriorityStatus, supervisor.SetPriorityOverride, supervisor.ClearPriorityOverride, supervisor.ApplyPriorityPolicies)
 	go supervisor.Run(context.Background())
 	go statusService.RunTrafficSampler(context.Background())
 	go statusService.RunDomainTrafficSampler(context.Background())

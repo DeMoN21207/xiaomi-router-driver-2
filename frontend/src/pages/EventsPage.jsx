@@ -187,21 +187,25 @@ export default function EventsPage() {
             <p className="text-on-surface-variant">{filter ? t("events.emptyFiltered") : t("events.empty")}</p>
           </div>
         ) : (
-          filtered.map((event) => (
-            <div key={event.id} className="rounded-xl border border-outline-variant/10 bg-surface-container-low p-5 transition-colors hover:bg-surface-container">
-              <div className="mb-2 flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
-                <div className="flex items-center gap-3">
-                  <Icon name={levelIcon(event.level)} className={`h-5 w-5 ${levelIconColor(event.level)}`} />
-                  <span className={`rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest ${levelBadge(event.level)}`}>
-                    {levelLabel(event.level, t)}
-                  </span>
-                  <span className="font-headline font-bold text-on-surface">{t(`kind.${event.kind}`) || event.kind}</span>
+          filtered.map((event) => {
+            const help = eventHelpText(event.kind, t);
+            return (
+              <div key={event.id} className="rounded-xl border border-outline-variant/10 bg-surface-container-low p-5 transition-colors hover:bg-surface-container">
+                <div className="mb-2 flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <Icon name={levelIcon(event.level)} className={`h-5 w-5 ${levelIconColor(event.level)}`} />
+                    <span className={`rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest ${levelBadge(event.level)}`}>
+                      {levelLabel(event.level, t)}
+                    </span>
+                    <span className="font-headline font-bold text-on-surface">{eventKindLabel(event.kind, t)}</span>
+                    {help ? <EventHelp text={help} label={t("events.help")} /> : null}
+                  </div>
+                  <span className="font-mono text-xs text-outline">{formatDateFull(event.occurredAt)}</span>
                 </div>
-                <span className="font-mono text-xs text-outline">{formatDateFull(event.occurredAt)}</span>
+                <p className="ml-9 text-sm text-on-surface-variant">{event.message}</p>
               </div>
-              <p className="ml-9 text-sm text-on-surface-variant">{event.message}</p>
-            </div>
-          ))
+            );
+          })
         )}
 
         {hasMore && !filter && (
@@ -226,6 +230,36 @@ export default function EventsPage() {
         )}
       </div>
     </div>
+  );
+}
+
+function eventKindLabel(kind, t) {
+  const key = `kind.${kind}`;
+  const label = t(key);
+  return label === key ? kind : label;
+}
+
+function eventHelpText(kind, t) {
+  const key = `help.${kind}`;
+  const help = t(key);
+  return help === key ? "" : help;
+}
+
+function EventHelp({ text, label }) {
+  return (
+    <span className="group relative inline-flex">
+      <button
+        type="button"
+        title={text}
+        aria-label={label}
+        className="inline-flex h-6 w-6 items-center justify-center rounded-full border border-outline-variant/20 bg-surface-container-highest text-outline transition-colors hover:border-primary/30 hover:text-primary"
+      >
+        <Icon name="help_outline" className="h-4 w-4" />
+      </button>
+      <span className="pointer-events-none absolute left-1/2 top-full z-40 mt-2 hidden w-72 -translate-x-1/2 rounded-lg border border-outline-variant/20 bg-surface-container-highest px-3 py-2 text-xs font-normal leading-relaxed text-on-surface shadow-xl group-hover:block">
+        {text}
+      </span>
+    </span>
   );
 }
 

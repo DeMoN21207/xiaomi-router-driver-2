@@ -22,8 +22,11 @@ The primary build target is the router bundle in `build/router`.
 The repository keeps the ready router bundle in `build/router`.
 
 Local deployment credentials are intentionally not versioned.
-Use `deploy_router.local.example.cmd` as a template for a local ignored `deploy_router.local.cmd`.
-Copy the contents of `build/router` to the router and start the service there.
+Use `deploy_router.local.example.sh` as a template for a local ignored `deploy_router.local.sh` on macOS/Linux.
+The deploy script can also read the existing Windows-style `deploy_router.local.cmd` if you already have one.
+
+- macOS/Linux: `./deploy_router.sh`
+- Manual deploy: copy the contents of `build/router` to the router and start the service there.
 
 ## Runtime binaries
 

@@ -5,7 +5,6 @@ import ConnectionsPage from "./pages/ConnectionsPage.jsx";
 import EventsPage from "./pages/EventsPage.jsx";
 import SettingsPage from "./pages/SettingsPage.jsx";
 import TrafficStatsPage from "./pages/TrafficStatsPage.jsx";
-import BlacklistPage from "./pages/BlacklistPage.jsx";
 
 export default function App() {
   return (
@@ -14,7 +13,6 @@ export default function App() {
         <Route index element={<DashboardPage />} />
         <Route path="connections" element={<ConnectionsPage />} />
         <Route path="traffic" element={<TrafficStatsPage />} />
-        <Route path="blacklist" element={<BlacklistPage />} />
         <Route path="events" element={<EventsPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />

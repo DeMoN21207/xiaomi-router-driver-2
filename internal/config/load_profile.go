@@ -17,6 +17,7 @@ type RoutingLoadProfileTuning struct {
 	PrimeMaxDomains             int
 	IPSetFlushOnSync            bool
 	IPSetTimeout                int
+	ConntrackFlushOnApply       bool
 	DomainTrafficSampleInterval time.Duration
 	SiteTrafficSampleInterval   time.Duration
 	DomainHealthInitialSample   bool
@@ -49,6 +50,7 @@ func RoutingLoadProfileTuningFor(profile string) RoutingLoadProfileTuning {
 			PrimeMaxDomains:             0,
 			IPSetFlushOnSync:            false,
 			IPSetTimeout:                1800,
+			ConntrackFlushOnApply:       false,
 			DomainTrafficSampleInterval: 0,
 			SiteTrafficSampleInterval:   0,
 			DomainHealthInitialSample:   false,
@@ -58,9 +60,10 @@ func RoutingLoadProfileTuningFor(profile string) RoutingLoadProfileTuning {
 		return RoutingLoadProfileTuning{
 			DomainStatsMode:             "on",
 			DomainStatsMaxDomains:       128,
-			PrimeMaxDomains:             64,
+			PrimeMaxDomains:             512,
 			IPSetFlushOnSync:            false,
-			IPSetTimeout:                1800,
+			IPSetTimeout:                86400,
+			ConntrackFlushOnApply:       true,
 			DomainTrafficSampleInterval: 30 * time.Second,
 			SiteTrafficSampleInterval:   30 * time.Second,
 			DomainHealthInitialSample:   true,
@@ -70,9 +73,10 @@ func RoutingLoadProfileTuningFor(profile string) RoutingLoadProfileTuning {
 		return RoutingLoadProfileTuning{
 			DomainStatsMode:             "auto",
 			DomainStatsMaxDomains:       128,
-			PrimeMaxDomains:             128,
+			PrimeMaxDomains:             512,
 			IPSetFlushOnSync:            false,
-			IPSetTimeout:                1800,
+			IPSetTimeout:                86400,
+			ConntrackFlushOnApply:       true,
 			DomainTrafficSampleInterval: 120 * time.Second,
 			SiteTrafficSampleInterval:   0,
 			DomainHealthInitialSample:   false,

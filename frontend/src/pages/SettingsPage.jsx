@@ -7,6 +7,8 @@ import InlineNotice from "../components/InlineNotice.jsx";
 import { formatBytes, formatDate, formatLatencyMs } from "../utils.js";
 
 const STATUS_REFRESH_MS = 10_000;
+const TOP_ROUTING_DOMAINS_LIMIT = 10;
+const TOP_ROUTING_DOMAINS_QUERY = `/api/traffic/domains?sort=bytes&limit=${TOP_ROUTING_DOMAINS_LIMIT}&live=1`;
 
 const DEFAULT_AUTOMATION = {
   installService: false,
@@ -51,7 +53,7 @@ export default function SettingsPage() {
         const [nextStatus, nextConfig, nextDomainTraffic] = await Promise.all([
           fetchJSON("/api/status"),
           fetchJSON("/api/config"),
-          fetchJSON("/api/traffic/domains?sort=bytes&limit=10"),
+          fetchJSON(TOP_ROUTING_DOMAINS_QUERY),
         ]);
         if (!active) return;
 
@@ -71,7 +73,7 @@ export default function SettingsPage() {
       try {
         const [nextStatus, nextDomainTraffic] = await Promise.all([
           fetchJSON("/api/status"),
-          fetchJSON("/api/traffic/domains?sort=bytes&limit=10"),
+          fetchJSON(TOP_ROUTING_DOMAINS_QUERY),
         ]);
         if (!active) return;
         setStatus(nextStatus);
@@ -97,7 +99,7 @@ export default function SettingsPage() {
       const [nextStatus, nextConfig, nextDomainTraffic] = await Promise.all([
         fetchJSON("/api/status"),
         fetchJSON("/api/config"),
-        fetchJSON("/api/traffic/domains?sort=bytes&limit=10"),
+        fetchJSON(TOP_ROUTING_DOMAINS_QUERY),
       ]);
 
       setStatus(nextStatus);
@@ -116,7 +118,12 @@ export default function SettingsPage() {
   const providers = config?.providers ?? [];
   const rules = config?.rules ?? [];
   const subscriptionRuntime = status?.subscriptionRuntime ?? [];
-  const topTrafficDomains = domainTraffic?.domains ?? [];
+  const topRoutingDomains = domainTraffic?.domains ?? [];
+  const effectiveDomainCount = status?.domainsCount ?? 0;
+  const activeRulesCount = status?.enabledRules ?? rules.filter((rule) => {
+    const provider = providers.find((item) => item.id === rule.providerId);
+    return rule.enabled && provider?.enabled;
+  }).length;
 
   const updateRoutingField = (field, value) => {
     setRouting((current) => (current ? { ...current, [field]: value } : current));
@@ -184,7 +191,7 @@ export default function SettingsPage() {
           providerFailover: Boolean(automation.providerFailover),
           failoverFailureSeconds: Number(automation.failoverFailureSeconds || 120),
           failoverRestoreSeconds: Number(automation.failoverRestoreSeconds || 60),
-          failoverAllDownMode: automation.failoverAllDownMode || "keep",
+          failoverAllDownMode: "keep",
           trafficCleanupDays: Number(automation.trafficCleanupDays || 0),
         }),
       });
@@ -269,6 +276,13 @@ export default function SettingsPage() {
               ) : (
                 rules.map((rule) => {
                   const provider = providers.find((item) => item.id === rule.providerId);
+                  const providerEnabled = Boolean(provider?.enabled);
+                  const ruleEffective = Boolean(rule.enabled && providerEnabled);
+                  const ruleStatus = ruleEffective
+                    ? t("settings.ruleActive")
+                    : rule.enabled && !providerEnabled
+                      ? t("settings.ruleProviderOff")
+                      : t("settings.ruleOff");
                   return (
                     <div key={rule.id} className="flex items-center justify-between rounded-lg bg-surface-container p-3">
                       <div>
@@ -279,10 +293,14 @@ export default function SettingsPage() {
                       </div>
                       <span
                         className={`rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest ${
-                          rule.enabled ? "bg-secondary/10 text-secondary" : "bg-outline-variant/20 text-outline"
+                          ruleEffective
+                            ? "bg-secondary/10 text-secondary"
+                            : rule.enabled
+                              ? "bg-tertiary/10 text-tertiary"
+                              : "bg-outline-variant/20 text-outline"
                         }`}
                       >
-                        {rule.enabled ? t("settings.ruleActive") : t("settings.ruleOff")}
+                        {ruleStatus}
                       </span>
                     </div>
                   );
@@ -327,25 +345,32 @@ export default function SettingsPage() {
           </Section>
 
           <Section icon="dns" iconColor="text-primary" title={t("settings.domains")}>
-            {topTrafficDomains.length === 0 ? (
+            {topRoutingDomains.length === 0 ? (
               <p className="text-sm text-on-surface-variant">{t("settings.domainsEmpty")}</p>
             ) : (
               <div className="overflow-hidden rounded-lg border border-outline-variant/10">
+                <div className="border-b border-outline-variant/10 bg-surface-container-high px-4 py-2 text-xs text-on-surface-variant">
+                  {t("settings.effectiveDomainsTop", {
+                    limit: String(TOP_ROUTING_DOMAINS_LIMIT),
+                    count: String(effectiveDomainCount),
+                    total: formatBytes(domainTraffic?.totalBytes || 0),
+                  })}
+                </div>
                 <table className="w-full text-left">
                   <thead>
                     <tr className="border-b border-outline-variant/10 bg-surface-container-high">
                       <th className="px-4 py-2.5 text-[10px] font-bold uppercase tracking-widest text-outline">#</th>
                       <th className="px-4 py-2.5 text-[10px] font-bold uppercase tracking-widest text-outline">{t("settings.domainColumn")}</th>
-                      <th className="px-4 py-2.5 text-right text-[10px] font-bold uppercase tracking-widest text-outline">{t("trafficStats.traffic")}</th>
+                      <th className="px-4 py-2.5 text-right text-[10px] font-bold uppercase tracking-widest text-outline">{t("settings.domainTrafficColumn")}</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {topTrafficDomains.map((item, idx) => (
+                    {topRoutingDomains.map((item, idx) => (
                       <tr key={item.domain} className="border-b border-outline-variant/5 bg-surface-container transition-colors last:border-b-0 hover:bg-surface-container-high">
                         <td className="px-4 py-2 text-xs text-outline-variant">
                           <RankBadge rank={idx + 1} />
                         </td>
-                        <td className="px-4 py-2 font-mono text-sm text-on-surface">{item.domain}</td>
+                        <td className="min-w-0 px-4 py-2 font-mono text-sm text-on-surface break-all">{item.domain}</td>
                         <td className="px-4 py-2 text-right font-mono text-sm text-on-surface">{formatBytes(item.bytes || 0)}</td>
                       </tr>
                     ))}
@@ -360,7 +385,8 @@ export default function SettingsPage() {
           <Section icon="analytics" iconColor="text-primary" title={t("settings.stats")}>
             <div className="space-y-3">
               <StatRow label={t("settings.providersCount")} value={providers.length} />
-              <StatRow label={t("settings.activeRules")} value={rules.filter((rule) => rule.enabled).length} />
+              <StatRow label={t("settings.activeRules")} value={activeRulesCount} />
+              <StatRow label={t("settings.activeSubscriptionRoutes")} value={subscriptionRuntime.length} />
               <StatRow label={t("settings.totalDomains")} value={status?.domainsCount ?? 0} />
               <StatRow label={t("settings.lastApply")} value={formatDate(status?.lastAppliedAt || config?.lastAppliedAt) || t("common.notYet")} />
               <StatRow label={t("settings.lastUpdate")} value={formatDate(config?.updatedAt) || "-"} />
@@ -511,16 +537,13 @@ export default function SettingsPage() {
                 />
               </div>
 
-              <SelectInput
-                label={t("settings.failoverAllDownMode")}
-                hint={t("hint.failoverAllDownMode")}
-                value={automation.failoverAllDownMode || "keep"}
-                onChange={(value) => updateAutomationField("failoverAllDownMode", value)}
-                options={[
-                  { value: "keep", label: t("settings.failoverAllDownKeep") },
-                  { value: "direct", label: t("settings.failoverAllDownDirect") },
-                ]}
-              />
+              <div className="rounded-lg border border-outline-variant/10 bg-surface-container p-3">
+                <span className="block text-sm text-on-surface">{t("settings.failoverAllDownMode")}</span>
+                <span className="mt-1 block text-xs text-on-surface-variant">{t("hint.failoverAllDownMode")}</span>
+                <span className="mt-3 inline-flex rounded-full bg-primary/10 px-3 py-1 text-xs font-bold uppercase tracking-wide text-primary">
+                  {t("settings.failoverAllDownKeep")}
+                </span>
+              </div>
 
               <div className="flex items-center justify-between gap-4 rounded-lg bg-surface-container p-3">
                 <div>

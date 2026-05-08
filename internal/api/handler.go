@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"xiomi-router-driver/internal/automation"
-	"xiomi-router-driver/internal/blacklist"
 	"xiomi-router-driver/internal/config"
 	"xiomi-router-driver/internal/domains"
 	"xiomi-router-driver/internal/events"
@@ -35,35 +34,39 @@ import (
 )
 
 type Dependencies struct {
-	State           *config.Manager
-	Domains         *domains.Manager
-	Events          *events.Store
-	Routing         *routing.Runner
-	Automation      *automation.Manager
-	OpenVPN         *openvpn.Manager
-	Subscriptions   *subscription.Manager
-	Status          *status.Service
-	Blacklist       *blacklist.Manager
-	BlacklistRunner *blacklist.Runner
-	FailoverStatus  func() automation.FailoverStatus
-	DataDir         string
+	State                 *config.Manager
+	Domains               *domains.Manager
+	Events                *events.Store
+	Routing               *routing.Runner
+	Automation            *automation.Manager
+	OpenVPN               *openvpn.Manager
+	Subscriptions         *subscription.Manager
+	Status                *status.Service
+	FailoverStatus        func() automation.FailoverStatus
+	PriorityStatus        func() automation.PriorityStatus
+	SetPriorityOverride   func(policyID string, location string) error
+	ClearPriorityOverride func(policyID string)
+	ApplyPriorityNow      func(ctx context.Context) error
+	DataDir               string
 }
 
 type Handler struct {
-	state           *config.Manager
-	domains         *domains.Manager
-	events          *events.Store
-	routing         *routing.Runner
-	automation      *automation.Manager
-	openvpn         *openvpn.Manager
-	subscriptions   *subscription.Manager
-	status          *status.Service
-	blacklist       *blacklist.Manager
-	blacklistRunner *blacklist.Runner
-	failoverStatus  func() automation.FailoverStatus
-	dataDir         string
-	router          http.Handler
-	applyMu         sync.Mutex
+	state                 *config.Manager
+	domains               *domains.Manager
+	events                *events.Store
+	routing               *routing.Runner
+	automation            *automation.Manager
+	openvpn               *openvpn.Manager
+	subscriptions         *subscription.Manager
+	status                *status.Service
+	failoverStatus        func() automation.FailoverStatus
+	priorityStatus        func() automation.PriorityStatus
+	setPriorityOverride   func(policyID string, location string) error
+	clearPriorityOverride func(policyID string)
+	applyPriorityNow      func(ctx context.Context) error
+	dataDir               string
+	router                http.Handler
+	applyMu               sync.Mutex
 }
 
 type providerRequest struct {
@@ -82,6 +85,19 @@ type ruleRequest struct {
 	Enabled          bool   `json:"enabled"`
 }
 
+type priorityPolicyRequest struct {
+	Name       string                          `json:"name"`
+	ProviderID string                          `json:"providerId"`
+	Enabled    bool                            `json:"enabled"`
+	Entries    []string                        `json:"entries"`
+	Targets    []config.PriorityTarget         `json:"targets"`
+	Schedule   []config.PriorityScheduleWindow `json:"schedule"`
+}
+
+type priorityOverrideRequest struct {
+	Location string `json:"location"`
+}
+
 type applyResult struct {
 	Status       string   `json:"status"`
 	RulesApplied int      `json:"rulesApplied"`
@@ -92,18 +108,20 @@ const applyRequestTimeout = 2 * time.Minute
 
 func NewHandler(deps Dependencies) *Handler {
 	handler := &Handler{
-		state:           deps.State,
-		domains:         deps.Domains,
-		events:          deps.Events,
-		routing:         deps.Routing,
-		automation:      deps.Automation,
-		openvpn:         deps.OpenVPN,
-		subscriptions:   deps.Subscriptions,
-		status:          deps.Status,
-		blacklist:       deps.Blacklist,
-		blacklistRunner: deps.BlacklistRunner,
-		failoverStatus:  deps.FailoverStatus,
-		dataDir:         deps.DataDir,
+		state:                 deps.State,
+		domains:               deps.Domains,
+		events:                deps.Events,
+		routing:               deps.Routing,
+		automation:            deps.Automation,
+		openvpn:               deps.OpenVPN,
+		subscriptions:         deps.Subscriptions,
+		status:                deps.Status,
+		failoverStatus:        deps.FailoverStatus,
+		priorityStatus:        deps.PriorityStatus,
+		setPriorityOverride:   deps.SetPriorityOverride,
+		clearPriorityOverride: deps.ClearPriorityOverride,
+		applyPriorityNow:      deps.ApplyPriorityNow,
+		dataDir:               deps.DataDir,
 	}
 
 	mux := http.NewServeMux()
@@ -118,6 +136,9 @@ func NewHandler(deps Dependencies) *Handler {
 	mux.HandleFunc("/api/config", handler.handleConfig)
 	mux.HandleFunc("/api/config/routing", handler.handleRoutingConfig)
 	mux.HandleFunc("/api/config/automation", handler.handleAutomationConfig)
+	mux.HandleFunc("/api/priority-policies/status", handler.handlePriorityPolicyStatus)
+	mux.HandleFunc("/api/priority-policies", handler.handlePriorityPolicies)
+	mux.HandleFunc("/api/priority-policies/", handler.handlePriorityPolicy)
 	mux.HandleFunc("/api/events", handler.handleEvents)
 	mux.HandleFunc("/api/providers/probe", handler.handleProbeProvider)
 	mux.HandleFunc("/api/providers/latency", handler.handleProviderLatency)
@@ -130,8 +151,6 @@ func NewHandler(deps Dependencies) *Handler {
 	mux.HandleFunc("/api/domains/health", handler.handleDomainHealth)
 	mux.HandleFunc("/api/domains/health/check", handler.handleCheckDomainHealth)
 	mux.HandleFunc("/api/domains", handler.handleDomainsPreview)
-	mux.HandleFunc("/api/blacklist", handler.handleBlacklist)
-	mux.HandleFunc("/api/blacklist/apply", handler.handleApplyBlacklist)
 	mux.HandleFunc("/api/system/resources", handler.handleSystemResources)
 	mux.HandleFunc("/api/system/reboot", handler.handleReboot)
 	handler.router = mux
@@ -140,6 +159,13 @@ func NewHandler(deps Dependencies) *Handler {
 
 func (h *Handler) SetFailoverStatusProvider(provider func() automation.FailoverStatus) {
 	h.failoverStatus = provider
+}
+
+func (h *Handler) SetPriorityRuntime(statusProvider func() automation.PriorityStatus, setOverride func(policyID string, location string) error, clearOverride func(policyID string), applyNow func(ctx context.Context) error) {
+	h.priorityStatus = statusProvider
+	h.setPriorityOverride = setOverride
+	h.clearPriorityOverride = clearOverride
+	h.applyPriorityNow = applyNow
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -290,7 +316,15 @@ func (h *Handler) handleDomainTraffic(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		result, err := h.status.DomainTraffic(sortBy, limit)
+		var (
+			result status.DomainTrafficResponse
+			err    error
+		)
+		if truthyQueryValue(q.Get("live")) {
+			result, err = h.status.LiveDomainTraffic(sortBy, limit)
+		} else {
+			result, err = h.status.DomainTraffic(sortBy, limit)
+		}
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -654,6 +688,224 @@ func (h *Handler) handleAutomationConfig(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+func (h *Handler) handlePriorityPolicyStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	if h.priorityStatus == nil {
+		writeJSON(w, http.StatusOK, automation.PriorityStatus{})
+		return
+	}
+	writeJSON(w, http.StatusOK, h.priorityStatus())
+}
+
+func (h *Handler) handlePriorityPolicies(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		state, err := h.state.Load()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		providerID := strings.TrimSpace(r.URL.Query().Get("providerId"))
+		policies := state.PriorityPolicies
+		if providerID != "" {
+			filtered := make([]config.PriorityPolicy, 0, len(policies))
+			for _, policy := range policies {
+				if policy.ProviderID == providerID {
+					filtered = append(filtered, policy)
+				}
+			}
+			policies = filtered
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"policies": policies})
+	case http.MethodPost:
+		var req priorityPolicyRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		state, err := h.state.Load()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		policy, err := h.buildPriorityPolicy("", req, state)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		nextState := state
+		nextState.PriorityPolicies = append(append([]config.PriorityPolicy(nil), state.PriorityPolicies...), policy)
+		if err := validatePriorityPolicyState(nextState); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := validateActiveRuleEntries(nextState); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		saved, err := h.state.Save(nextState)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"policy": policy, "count": len(saved.PriorityPolicies)})
+		h.recordEvent("info", "priority_policy.created", fmt.Sprintf("Priority policy %q created", policy.Name))
+	default:
+		writeMethodNotAllowed(w, http.MethodGet, http.MethodPost)
+	}
+}
+
+func (h *Handler) handlePriorityPolicy(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/priority-policies/")
+	path = strings.Trim(path, "/")
+	if path == "" {
+		writeError(w, http.StatusBadRequest, errors.New("priority policy id is required"))
+		return
+	}
+	parts := strings.Split(path, "/")
+	id, err := url.PathUnescape(parts[0])
+	if err != nil || strings.TrimSpace(id) == "" {
+		writeError(w, http.StatusBadRequest, errors.New("priority policy id is invalid"))
+		return
+	}
+	if len(parts) > 1 {
+		if len(parts) == 2 && parts[1] == "override" {
+			h.handlePriorityPolicyOverride(w, r, id)
+			return
+		}
+		writeError(w, http.StatusNotFound, fmt.Errorf("priority policy path %q not found", r.URL.Path))
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPut:
+		var req priorityPolicyRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		state, err := h.state.Load()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		index := findPriorityPolicyIndex(state.PriorityPolicies, id)
+		if index < 0 {
+			writeError(w, http.StatusNotFound, fmt.Errorf("priority policy %s not found", id))
+			return
+		}
+		policy, err := h.buildPriorityPolicy(id, req, state)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		nextState := state
+		nextState.PriorityPolicies = append([]config.PriorityPolicy(nil), state.PriorityPolicies...)
+		nextState.PriorityPolicies[index] = policy
+		if err := validatePriorityPolicyState(nextState); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := validateActiveRuleEntries(nextState); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		saved, err := h.state.Save(nextState)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"policy": saved.PriorityPolicies[index]})
+		h.recordEvent("info", "priority_policy.updated", fmt.Sprintf("Priority policy %q updated", policy.Name))
+	case http.MethodDelete:
+		state, err := h.state.Load()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		index := findPriorityPolicyIndex(state.PriorityPolicies, id)
+		if index < 0 {
+			writeError(w, http.StatusNotFound, fmt.Errorf("priority policy %s not found", id))
+			return
+		}
+		nextState := state
+		nextState.PriorityPolicies = append([]config.PriorityPolicy(nil), state.PriorityPolicies[:index]...)
+		nextState.PriorityPolicies = append(nextState.PriorityPolicies, state.PriorityPolicies[index+1:]...)
+		if _, err := h.state.Save(nextState); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if h.clearPriorityOverride != nil {
+			h.clearPriorityOverride(id)
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+		h.recordEvent("warn", "priority_policy.deleted", fmt.Sprintf("Priority policy %s deleted", id))
+	default:
+		writeMethodNotAllowed(w, http.MethodPut, http.MethodDelete)
+	}
+}
+
+func (h *Handler) handlePriorityPolicyOverride(w http.ResponseWriter, r *http.Request, id string) {
+	switch r.Method {
+	case http.MethodPost:
+		var req priorityOverrideRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		state, err := h.state.Load()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		policy, ok := findPriorityPolicy(state.PriorityPolicies, id)
+		if !ok {
+			writeError(w, http.StatusNotFound, fmt.Errorf("priority policy %s not found", id))
+			return
+		}
+		location := strings.TrimSpace(req.Location)
+		if !priorityPolicyHasTarget(policy, location) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("location %q is not in priority policy targets", location))
+			return
+		}
+		if h.setPriorityOverride == nil {
+			writeError(w, http.StatusConflict, errors.New("priority runtime is not configured"))
+			return
+		}
+		if err := h.setPriorityOverride(id, location); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if h.applyPriorityNow != nil {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), applyRequestTimeout)
+			defer cancel()
+			if err := h.applyPriorityNow(ctx); err != nil {
+				writeApplyError(w, err)
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "override_set"})
+	case http.MethodDelete:
+		if h.clearPriorityOverride != nil {
+			h.clearPriorityOverride(id)
+		}
+		if h.applyPriorityNow != nil {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), applyRequestTimeout)
+			defer cancel()
+			if err := h.applyPriorityNow(ctx); err != nil {
+				writeApplyError(w, err)
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "override_cleared"})
+	default:
+		writeMethodNotAllowed(w, http.MethodPost, http.MethodDelete)
+	}
+}
+
 func (h *Handler) handleProviders(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -822,7 +1074,10 @@ func (h *Handler) handleProvider(w http.ResponseWriter, r *http.Request) {
 		}
 		previous := state.Providers[index]
 		if !previous.Enabled && provider.Enabled {
-			if err := validateProviderActivation(provider, state.Providers, state.Rules); err != nil {
+			nextState := state
+			nextState.Providers = append([]config.Provider(nil), state.Providers...)
+			nextState.Providers[index] = provider
+			if err := validateActiveRuleEntries(nextState); err != nil {
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}
@@ -864,9 +1119,17 @@ func (h *Handler) handleProvider(w http.ResponseWriter, r *http.Request) {
 			}
 			nextRules = append(nextRules, rule)
 		}
+		nextPolicies := make([]config.PriorityPolicy, 0, len(state.PriorityPolicies))
+		for _, policy := range state.PriorityPolicies {
+			if policy.ProviderID == id {
+				continue
+			}
+			nextPolicies = append(nextPolicies, policy)
+		}
 
 		state.Providers = nextProviders
 		state.Rules = nextRules
+		state.PriorityPolicies = nextPolicies
 		if _, err := h.state.Save(state); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -906,12 +1169,11 @@ func (h *Handler) handleRules(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		if err := validateRuleEntries(rule, state.Providers, state.Rules); err != nil {
+		state.Rules = append(state.Rules, rule)
+		if err := validateActiveRuleEntries(state); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-
-		state.Rules = append(state.Rules, rule)
 		saved, err := h.state.Save(state)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -960,7 +1222,10 @@ func (h *Handler) handleRule(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, fmt.Errorf("rule %s not found", id))
 			return
 		}
-		if err := validateRuleEntries(rule, state.Providers, state.Rules); err != nil {
+		nextState := state
+		nextState.Rules = append([]config.Rule(nil), state.Rules...)
+		nextState.Rules[index] = rule
+		if err := validateActiveRuleEntries(nextState); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -1125,11 +1390,13 @@ func (h *Handler) ApplyRulesFromState(ctx context.Context, state config.State) e
 func (h *Handler) applyStateRules(ctx context.Context, state config.State, persistState bool) (applyResult, error) {
 	h.applyMu.Lock()
 	defer h.applyMu.Unlock()
+	savedState := state
+	state = automation.ApplyPriorityDefaults(state, time.Now())
 
 	fail := func(err error) (applyResult, error) {
 		if persistState {
-			state.LastError = err.Error()
-			_, _ = h.state.Save(state)
+			savedState.LastError = err.Error()
+			_, _ = h.state.Save(savedState)
 		}
 		h.recordEvent("error", "rules.apply_failed", err.Error())
 		return applyResult{}, err
@@ -1268,9 +1535,9 @@ func (h *Handler) applyStateRules(ctx context.Context, state config.State, persi
 	}
 
 	if persistState {
-		state.LastAppliedAt = time.Now().UTC().Format(time.RFC3339)
-		state.LastError = ""
-		_, _ = h.state.Save(state)
+		savedState.LastAppliedAt = time.Now().UTC().Format(time.RFC3339)
+		savedState.LastError = ""
+		_, _ = h.state.Save(savedState)
 	}
 
 	eventMessage := fmt.Sprintf("Applied %d rules for %d routing entries", len(enabledRules), len(domainsToApply))
@@ -1358,143 +1625,6 @@ func (h *Handler) handleCheckDomainHealth(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, http.StatusOK, response)
-}
-
-func (h *Handler) handleBlacklist(w http.ResponseWriter, r *http.Request) {
-	if h.blacklist == nil {
-		writeError(w, http.StatusNotImplemented, errors.New("blacklist is not configured"))
-		return
-	}
-
-	switch r.Method {
-	case http.MethodGet:
-		entries, err := h.blacklist.List()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		domainCount, ipCount := 0, 0
-		for _, e := range entries {
-			if e.Type == "ip" {
-				ipCount++
-			} else {
-				domainCount++
-			}
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"entries":     entries,
-			"count":       len(entries),
-			"domainCount": domainCount,
-			"ipCount":     ipCount,
-		})
-
-	case http.MethodPost:
-		var body struct {
-			Entries string `json:"entries"`
-		}
-		if err := decodeJSON(r, &body); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		values := splitDomains(body.Entries)
-		if len(values) == 0 {
-			writeError(w, http.StatusBadRequest, errors.New("no valid entries provided"))
-			return
-		}
-		if err := h.blacklist.AddMany(values); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		entries, _ := h.blacklist.List()
-		domainCount, ipCount := 0, 0
-		for _, e := range entries {
-			if e.Type == "ip" {
-				ipCount++
-			} else {
-				domainCount++
-			}
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"entries":     entries,
-			"count":       len(entries),
-			"domainCount": domainCount,
-			"ipCount":     ipCount,
-		})
-		h.recordEvent("info", "blacklist.updated", fmt.Sprintf("Blacklist updated: %d domains, %d IPs", domainCount, ipCount))
-
-	case http.MethodDelete:
-		value := r.URL.Query().Get("value")
-		if value == "" {
-			writeError(w, http.StatusBadRequest, errors.New("value parameter is required"))
-			return
-		}
-		if err := h.blacklist.Delete(value); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		entries, _ := h.blacklist.List()
-		writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "count": len(entries)})
-		h.recordEvent("info", "blacklist.entry_removed", fmt.Sprintf("Removed %s from blacklist", value))
-
-	default:
-		writeMethodNotAllowed(w, http.MethodGet, http.MethodPost, http.MethodDelete)
-	}
-}
-
-func (h *Handler) handleApplyBlacklist(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeMethodNotAllowed(w, http.MethodPost)
-		return
-	}
-	if h.blacklist == nil || h.blacklistRunner == nil {
-		writeError(w, http.StatusNotImplemented, errors.New("blacklist is not configured"))
-		return
-	}
-
-	state, err := h.state.Load()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	entries, err := h.blacklist.List()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	opts := blacklist.RunOptions{
-		DomainsListPath: h.blacklist.DomainsListPath(),
-		IPsListPath:     h.blacklist.IPsListPath(),
-		LANIface:        state.Routing.LANIface,
-	}
-
-	action := "add"
-	if len(entries) == 0 {
-		action = "del"
-	}
-
-	if err := h.blacklistRunner.Run(r.Context(), action, opts); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		h.recordEvent("error", "blacklist.apply_failed", err.Error())
-		return
-	}
-
-	domainCount, ipCount := 0, 0
-	for _, e := range entries {
-		if e.Type == "ip" {
-			ipCount++
-		} else {
-			domainCount++
-		}
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":      "applied",
-		"domainCount": domainCount,
-		"ipCount":     ipCount,
-	})
-	h.recordEvent("info", "blacklist.applied", fmt.Sprintf("Blacklist applied: %d domains, %d IPs", domainCount, ipCount))
 }
 
 func buildProvider(id string, req providerRequest) (config.Provider, error) {
@@ -1605,6 +1735,223 @@ func buildRule(id string, req ruleRequest, providers []config.Provider) (config.
 	}, nil
 }
 
+func (h *Handler) buildPriorityPolicy(id string, req priorityPolicyRequest, state config.State) (config.PriorityPolicy, error) {
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		return config.PriorityPolicy{}, errors.New("priority policy name is required")
+	}
+	providerID := strings.TrimSpace(req.ProviderID)
+	if providerID == "" {
+		return config.PriorityPolicy{}, errors.New("providerId is required")
+	}
+	provider, exists := findProviderByID(state.Providers, providerID)
+	if !exists {
+		return config.PriorityPolicy{}, fmt.Errorf("provider %s not found", providerID)
+	}
+	if provider.Type != config.ProviderTypeSubscription {
+		return config.PriorityPolicy{}, errors.New("priority policies are supported only for subscription providers")
+	}
+
+	targets := normalizePriorityRequestTargets(req.Targets)
+	if len(targets) == 0 {
+		return config.PriorityPolicy{}, errors.New("priority policy targets are required")
+	}
+	schedule, err := normalizePriorityRequestSchedule(req.Schedule, targets)
+	if err != nil {
+		return config.PriorityPolicy{}, err
+	}
+	if err := validatePriorityLocations(provider, targets, h.subscriptionRuntimeDir()); err != nil {
+		return config.PriorityPolicy{}, err
+	}
+	if err := validatePrioritySchedule(schedule); err != nil {
+		return config.PriorityPolicy{}, err
+	}
+
+	if id == "" {
+		id = newID("policy")
+	}
+	return config.PriorityPolicy{
+		ID:         id,
+		ProviderID: providerID,
+		Name:       name,
+		Enabled:    req.Enabled,
+		Entries:    nil,
+		Targets:    targets,
+		Schedule:   schedule,
+	}, nil
+}
+
+func normalizePriorityRequestTargets(targets []config.PriorityTarget) []config.PriorityTarget {
+	out := make([]config.PriorityTarget, 0, len(targets))
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		location := strings.TrimSpace(target.Location)
+		if location == "" {
+			continue
+		}
+		key := strings.ToLower(location)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, config.PriorityTarget{Location: location})
+	}
+	return out
+}
+
+func normalizePriorityRequestSchedule(schedule []config.PriorityScheduleWindow, targets []config.PriorityTarget) ([]config.PriorityScheduleWindow, error) {
+	out := make([]config.PriorityScheduleWindow, 0, len(schedule))
+	for _, window := range schedule {
+		start := strings.TrimSpace(window.Start)
+		end := strings.TrimSpace(window.End)
+		location := strings.TrimSpace(window.Location)
+		if start == "" && end == "" && location == "" {
+			continue
+		}
+		if start == "" || end == "" || location == "" {
+			return nil, errors.New("priority schedule windows require start, end, and location")
+		}
+		if _, ok := parseClockMinute(start); !ok {
+			return nil, fmt.Errorf("priority schedule start %q must use HH:MM", start)
+		}
+		if _, ok := parseClockMinute(end); !ok {
+			return nil, fmt.Errorf("priority schedule end %q must use HH:MM", end)
+		}
+		if start == end {
+			return nil, fmt.Errorf("priority schedule window %s-%s must not be empty", start, end)
+		}
+		if !targetLocationsContain(targets, location) {
+			return nil, fmt.Errorf("priority schedule location %q is not in targets", location)
+		}
+		out = append(out, config.PriorityScheduleWindow{Start: start, End: end, Location: location})
+	}
+	return out, nil
+}
+
+func validatePriorityLocations(provider config.Provider, targets []config.PriorityTarget, runtimeDir string) error {
+	entries, _, err := subscription.FetchEntriesCached(provider.Source, runtimeDir)
+	if err != nil {
+		return fmt.Errorf("load subscription locations for %q: %w", provider.Name, err)
+	}
+	available := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		available[strings.ToLower(strings.TrimSpace(entry.Name))] = entry.Name
+	}
+	for _, target := range targets {
+		key := strings.ToLower(strings.TrimSpace(target.Location))
+		if _, exists := available[key]; !exists {
+			return fmt.Errorf("location %q not found in provider %q", target.Location, provider.Name)
+		}
+	}
+	return nil
+}
+
+func validatePrioritySchedule(schedule []config.PriorityScheduleWindow) error {
+	segments := make([]clockSegment, 0, len(schedule)*2)
+	for _, window := range schedule {
+		start, okStart := parseClockMinute(window.Start)
+		end, okEnd := parseClockMinute(window.End)
+		if !okStart || !okEnd || start == end {
+			return fmt.Errorf("priority schedule window %s-%s is invalid", window.Start, window.End)
+		}
+		for _, segment := range splitClockWindow(start, end) {
+			for _, existing := range segments {
+				if clockSegmentsOverlap(existing, segment) {
+					return fmt.Errorf("priority schedule window %s-%s overlaps with %s-%s", window.Start, window.End, existing.startText, existing.endText)
+				}
+			}
+			segment.startText = window.Start
+			segment.endText = window.End
+			segments = append(segments, segment)
+		}
+	}
+	return nil
+}
+
+type clockSegment struct {
+	start     int
+	end       int
+	startText string
+	endText   string
+}
+
+func splitClockWindow(start int, end int) []clockSegment {
+	if start < end {
+		return []clockSegment{{start: start, end: end}}
+	}
+	return []clockSegment{{start: start, end: 24 * 60}, {start: 0, end: end}}
+}
+
+func clockSegmentsOverlap(left clockSegment, right clockSegment) bool {
+	return left.start < right.end && right.start < left.end
+}
+
+func parseClockMinute(value string) (int, bool) {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) != 2 {
+		return 0, false
+	}
+	hour, err := strconv.Atoi(parts[0])
+	if err != nil || hour < 0 || hour > 23 {
+		return 0, false
+	}
+	minute, err := strconv.Atoi(parts[1])
+	if err != nil || minute < 0 || minute > 59 {
+		return 0, false
+	}
+	if len(parts[0]) != 2 || len(parts[1]) != 2 {
+		return 0, false
+	}
+	return hour*60 + minute, true
+}
+
+func targetLocationsContain(targets []config.PriorityTarget, location string) bool {
+	for _, target := range targets {
+		if strings.EqualFold(strings.TrimSpace(target.Location), strings.TrimSpace(location)) {
+			return true
+		}
+	}
+	return false
+}
+
+func findProviderByID(providers []config.Provider, id string) (config.Provider, bool) {
+	for _, provider := range providers {
+		if provider.ID == id {
+			return provider, true
+		}
+	}
+	return config.Provider{}, false
+}
+
+func findPriorityPolicy(policies []config.PriorityPolicy, id string) (config.PriorityPolicy, bool) {
+	for _, policy := range policies {
+		if policy.ID == id {
+			return policy, true
+		}
+	}
+	return config.PriorityPolicy{}, false
+}
+
+func findPriorityPolicyIndex(policies []config.PriorityPolicy, id string) int {
+	for index, policy := range policies {
+		if policy.ID == id {
+			return index
+		}
+	}
+	return -1
+}
+
+func priorityPolicyHasTarget(policy config.PriorityPolicy, location string) bool {
+	return targetLocationsContain(policy.Targets, location)
+}
+
+func (h *Handler) subscriptionRuntimeDir() string {
+	if strings.TrimSpace(h.dataDir) == "" {
+		return ""
+	}
+	return filepath.Join(h.dataDir, ".vpn-manager", "subscriptions")
+}
+
 type activeRuleOwner struct {
 	RuleID   string
 	RuleName string
@@ -1685,7 +2032,6 @@ func validateProviderActivation(candidate config.Provider, providers []config.Pr
 			return err
 		}
 	}
-
 	return nil
 }
 
@@ -1716,6 +2062,29 @@ func validateActiveRuleEntries(state config.State) error {
 	return nil
 }
 
+func validatePriorityPolicyState(state config.State) error {
+	providersByID := providersIndex(state.Providers)
+	enabledByProvider := make(map[string]config.PriorityPolicy)
+	for _, policy := range state.PriorityPolicies {
+		if !policy.Enabled {
+			continue
+		}
+		providerID := strings.TrimSpace(policy.ProviderID)
+		if providerID == "" {
+			continue
+		}
+		if previous, exists := enabledByProvider[providerID]; exists {
+			providerName := providerID
+			if provider, ok := providersByID[providerID]; ok && strings.TrimSpace(provider.Name) != "" {
+				providerName = provider.Name
+			}
+			return fmt.Errorf("only one enabled priority policy is allowed for provider %q: %q and %q", providerName, previous.Name, policy.Name)
+		}
+		enabledByProvider[providerID] = policy
+	}
+	return nil
+}
+
 func providersIndex(providers []config.Provider) map[string]config.Provider {
 	byID := make(map[string]config.Provider, len(providers))
 	for _, provider := range providers {
@@ -1742,6 +2111,23 @@ func formatRuleLabel(rule config.Rule, provider config.Provider) string {
 		return rule.ID
 	}
 	return "unknown route"
+}
+
+func formatPriorityPolicyLabel(policy config.PriorityPolicy, provider config.Provider) string {
+	name := strings.TrimSpace(policy.Name)
+	if providerName := strings.TrimSpace(provider.Name); providerName != "" {
+		if name != "" {
+			return providerName + " / " + name
+		}
+		return providerName
+	}
+	if name != "" {
+		return name
+	}
+	if strings.TrimSpace(policy.ID) != "" {
+		return policy.ID
+	}
+	return "unknown priority policy"
 }
 
 func registerActiveEntries(entries []string, owner activeRuleOwner, seen map[string]activeRuleOwner, ipRanges *[]activeIPRange) error {
@@ -1920,6 +2306,15 @@ func parsePositiveQueryIntWithLegacy(values url.Values, primaryKey string, legac
 		return fallback
 	}
 	return parsePositiveQueryInt(values, legacyKey, fallback)
+}
+
+func truthyQueryValue(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, payload any) {

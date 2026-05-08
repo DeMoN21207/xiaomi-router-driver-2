@@ -7,6 +7,7 @@ import InlineNotice from "../components/InlineNotice.jsx";
 import { formatLatencyMs, statusToneClasses } from "../utils.js";
 
 const defaultForm = { name: "", type: "openvpn", source: "", enabled: true };
+const defaultPriorityDraft = { name: "", enabled: true, targets: [], schedule: [] };
 const DOMAIN_PREVIEW_LIMIT = 80;
 const DOMAIN_SEARCH_RESULT_LIMIT = 200;
 const ROUTING_ENTRIES_EXAMPLE = "# Example routing entries\n# Lines starting with # are ignored\n# Domains, IPv4 addresses and IPv4 CIDR ranges are supported\n\nyoutube.com\ngooglevideo.com\ndiscord.com\ngateway.discord.gg\n149.154.160.0/20\n91.108.56.0/22\n";
@@ -181,6 +182,7 @@ export default function ConnectionsPage() {
   const [configLoaded, setConfigLoaded] = useState(false);
   const [status, setStatus] = useState(null);
   const [failoverStatus, setFailoverStatus] = useState(null);
+  const [priorityStatus, setPriorityStatus] = useState(null);
   const [domainHealthMap, setDomainHealthMap] = useState(() => new Map());
   const [form, setForm] = useState(defaultForm);
   const [showForm, setShowForm] = useState(false);
@@ -195,9 +197,11 @@ export default function ConnectionsPage() {
 
   const providers = config?.providers ?? [];
   const rules = config?.rules ?? [];
+  const priorityPolicies = config?.priorityPolicies ?? [];
   const runtimeMap = new Map((status?.providers ?? []).map((p) => [p.id, p]));
   const failoverOverrideMap = new Map((failoverStatus?.activeOverrides ?? []).map((item) => [item.ruleId, item]));
   const failoverProviderMap = new Map((failoverStatus?.providers ?? []).map((item) => [item.providerId, item]));
+  const priorityStatusMap = new Map((priorityStatus?.policies ?? []).map((item) => [item.policyId, item]));
   const activeFailoverOverrides = failoverStatus?.activeOverrides ?? [];
 
   const showToast = useCallback((message, error = false) => {
@@ -222,10 +226,11 @@ export default function ConnectionsPage() {
       return;
     }
 
-    const [nextStatus, nextDomainHealth, nextFailoverStatus] = await Promise.allSettled([
+    const [nextStatus, nextDomainHealth, nextFailoverStatus, nextPriorityStatus] = await Promise.allSettled([
       fetchJSON("/api/status"),
       fetchJSON("/api/domains/health"),
       fetchJSON("/api/failover/status"),
+      fetchJSON("/api/priority-policies/status"),
     ]);
 
     if (nextStatus.status === "fulfilled") {
@@ -242,6 +247,10 @@ export default function ConnectionsPage() {
 
     if (nextFailoverStatus.status === "fulfilled") {
       setFailoverStatus(nextFailoverStatus.value);
+    }
+
+    if (nextPriorityStatus.status === "fulfilled") {
+      setPriorityStatus(nextPriorityStatus.value);
     }
   }, [t]);
 
@@ -522,6 +531,7 @@ export default function ConnectionsPage() {
           const statusLabel = !provider.enabled ? t("connections.off") : isOnline ? t("connections.online") : t("connections.problem");
           const toneClasses = statusToneClasses(tone);
           const providerRules = rules.filter((r) => r.providerId === provider.id);
+          const providerPriorityPolicies = priorityPolicies.filter((policy) => policy.providerId === provider.id);
 
           return (
             <ProviderCard
@@ -533,6 +543,8 @@ export default function ConnectionsPage() {
               statusLabel={statusLabel}
               isOnline={isOnline}
               providerRules={providerRules}
+              priorityPolicies={providerPriorityPolicies}
+              priorityStatusMap={priorityStatusMap}
               busy={busy}
               failoverOverrides={failoverOverrideMap}
               failoverProvider={failoverProviderMap.get(provider.id)}
@@ -604,7 +616,7 @@ function formatFailoverOverrideMessage(override, t) {
   return t("connections.failoverProvider", { from: original || override.originalProviderId || "-", to: active || override.activeProviderId || "-" });
 }
 
-function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, isOnline, providerRules, busy, failoverOverrides, failoverProvider, domainHealthMap, onDelete, onToggleEnabled, onDomainsChange, showToast, setPageError, t }) {
+function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, isOnline, providerRules, priorityPolicies, priorityStatusMap, busy, failoverOverrides, failoverProvider, domainHealthMap, onDelete, onToggleEnabled, onDomainsChange, showToast, setPageError, t }) {
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [probing, setProbing] = useState(false);
@@ -914,6 +926,23 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
             </div>
           )}
 
+          {provider.type === "subscription" && (
+            <PriorityPoliciesPanel
+              provider={provider}
+              providerRules={providerRules}
+              policies={priorityPolicies}
+              priorityStatusMap={priorityStatusMap}
+              probeLocations={probeLocations}
+              probing={probing}
+              saving={saving}
+              setSaving={setSaving}
+              onChanged={onDomainsChange}
+              showToast={showToast}
+              setPageError={setPageError}
+              t={t}
+            />
+          )}
+
           {/* Rules (routes) — each with its own location + domains */}
           <div className="space-y-4">
             {providerRules.length === 0 && (
@@ -956,6 +985,370 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function PriorityPoliciesPanel({ provider, providerRules, policies, priorityStatusMap, probeLocations, probing, saving, setSaving, onChanged, showToast, setPageError, t }) {
+  const [editingId, setEditingId] = useState("");
+  const [draft, setDraft] = useState(defaultPriorityDraft);
+  const [newTarget, setNewTarget] = useState("");
+  const [dragIndex, setDragIndex] = useState(-1);
+
+  const locationNames = useMemo(() => (probeLocations || []).filter((loc) => !loc.endpointError).map((loc) => loc.name), [probeLocations]);
+  const providerEntryCount = useMemo(() => {
+    const entries = new Set();
+    (providerRules || []).forEach((rule) => {
+      if (rule.enabled === false) return;
+      (rule.domains || []).forEach((entry) => {
+        const value = String(entry || "").trim();
+        if (value) entries.add(value);
+      });
+    });
+    return entries.size;
+  }, [providerRules]);
+  const editing = editingId !== "";
+
+  function startCreate() {
+    setEditingId("new");
+    setDraft({
+      ...defaultPriorityDraft,
+      name: `${provider.name} priority`,
+      targets: [],
+      schedule: [],
+    });
+    setNewTarget("");
+  }
+
+  function startEdit(policy) {
+    setEditingId(policy.id);
+    setDraft({
+      name: policy.name || "",
+      enabled: policy.enabled !== false,
+      targets: (policy.targets || []).map((target) => target.location).filter(Boolean),
+      schedule: (policy.schedule || []).map((item) => ({ start: item.start || "", end: item.end || "", location: item.location || "" })),
+    });
+    setNewTarget("");
+  }
+
+  function cancelEdit() {
+    setEditingId("");
+    setDraft(defaultPriorityDraft);
+    setNewTarget("");
+  }
+
+  function addTarget() {
+    const location = newTarget.trim();
+    if (!location || draft.targets.some((target) => target.toLowerCase() === location.toLowerCase())) {
+      return;
+    }
+    setDraft((current) => ({ ...current, targets: [...current.targets, location] }));
+    setNewTarget("");
+  }
+
+  function moveTarget(from, to) {
+    if (to < 0 || to >= draft.targets.length) return;
+    const nextTargets = [...draft.targets];
+    const [item] = nextTargets.splice(from, 1);
+    nextTargets.splice(to, 0, item);
+    setDraft((current) => ({ ...current, targets: nextTargets }));
+  }
+
+  function removeTarget(location) {
+    setDraft((current) => ({
+      ...current,
+      targets: current.targets.filter((target) => target !== location),
+      schedule: current.schedule.filter((window) => window.location !== location),
+    }));
+  }
+
+  function updateSchedule(index, patch) {
+    setDraft((current) => {
+      const schedule = [...current.schedule];
+      schedule[index] = { ...schedule[index], ...patch };
+      return { ...current, schedule };
+    });
+  }
+
+  async function savePolicy(event) {
+    event.preventDefault();
+    const payload = {
+      name: draft.name.trim(),
+      providerId: provider.id,
+      enabled: Boolean(draft.enabled),
+      targets: draft.targets.map((location) => ({ location })),
+      schedule: draft.schedule
+        .filter((window) => window.start || window.end || window.location)
+        .map((window) => ({ start: window.start, end: window.end, location: window.location })),
+    };
+    setSaving(true);
+    try {
+      const isNew = editingId === "new";
+      await fetchJSON(isNew ? "/api/priority-policies" : `/api/priority-policies/${encodeURIComponent(editingId)}`, {
+        method: isNew ? "POST" : "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      await fetchJSON("/api/rules/apply", { method: "POST" });
+      cancelEdit();
+      showToast(t("connections.prioritySaved"));
+      await onChanged();
+    } catch (error) {
+      setPageError(error.message);
+      showToast(error.message, true);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deletePolicy(policy) {
+    setSaving(true);
+    try {
+      await fetchJSON(`/api/priority-policies/${encodeURIComponent(policy.id)}`, { method: "DELETE" });
+      await fetchJSON("/api/rules/apply", { method: "POST" });
+      showToast(t("connections.priorityDeleted"));
+      await onChanged();
+    } catch (error) {
+      setPageError(error.message);
+      showToast(error.message, true);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function setOverride(policy, location) {
+    setSaving(true);
+    try {
+      await fetchJSON(`/api/priority-policies/${encodeURIComponent(policy.id)}/override`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ location }),
+      });
+      showToast(t("connections.priorityOverrideSet"));
+      await onChanged();
+    } catch (error) {
+      setPageError(error.message);
+      showToast(error.message, true);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function clearOverride(policy) {
+    setSaving(true);
+    try {
+      await fetchJSON(`/api/priority-policies/${encodeURIComponent(policy.id)}/override`, { method: "DELETE" });
+      showToast(t("connections.priorityOverrideCleared"));
+      await onChanged();
+    } catch (error) {
+      setPageError(error.message);
+      showToast(error.message, true);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="mb-5 rounded-lg border border-outline-variant/10 bg-surface-container p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <h4 className="text-xs font-bold uppercase tracking-widest text-outline">{t("connections.priorityPolicies")}</h4>
+          <p className="mt-1 text-sm text-on-surface-variant">{t("connections.priorityHint")}</p>
+        </div>
+        <button
+          type="button"
+          onClick={startCreate}
+          disabled={saving || editing}
+          className="shrink-0 rounded-lg bg-primary/10 px-3 py-2 text-sm font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-40"
+        >
+          <Icon name="add" className="mr-1 inline h-4 w-4 align-[-3px]" />
+          {t("connections.priorityAdd")}
+        </button>
+      </div>
+
+      {policies.length === 0 && !editing ? (
+        <p className="rounded-lg border border-dashed border-outline-variant/20 bg-surface-container-high px-4 py-3 text-sm text-on-surface-variant">
+          {t("connections.priorityEmpty")}
+        </p>
+      ) : null}
+
+      <div className="space-y-3">
+        {policies.map((policy) => {
+          const status = priorityStatusMap?.get(policy.id);
+          const active = status?.activeLocation || "";
+          const override = status?.overrideLocation || "";
+          return (
+            <div key={policy.id} className="rounded-lg border border-outline-variant/10 bg-surface-container-high p-3">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-headline text-sm font-bold text-on-surface">{policy.name}</span>
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${policy.enabled ? "bg-secondary/10 text-secondary" : "bg-outline-variant/10 text-outline"}`}>
+                      {policy.enabled ? t("connections.priorityEnabled") : t("connections.priorityDisabled")}
+                    </span>
+                    {active ? (
+                      <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-primary">
+                        {t("connections.priorityActive")}: {active}
+                      </span>
+                    ) : null}
+                    {override ? (
+                      <span className="rounded-full bg-tertiary/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-tertiary">
+                        {t("connections.priorityOverride")}: {override}
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {(policy.targets || []).map((target, index) => {
+                      const targetStatus = status?.targets?.find((item) => item.location === target.location);
+                      const targetActive = active === target.location;
+                      return (
+                        <button
+                          type="button"
+                          key={`${policy.id}:${target.location}`}
+                          onClick={() => setOverride(policy, target.location)}
+                          disabled={saving}
+                          title={t("connections.prioritySetOverride")}
+                          className={`rounded-lg border px-2.5 py-1 text-xs transition-colors disabled:opacity-40 ${targetActive ? "border-primary/30 bg-primary/10 text-primary" : "border-outline-variant/15 bg-surface-container-highest text-on-surface-variant hover:border-primary/25 hover:text-on-surface"}`}
+                        >
+                          {index + 1}. {target.location}
+                          {targetStatus?.status && targetStatus.status !== "unknown" ? ` · ${targetStatus.status}` : ""}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="mt-2 text-xs text-on-surface-variant">
+                    {providerEntryCount} {t("connections.priorityEntries")} · {(policy.schedule || []).length} {t("connections.priorityWindows")}
+                    {status?.reason ? ` · ${status.reason}` : ""}
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {override ? (
+                    <button type="button" onClick={() => clearOverride(policy)} disabled={saving} className="rounded-lg bg-tertiary/10 px-2.5 py-1.5 text-xs font-medium text-tertiary transition-colors hover:bg-tertiary/20 disabled:opacity-40">
+                      {t("connections.priorityClearOverride")}
+                    </button>
+                  ) : null}
+                  <button type="button" onClick={() => startEdit(policy)} disabled={saving || editing} className="rounded-lg bg-surface-container-highest p-2 text-on-surface-variant transition-colors hover:text-primary disabled:opacity-40">
+                    <Icon name="edit" className="h-4 w-4" />
+                  </button>
+                  <button type="button" onClick={() => deletePolicy(policy)} disabled={saving || editing} className="rounded-lg bg-surface-container-highest p-2 text-on-surface-variant transition-colors hover:text-error disabled:opacity-40">
+                    <Icon name="delete" className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {editing ? (
+        <form onSubmit={savePolicy} className="mt-4 space-y-4 rounded-lg border border-primary/20 bg-surface-container-high p-4">
+          <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_160px]">
+            <FormField label={t("connections.priorityName")}>
+              <input
+                value={draft.name}
+                onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))}
+                className="w-full rounded-lg border border-outline-variant/20 bg-surface-container-lowest/50 px-3 py-2 text-sm text-on-surface outline-none transition-colors focus:border-primary/40"
+              />
+            </FormField>
+            <label className="flex items-end gap-2 pb-2 text-sm text-on-surface">
+              <input
+                type="checkbox"
+                checked={draft.enabled}
+                onChange={(event) => setDraft((current) => ({ ...current, enabled: event.target.checked }))}
+                className="h-4 w-4 accent-primary"
+              />
+              {t("connections.priorityEnabled")}
+            </label>
+          </div>
+
+          <p className="rounded-lg border border-outline-variant/15 bg-surface-container-lowest/50 px-3 py-2 text-sm text-on-surface-variant">
+            {t("connections.priorityEntriesAuto", { count: providerEntryCount })}
+          </p>
+
+          <div>
+            <p className="mb-2 text-[10px] font-bold uppercase tracking-widest text-outline">{t("connections.priorityTargets")}</p>
+            <div className="mb-2 flex gap-2">
+              <select
+                value={newTarget}
+                onChange={(event) => setNewTarget(event.target.value)}
+                disabled={probing || !probeLocations}
+                className="min-w-0 flex-1 rounded-lg border border-outline-variant/20 bg-surface-container-lowest/50 px-3 py-2 text-sm text-on-surface outline-none transition-colors focus:border-primary/40 disabled:opacity-50"
+              >
+                <option value="">{probing ? t("connections.probing") : t("connections.prioritySelectTarget")}</option>
+                {locationNames.map((location) => (
+                  <option key={location} value={location}>{location}</option>
+                ))}
+              </select>
+              <button type="button" onClick={addTarget} disabled={!newTarget} className="rounded-lg bg-primary/10 px-3 py-2 text-sm font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-40">
+                {t("connections.priorityAddTarget")}
+              </button>
+            </div>
+            <div className="space-y-1.5">
+              {draft.targets.map((location, index) => (
+                <div
+                  key={location}
+                  draggable
+                  onDragStart={() => setDragIndex(index)}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={() => {
+                    if (dragIndex >= 0 && dragIndex !== index) moveTarget(dragIndex, index);
+                    setDragIndex(-1);
+                  }}
+                  className="flex items-center gap-2 rounded-lg border border-outline-variant/15 bg-surface-container-lowest/50 px-3 py-2"
+                >
+                  <span className="w-6 text-xs font-bold text-outline">{index + 1}</span>
+                  <span className="min-w-0 flex-1 truncate text-sm text-on-surface">{location}</span>
+                  <button type="button" onClick={() => moveTarget(index, index - 1)} disabled={index === 0} className="rounded p-1 text-on-surface-variant hover:text-primary disabled:opacity-30">
+                    <Icon name="arrow_drop_up" className="h-4 w-4" />
+                  </button>
+                  <button type="button" onClick={() => moveTarget(index, index + 1)} disabled={index === draft.targets.length - 1} className="rounded p-1 text-on-surface-variant hover:text-primary disabled:opacity-30">
+                    <Icon name="arrow_drop_down" className="h-4 w-4" />
+                  </button>
+                  <button type="button" onClick={() => removeTarget(location)} className="rounded p-1 text-on-surface-variant hover:text-error">
+                    <Icon name="close" className="h-4 w-4" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <p className="text-[10px] font-bold uppercase tracking-widest text-outline">{t("connections.prioritySchedule")}</p>
+              <button type="button" onClick={() => setDraft((current) => ({ ...current, schedule: [...current.schedule, { start: "09:00", end: "18:00", location: current.targets[0] || "" }] }))} disabled={draft.targets.length === 0} className="rounded-lg bg-surface-container-highest px-2.5 py-1 text-xs text-primary transition-colors hover:bg-primary/10 disabled:opacity-40">
+                {t("connections.priorityAddWindow")}
+              </button>
+            </div>
+            <div className="space-y-2">
+              {draft.schedule.map((window, index) => (
+                <div key={`${index}:${window.start}:${window.end}`} className="grid gap-2 sm:grid-cols-[120px_120px_minmax(0,1fr)_32px]">
+                  <input type="time" value={window.start} onChange={(event) => updateSchedule(index, { start: event.target.value })} className="rounded-lg border border-outline-variant/20 bg-surface-container-lowest/50 px-3 py-2 text-sm text-on-surface outline-none focus:border-primary/40" />
+                  <input type="time" value={window.end} onChange={(event) => updateSchedule(index, { end: event.target.value })} className="rounded-lg border border-outline-variant/20 bg-surface-container-lowest/50 px-3 py-2 text-sm text-on-surface outline-none focus:border-primary/40" />
+                  <select value={window.location} onChange={(event) => updateSchedule(index, { location: event.target.value })} className="rounded-lg border border-outline-variant/20 bg-surface-container-lowest/50 px-3 py-2 text-sm text-on-surface outline-none focus:border-primary/40">
+                    <option value="">{t("connections.prioritySelectTarget")}</option>
+                    {draft.targets.map((location) => <option key={location} value={location}>{location}</option>)}
+                  </select>
+                  <button type="button" onClick={() => setDraft((current) => ({ ...current, schedule: current.schedule.filter((_, itemIndex) => itemIndex !== index) }))} className="rounded-lg text-on-surface-variant transition-colors hover:bg-error-container/20 hover:text-error">
+                    <Icon name="close" className="mx-auto h-4 w-4" />
+                  </button>
+                </div>
+              ))}
+              {draft.schedule.length === 0 ? (
+                <p className="text-xs text-on-surface-variant">{t("connections.priorityNoSchedule")}</p>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-2">
+            <button type="button" onClick={cancelEdit} disabled={saving} className="rounded-lg px-4 py-2 text-sm text-on-surface-variant transition-colors hover:text-on-surface disabled:opacity-40">
+              {t("connections.cancel")}
+            </button>
+            <button type="submit" disabled={saving || !draft.name.trim() || draft.targets.length === 0} className="rounded-lg bg-primary/10 px-4 py-2 text-sm font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-40">
+              {t("connections.prioritySave")}
+            </button>
+          </div>
+        </form>
+      ) : null}
     </div>
   );
 }

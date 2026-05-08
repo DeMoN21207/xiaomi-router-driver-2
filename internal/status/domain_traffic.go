@@ -7,11 +7,13 @@ import (
 	"log"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"xiomi-router-driver/internal/config"
 	"xiomi-router-driver/internal/routing"
 )
 
@@ -37,6 +39,11 @@ type domainTrafficStore struct {
 	mu          sync.Mutex
 	initialized bool
 	initErr     error
+}
+
+type domainTrafficChainSample struct {
+	Chain string
+	Stats []DomainTrafficStat
 }
 
 func newDomainTrafficStore(db *sql.DB) *domainTrafficStore {
@@ -112,30 +119,77 @@ func parseIptablesOutput(output string) ([]DomainTrafficStat, error) {
 
 // SampleDomainTraffic reads current iptables counters and stores deltas in the DB.
 func (s *Service) SampleDomainTraffic() error {
+	_, err := s.sampleAndStoreDomainTraffic()
+	return err
+}
+
+func (s *Service) sampleAndStoreDomainTraffic() (bool, error) {
 	if s.domainTraffic == nil {
-		return nil
+		return false, nil
 	}
 
 	// Build chain names from active routing settings
 	chains := s.activeDomainStatsChains()
 	if len(chains) == 0 {
-		return nil
+		return false, nil
+	}
+
+	samples, err := sampleDomainTrafficChains(chains)
+	if err != nil {
+		return false, err
+	}
+	if len(samples) == 0 {
+		return false, nil
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	for _, chain := range chains {
-		stats, err := readIptablesChainCounters(chain)
-		if err != nil {
-			log.Printf("domain traffic: skip chain %s: %v", chain, err)
-			continue
-		}
-
-		if err := s.domainTraffic.Upsert(stats, now); err != nil {
-			return fmt.Errorf("domain traffic upsert: %w", err)
+	for _, sample := range samples {
+		if err := s.domainTraffic.Upsert(sample.Stats, now); err != nil {
+			return false, fmt.Errorf("domain traffic upsert: %w", err)
 		}
 	}
 
-	return nil
+	return true, nil
+}
+
+func sampleDomainTrafficChains(chains []string) ([]domainTrafficChainSample, error) {
+	if len(chains) == 0 {
+		return nil, nil
+	}
+
+	samples := make([]domainTrafficChainSample, 0, len(chains))
+	errs := make([]error, 0, len(chains))
+	for _, chain := range chains {
+		stats, err := readIptablesChainCounters(chain)
+		if err != nil {
+			if isMissingIptablesChainError(err) {
+				log.Printf("domain traffic: chain %s is not present", chain)
+				continue
+			}
+
+			wrapped := fmt.Errorf("%s: %w", chain, err)
+			log.Printf("domain traffic: skip chain %s: %v", chain, err)
+			errs = append(errs, wrapped)
+			continue
+		}
+
+		samples = append(samples, domainTrafficChainSample{Chain: chain, Stats: stats})
+	}
+
+	if len(samples) == 0 && len(errs) > 0 {
+		return nil, fmt.Errorf("domain traffic sample failed for all chains: %w", errors.Join(errs...))
+	}
+
+	return samples, nil
+}
+
+func isMissingIptablesChainError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "No chain/target/match by that name") ||
+		strings.Contains(message, "does not exist")
 }
 
 func (s *Service) activeDomainStatsChains() []string {
@@ -147,8 +201,9 @@ func (s *Service) activeDomainStatsChains() []string {
 	seen := make(map[string]bool)
 	var chains []string
 
-	// Main routing ipset -> chain
-	if s.domains != nil {
+	// Main OpenVPN routing ipset -> chain. Subscription runtimes derive their own
+	// ipset names below, so a subscription-only setup should not probe the base chain.
+	if s.domains != nil && stateHasActiveOpenVPNDomainRules(state) {
 		domainCount, countErr := s.domains.CountDomains()
 		if countErr == nil && s.effectiveDomainStatsEnabled(domainCount) {
 			mainChain := routing.DomainStatsChainName(state.Routing.IPSetName)
@@ -164,7 +219,7 @@ func (s *Service) activeDomainStatsChains() []string {
 		snapshots, err := s.subscriptions.Snapshots()
 		if err == nil {
 			for _, snap := range snapshots {
-				if snap.IPSetName != "" && s.effectiveDomainStatsEnabled(snap.DomainCount) {
+				if snap.IPSetName != "" && snap.DomainCount > 0 {
 					chain := routing.DomainStatsChainName(snap.IPSetName)
 					if !seen[chain] {
 						seen[chain] = true
@@ -178,12 +233,35 @@ func (s *Service) activeDomainStatsChains() []string {
 	return chains
 }
 
+func stateHasActiveOpenVPNDomainRules(state config.State) bool {
+	providersByID := make(map[string]config.Provider, len(state.Providers))
+	for _, provider := range state.Providers {
+		providersByID[provider.ID] = provider
+	}
+
+	for _, rule := range state.Rules {
+		if !rule.Enabled || !ruleHasDomains(rule) {
+			continue
+		}
+		provider, ok := providersByID[rule.ProviderID]
+		if ok && provider.Enabled && provider.Type == config.ProviderTypeOpenVPN {
+			return true
+		}
+	}
+
+	return false
+}
+
 // DomainTraffic returns aggregated per-domain traffic stats.
 func (s *Service) DomainTraffic(sortBy string, limit int) (DomainTrafficResponse, error) {
 	if s.domainTraffic == nil {
 		return DomainTrafficResponse{Domains: []DomainTrafficStat{}}, nil
 	}
-	if len(s.activeDomainStatsChains()) == 0 {
+	sampled, err := s.sampleAndStoreDomainTraffic()
+	if err != nil {
+		return DomainTrafficResponse{}, err
+	}
+	if !sampled {
 		return DomainTrafficResponse{Domains: []DomainTrafficStat{}}, nil
 	}
 
@@ -197,6 +275,96 @@ func (s *Service) DomainTraffic(sortBy string, limit int) (DomainTrafficResponse
 		TotalBytes: result.TotalBytes,
 		UpdatedAt:  result.UpdatedAt,
 	}, nil
+}
+
+// LiveDomainTraffic returns current counters from active iptables accounting chains.
+func (s *Service) LiveDomainTraffic(sortBy string, limit int) (DomainTrafficResponse, error) {
+	chains := s.activeDomainStatsChains()
+	if len(chains) == 0 {
+		return DomainTrafficResponse{Domains: []DomainTrafficStat{}}, nil
+	}
+
+	samples, err := sampleDomainTrafficChains(chains)
+	if err != nil {
+		return DomainTrafficResponse{}, err
+	}
+
+	sampledAt := time.Now().UTC().Format(time.RFC3339)
+	stats, totalBytes := aggregateLiveDomainTraffic(samples, sampledAt)
+	sortDomainTrafficStats(stats, sortBy)
+	if limit > 0 && limit < len(stats) {
+		stats = stats[:limit]
+	}
+
+	return DomainTrafficResponse{
+		Domains:    stats,
+		TotalBytes: totalBytes,
+		UpdatedAt:  sampledAt,
+	}, nil
+}
+
+func aggregateLiveDomainTraffic(samples []domainTrafficChainSample, sampledAt string) ([]DomainTrafficStat, uint64) {
+	byDomain := make(map[string]*DomainTrafficStat)
+	var totalBytes uint64
+
+	for _, sample := range samples {
+		for _, stat := range sample.Stats {
+			domainName, direction := splitDomainDirection(stat.Domain)
+			domainName = strings.TrimSpace(domainName)
+			if domainName == "" {
+				continue
+			}
+
+			item := byDomain[domainName]
+			if item == nil {
+				item = &DomainTrafficStat{
+					Domain:    domainName,
+					UpdatedAt: sampledAt,
+				}
+				byDomain[domainName] = item
+			}
+
+			item.Bytes += stat.Bytes
+			item.Packets += stat.Packets
+			totalBytes += stat.Bytes
+			switch direction {
+			case "up":
+				item.TXBytes += stat.Bytes
+			case "dn":
+				item.RXBytes += stat.Bytes
+			}
+		}
+	}
+
+	stats := make([]DomainTrafficStat, 0, len(byDomain))
+	for _, stat := range byDomain {
+		stats = append(stats, *stat)
+	}
+
+	return stats, totalBytes
+}
+
+func sortDomainTrafficStats(stats []DomainTrafficStat, sortBy string) {
+	switch strings.TrimSpace(sortBy) {
+	case "domain":
+		sort.Slice(stats, func(i, j int) bool {
+			return stats[i].Domain < stats[j].Domain
+		})
+	case "packets":
+		sort.Slice(stats, func(i, j int) bool {
+			if stats[i].Packets == stats[j].Packets {
+				return stats[i].Domain < stats[j].Domain
+			}
+			return stats[i].Packets > stats[j].Packets
+		})
+	default:
+		sort.Slice(stats, func(i, j int) bool {
+			if stats[i].Bytes == stats[j].Bytes {
+				return stats[i].Domain < stats[j].Domain
+			}
+			return stats[i].Bytes > stats[j].Bytes
+		})
+	}
 }
 
 // ResetDomainTraffic clears all accumulated domain traffic stats.

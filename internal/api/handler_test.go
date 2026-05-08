@@ -123,6 +123,90 @@ func TestValidateActiveRuleEntriesIgnoresDisabledRules(t *testing.T) {
 	}
 }
 
+func TestBuildPriorityPolicyRejectsScheduleOverlap(t *testing.T) {
+	handler := &Handler{dataDir: t.TempDir()}
+	state := config.State{
+		Providers: []config.Provider{testProvider("provider-a", "Alpha", true)},
+	}
+	state.Providers[0].Source = testSubscriptionSource()
+
+	_, err := handler.buildPriorityPolicy("", priorityPolicyRequest{
+		Name:       "Main",
+		ProviderID: "provider-a",
+		Enabled:    true,
+		Targets:    []config.PriorityTarget{{Location: "Germany"}, {Location: "Netherlands"}},
+		Schedule: []config.PriorityScheduleWindow{
+			{Start: "09:00", End: "12:00", Location: "Germany"},
+			{Start: "11:00", End: "13:00", Location: "Netherlands"},
+		},
+	}, state)
+	if err == nil {
+		t.Fatal("buildPriorityPolicy() error = nil, want overlap error")
+	}
+	if !strings.Contains(err.Error(), "overlaps") {
+		t.Fatalf("buildPriorityPolicy() error = %q, want overlap", err.Error())
+	}
+}
+
+func TestBuildPriorityPolicyAllowsEmptyEntries(t *testing.T) {
+	handler := &Handler{dataDir: t.TempDir()}
+	state := config.State{
+		Providers: []config.Provider{testProvider("provider-a", "Alpha", true)},
+	}
+	state.Providers[0].Source = testSubscriptionSource()
+
+	policy, err := handler.buildPriorityPolicy("", priorityPolicyRequest{
+		Name:       "Main",
+		ProviderID: "provider-a",
+		Enabled:    true,
+		Targets:    []config.PriorityTarget{{Location: "Germany"}, {Location: "Netherlands"}},
+	}, state)
+	if err != nil {
+		t.Fatalf("buildPriorityPolicy() error = %v, want nil", err)
+	}
+	if len(policy.Entries) != 0 {
+		t.Fatalf("buildPriorityPolicy() entries = %+v, want empty", policy.Entries)
+	}
+}
+
+func TestValidateActiveRuleEntriesIgnoresPriorityPolicyEntries(t *testing.T) {
+	state := config.State{
+		Providers: []config.Provider{
+			testProvider("provider-a", "Alpha", true),
+		},
+		Rules: []config.Rule{
+			testRule("rule-a", "Rule A", "provider-a", "Warsaw", []string{"openai.com"}, true),
+		},
+		PriorityPolicies: []config.PriorityPolicy{
+			{ID: "policy-a", Name: "Priority", ProviderID: "provider-a", Enabled: true, Entries: []string{"openai.com"}, Targets: []config.PriorityTarget{{Location: "Germany"}}},
+		},
+	}
+
+	if err := validateActiveRuleEntries(state); err != nil {
+		t.Fatalf("validateActiveRuleEntries() error = %v, want nil", err)
+	}
+}
+
+func TestValidatePriorityPolicyStateRejectsMultipleEnabledPoliciesForProvider(t *testing.T) {
+	state := config.State{
+		Providers: []config.Provider{
+			testProvider("provider-a", "Alpha", true),
+		},
+		PriorityPolicies: []config.PriorityPolicy{
+			{ID: "policy-a", Name: "Day", ProviderID: "provider-a", Enabled: true, Targets: []config.PriorityTarget{{Location: "Germany"}}},
+			{ID: "policy-b", Name: "Night", ProviderID: "provider-a", Enabled: true, Targets: []config.PriorityTarget{{Location: "Netherlands"}}},
+		},
+	}
+
+	err := validatePriorityPolicyState(state)
+	if err == nil {
+		t.Fatal("validatePriorityPolicyState() error = nil, want duplicate provider policy error")
+	}
+	if !strings.Contains(err.Error(), "only one enabled priority policy") {
+		t.Fatalf("validatePriorityPolicyState() error = %q, want one enabled policy message", err.Error())
+	}
+}
+
 func testProvider(id, name string, enabled bool) config.Provider {
 	return config.Provider{
 		ID:      id,
@@ -131,6 +215,10 @@ func testProvider(id, name string, enabled bool) config.Provider {
 		Source:  "https://example.com/subscription",
 		Enabled: enabled,
 	}
+}
+
+func testSubscriptionSource() string {
+	return "{\n" + `"outbounds":[{"type":"vless","tag":"Germany","server":"127.0.0.1","server_port":443},{"type":"vless","tag":"Netherlands","server":"127.0.0.1","server_port":8443}]}`
 }
 
 func testRule(id, name, providerID, location string, domains []string, enabled bool) config.Rule {

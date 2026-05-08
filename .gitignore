@@ -1,7 +1,9 @@
 .claude/
 .tools/
+.DS_Store
 deploy_router.bat
 deploy_router.local.cmd
+deploy_router.local.sh
 /*.dll
 /*.exe
 .vpn-manager/

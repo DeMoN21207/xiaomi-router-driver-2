@@ -134,12 +134,18 @@ func (s *Supervisor) maybeProviderFailover(ctx context.Context, state config.Sta
 }
 
 func (s *Supervisor) applyStateRespectingFailover(ctx context.Context, state config.State) error {
+	priorityState := s.priorityAppliedState(state)
+	hasPriorityDecisions := false
+	s.priorityMu.RLock()
+	hasPriorityDecisions = len(s.priority.decisions) > 0
+	s.priorityMu.RUnlock()
+
 	s.failoverMu.RLock()
-	appliedState := s.failoverAppliedStateLocked(state)
+	appliedState := s.failoverAppliedStateLocked(priorityState)
 	hasOverrides := len(s.failover.overrides) > 0
 	s.failoverMu.RUnlock()
 
-	if s.applyState != nil && hasOverrides {
+	if s.applyState != nil && (hasOverrides || hasPriorityDecisions) {
 		return s.applyState(ctx, appliedState)
 	}
 	return s.apply(ctx)
@@ -613,44 +619,7 @@ func (s *Supervisor) switchProvider(ctx context.Context, baseState config.State,
 }
 
 func (s *Supervisor) applyAllDownPolicy(ctx context.Context, baseState config.State, failedProvider config.Provider, affectedRules []config.Rule, reason string) bool {
-	mode := strings.ToLower(strings.TrimSpace(baseState.Automation.FailoverAllDownMode))
-	if mode == "" {
-		mode = "keep"
-	}
-	if mode != "direct" {
-		s.record("error", "automation.provider_failover_failed", fmt.Sprintf("%s is unhealthy (%s), no fallback provider was found, all-down mode is %s", failedProvider.Name, reason, mode))
-		return false
-	}
-
-	previous := cloneOverrides(s.failover.overrides)
-	now := time.Now()
-	for _, rule := range affectedRules {
-		originalProviderID := rule.ProviderID
-		originalLocation := rule.SelectedLocation
-		if existing, exists := previous[rule.ID]; exists {
-			originalProviderID = existing.OriginalProviderID
-			originalLocation = existing.OriginalLocation
-		}
-		s.failover.overrides[rule.ID] = failoverOverride{
-			OriginalProviderID: originalProviderID,
-			OriginalLocation:   originalLocation,
-			Mode:               "direct",
-			Reason:             reason,
-			Since:              now,
-		}
-	}
-
-	applyCtx, cancel := context.WithTimeout(ctx, providerFailoverApplyTimeout)
-	err := s.applyState(applyCtx, s.failoverAppliedStateLocked(baseState))
-	cancel()
-	if err != nil {
-		s.failover.overrides = previous
-		s.record("error", "automation.provider_failover_failed", fmt.Sprintf("safe direct release for %s failed: %v", failedProvider.Name, err))
-		return false
-	}
-
-	s.failover.lastApply = now
-	s.record("warn", "automation.provider_failed_over", fmt.Sprintf("%s was unhealthy (%s), no healthy fallback was found; affected routes are temporarily released to direct internet", failedProvider.Name, reason))
+	s.record("error", "automation.provider_failover_failed", fmt.Sprintf("%s is unhealthy (%s), no healthy fallback provider was found; direct internet release is disabled", failedProvider.Name, reason))
 	return true
 }
 

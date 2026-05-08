@@ -22,17 +22,23 @@ func TestRoutingLoadProfileTuningFor(t *testing.T) {
 	if minimal.DomainStatsMode != "off" || minimal.DomainTrafficSampleInterval != 0 || minimal.SiteTrafficSampleInterval != 0 {
 		t.Fatalf("unexpected minimal tuning: %+v", minimal)
 	}
+	if minimal.ConntrackFlushOnApply {
+		t.Fatalf("expected minimal profile not to flush conntrack")
+	}
 
 	normal := RoutingLoadProfileTuningFor(RoutingLoadProfileNormal)
 	if normal.DomainStatsMode != "auto" || normal.DomainTrafficSampleInterval != 120*time.Second || normal.SiteTrafficSampleInterval != 0 {
 		t.Fatalf("unexpected normal tuning: %+v", normal)
 	}
-	if normal.PrimeMaxDomains != 128 {
-		t.Fatalf("expected normal priming to cover 128 domains, got %+v", normal)
+	if normal.PrimeMaxDomains != 512 || normal.IPSetTimeout != 86400 || !normal.ConntrackFlushOnApply {
+		t.Fatalf("expected normal profile to prime broadly and flush routed conntrack, got %+v", normal)
 	}
 
 	detailed := RoutingLoadProfileTuningFor(RoutingLoadProfileDetailed)
 	if detailed.DomainStatsMode != "on" || detailed.DomainHealthSampleInterval != 12*time.Hour || !detailed.DomainHealthInitialSample || detailed.SiteTrafficSampleInterval != 30*time.Second {
 		t.Fatalf("unexpected detailed tuning: %+v", detailed)
+	}
+	if detailed.PrimeMaxDomains != 512 || detailed.IPSetTimeout != 86400 || !detailed.ConntrackFlushOnApply {
+		t.Fatalf("expected detailed profile to prime broadly and flush routed conntrack, got %+v", detailed)
 	}
 }

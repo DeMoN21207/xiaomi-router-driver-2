@@ -30,7 +30,6 @@ What the app creates on first start:
 - `data/vpn-state.json`
 - `data/events.json`
 - `data/.vpn-manager/update_routes.sh`
-- `data/.vpn-manager/update_blacklist.sh`
 
 Requirements:
 - The router architecture must match the built binary in `bundle-info.txt`.

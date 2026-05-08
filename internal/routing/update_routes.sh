@@ -23,7 +23,7 @@ DOMAIN_STATS_CHAIN="${DOMAIN_STATS_CHAIN:-VDS_${IPSET_NAME}}"
 LEGACY_DOMAIN_STATS_CHAIN="${LEGACY_DOMAIN_STATS_CHAIN:-VPN_DOM_STATS_${IPSET_NAME}}"
 DNSMASQ_RESTART_LOG="${DNSMASQ_RESTART_LOG:-/tmp/vpn-manager-dnsmasq-restart.log}"
 PRIME_MAX_DOMAINS="${PRIME_MAX_DOMAINS:-0}"
-DNS_PRIME_LOOKUP_TIMEOUT_SECONDS="${DNS_PRIME_LOOKUP_TIMEOUT_SECONDS:-1}"
+DNS_PRIME_LOOKUP_TIMEOUT_SECONDS="${DNS_PRIME_LOOKUP_TIMEOUT_SECONDS:-2}"
 DNS_PRIME_SERVERS="${DNS_PRIME_SERVERS:-1.1.1.1,8.8.8.8,9.9.9.9}"
 DOMAIN_STATS_MAX_DOMAINS="${DOMAIN_STATS_MAX_DOMAINS:-128}"
 IPSET_TIMEOUT="${IPSET_TIMEOUT:-1800}"
@@ -41,7 +41,8 @@ CONNTRACK_FLUSH_ON_APPLY="${CONNTRACK_FLUSH_ON_APPLY:-0}"
 
 ENABLE_DOMAIN_STATS=1
 DNSMASQ_CONFIG_CHANGED=0
-DNSMASQ_CONFIG_BACKUP="${DNSMASQ_CONFIG_FILE}.bak"
+DNSMASQ_CONFIG_BASENAME="${DNSMASQ_CONFIG_FILE##*/}"
+DNSMASQ_CONFIG_BACKUP="${DNSMASQ_CONFIG_BACKUP:-/tmp/vpn-manager-dnsmasq/${DNSMASQ_CONFIG_BASENAME}.bak}"
 
 short_hash() {
     value="$1"
@@ -118,11 +119,35 @@ iptables() {
     fi
 }
 
+run_with_timeout() {
+    seconds="$1"
+    shift
+
+    if ! command -v timeout >/dev/null 2>&1 || [ "${seconds:-0}" -le 0 ] 2>/dev/null; then
+        "$@"
+        return
+    fi
+
+    if [ "${TIMEOUT_NEEDS_T_FLAG:-}" = "" ]; then
+        if timeout --help 2>&1 | grep -q -- '\[-t SECS\]'; then
+            TIMEOUT_NEEDS_T_FLAG=1
+        else
+            TIMEOUT_NEEDS_T_FLAG=0
+        fi
+    fi
+
+    if [ "$TIMEOUT_NEEDS_T_FLAG" = "1" ]; then
+        timeout -t "$seconds" "$@"
+    else
+        timeout "$seconds" "$@"
+    fi
+}
+
 resolve_domain_ips() {
     domain="$1"
     dns_server="${2:-127.0.0.1}"
     if command -v timeout >/dev/null 2>&1 && [ "${DNS_PRIME_LOOKUP_TIMEOUT_SECONDS:-0}" -gt 0 ] 2>/dev/null; then
-        timeout "$DNS_PRIME_LOOKUP_TIMEOUT_SECONDS" nslookup "$domain" "$dns_server" 2>/dev/null
+        run_with_timeout "$DNS_PRIME_LOOKUP_TIMEOUT_SECONDS" nslookup "$domain" "$dns_server" 2>/dev/null
     else
         nslookup "$domain" "$dns_server" 2>/dev/null
     fi \
@@ -246,20 +271,21 @@ apply_dnsmasq_changes() {
         return 0
     fi
 
-    echo "--> Reloading dnsmasq to apply config..."
-    if reload_dnsmasq; then
+    echo "--> Restarting dnsmasq to apply config..."
+    # Some OpenWrt dnsmasq builds do not reread conf-dir snippets on reload/SIGHUP.
+    if dnsmasq_control restart; then
         return 0
     fi
 
-    echo "Error: dnsmasq reload/restart failed." >&2
+    echo "Error: dnsmasq restart failed." >&2
     if [ -s "$DNSMASQ_RESTART_LOG" ]; then
         cat "$DNSMASQ_RESTART_LOG" >&2
     fi
 
     if [ -f "$DNSMASQ_CONFIG_BACKUP" ]; then
-        echo "--> Restoring previous dnsmasq config after failed reload." >&2
+        echo "--> Restoring previous dnsmasq config after failed restart." >&2
         cp "$DNSMASQ_CONFIG_BACKUP" "$DNSMASQ_CONFIG_FILE" >/dev/null 2>&1 || true
-        reload_dnsmasq >/dev/null 2>&1 || true
+        dnsmasq_control restart >/dev/null 2>&1 || true
     fi
     return 1
 }
@@ -634,14 +660,47 @@ ensure_dnsmasq_conf_dir() {
     fi
 }
 
+dnsmasq_conf_references_live_ipset() {
+    fragment="$1"
+    for set_name in $(awk -F/ '/^ipset=\// {print $NF}' "$fragment" 2>/dev/null | tr ',' ' '); do
+        [ -z "$set_name" ] && continue
+        if ipset list "$set_name" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+cleanup_dnsmasq_conf_fragments() {
+    dnsmasq_conf_dir=$(dirname "$DNSMASQ_CONFIG_FILE")
+    for fragment in "$dnsmasq_conf_dir"/vpn_dns*.conf "$dnsmasq_conf_dir"/vpn_dns*.conf.bak; do
+        [ -e "$fragment" ] || continue
+        if [ "$fragment" = "$DNSMASQ_CONFIG_FILE" ]; then
+            continue
+        fi
+        case "$fragment" in
+            *.conf.bak) ;;
+            *)
+                if dnsmasq_conf_references_live_ipset "$fragment"; then
+                    continue
+                fi
+                ;;
+        esac
+        if rm -f "$fragment" >/dev/null 2>&1; then
+            DNSMASQ_CONFIG_CHANGED=1
+        fi
+    done
+}
+
 render_dnsmasq_config() {
     echo "--> Generating dnsmasq config to populate ipset..."
     ensure_dnsmasq_conf_dir
+    cleanup_dnsmasq_conf_fragments
 
     tmp_file="${DNSMASQ_CONFIG_FILE}.$$"
     : > "$tmp_file" || return 1
 
-    domain_count=$(count_domain_entries)
+    domain_count=$(count_active_domains)
     ENABLE_DOMAIN_STATS=1
     if ! domain_stats_enabled "$domain_count"; then
         ENABLE_DOMAIN_STATS=0
@@ -657,13 +716,19 @@ render_dnsmasq_config() {
     grep -vE '^\s*#|^\s*$' "$DOMAIN_LIST" | while IFS= read -r domain_raw; do
         domain=$(echo "$domain_raw" | tr -d '\r')
         if [ -z "$domain" ]; then continue; fi
-        if is_ipv4_entry "$domain"; then continue; fi
 
-        # Shared ipset for routing
-        echo "ipset=/$domain/$IPSET_NAME" >> "$tmp_file"
-        if [ -n "$DNS_PROXY_SERVER" ]; then
-            echo "server=/$domain/$DNS_PROXY_SERVER" >> "$tmp_file"
+        if is_ipv4_entry "$domain"; then
+            if [ "$ENABLE_DOMAIN_STATS" = "1" ]; then
+                # Static IP/CIDR entries are already routed through the shared
+                # ipset; direct rules let the traffic table show them by value.
+                iptables -A "$DOMAIN_STATS_CHAIN" -d "$domain" -m comment --comment "${domain}|up" >/dev/null 2>&1 || true
+                iptables -A "$DOMAIN_STATS_CHAIN" -s "$domain" -m comment --comment "${domain}|dn" >/dev/null 2>&1 || true
+            fi
+            continue
         fi
+
+        ipset_targets="$IPSET_NAME"
+        dom_set=""
 
         if [ "$ENABLE_DOMAIN_STATS" = "1" ]; then
             # Per-domain ipset for traffic accounting.
@@ -671,22 +736,29 @@ render_dnsmasq_config() {
             dom_hash=$(short_hash "${IPSET_NAME}:${domain}")
             dom_set="${compact_domain_prefix}${dom_hash}"
             ipset create "$dom_set" hash:ip family inet timeout "$IPSET_TIMEOUT" -exist 2>/dev/null
-            echo "ipset=/$domain/$dom_set" >> "$tmp_file"
+            ipset_targets="${ipset_targets},${dom_set}"
+        fi
 
+        echo "ipset=/$domain/$ipset_targets" >> "$tmp_file"
+        if [ -n "$DNS_PROXY_SERVER" ]; then
+            echo "server=/$domain/$DNS_PROXY_SERVER" >> "$tmp_file"
+        fi
+
+        if [ "$ENABLE_DOMAIN_STATS" = "1" ]; then
             # Accounting rules: upload (LAN->VPN, dst=server) and download (VPN->LAN, src=server).
             iptables -A "$DOMAIN_STATS_CHAIN" -m set --match-set "$dom_set" dst -m comment --comment "${domain}|up" >/dev/null 2>&1 || true
             iptables -A "$DOMAIN_STATS_CHAIN" -m set --match-set "$dom_set" src -m comment --comment "${domain}|dn" >/dev/null 2>&1 || true
         fi
     done
 
-    DNSMASQ_CONFIG_CHANGED=1
     if [ -f "$DNSMASQ_CONFIG_FILE" ] && command -v cmp >/dev/null 2>&1 && cmp -s "$tmp_file" "$DNSMASQ_CONFIG_FILE"; then
-        DNSMASQ_CONFIG_CHANGED=0
         rm -f "$tmp_file"
         return 0
     fi
 
+    DNSMASQ_CONFIG_CHANGED=1
     if [ -f "$DNSMASQ_CONFIG_FILE" ]; then
+        mkdir -p "$(dirname "$DNSMASQ_CONFIG_BACKUP")" >/dev/null 2>&1 || true
         cp "$DNSMASQ_CONFIG_FILE" "$DNSMASQ_CONFIG_BACKUP" >/dev/null 2>&1 || true
     else
         rm -f "$DNSMASQ_CONFIG_BACKUP" >/dev/null 2>&1 || true
@@ -702,9 +774,51 @@ flush_conntrack_if_requested() {
         echo "--> conntrack cleanup requested but conntrack binary is not available."
         return 0
     fi
-    echo "--> Flushing TCP/UDP conntrack entries after route switch..."
-    conntrack -D -p tcp >/dev/null 2>&1 || true
-    conntrack -D -p udp >/dev/null 2>&1 || true
+    echo "--> Flushing conntrack entries for routed destinations..."
+
+    count=0
+    flushed=""
+    while IFS= read -r entry_raw || [ -n "$entry_raw" ]; do
+        entry=$(echo "$entry_raw" | tr -d '\r')
+        case "$entry" in
+            ""|\#*) continue ;;
+        esac
+
+        if is_ipv4_entry "$entry"; then
+            case " $flushed " in
+                *" $entry "*) ;;
+                *)
+                    flushed="$flushed $entry"
+                    conntrack -D -d "$entry" >/dev/null 2>&1 || true
+                    conntrack -D -s "$entry" >/dev/null 2>&1 || true
+                    ;;
+            esac
+            continue
+        fi
+
+        count=$((count + 1))
+        if [ "${PRIME_MAX_DOMAINS:-0}" -gt 0 ] && [ "$count" -gt "$PRIME_MAX_DOMAINS" ]; then
+            echo "--> Conntrack cleanup capped at ${PRIME_MAX_DOMAINS} domains."
+            break
+        fi
+
+        for dns_server in 127.0.0.1 $(printf '%s\n' "$DNS_PRIME_SERVERS" | tr ',;' ' '); do
+            dns_server=$(echo "$dns_server" | tr -d '\r')
+            if [ -z "$dns_server" ]; then
+                continue
+            fi
+            for ip in $(resolve_domain_ips "$entry" "$dns_server"); do
+                case " $flushed " in
+                    *" $ip "*) ;;
+                    *)
+                        flushed="$flushed $ip"
+                        conntrack -D -d "$ip" >/dev/null 2>&1 || true
+                        conntrack -D -s "$ip" >/dev/null 2>&1 || true
+                        ;;
+                esac
+            done
+        done
+    done < "$DOMAIN_LIST"
 }
 
 # Main function to add rules and routes

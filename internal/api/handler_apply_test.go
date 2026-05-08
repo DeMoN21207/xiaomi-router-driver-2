@@ -22,14 +22,13 @@ func TestHandleRuleApplyRollbackOnFailure(t *testing.T) {
 	domainsManager := domains.NewManager(db, filepath.Join(tempDir, "domains.current"), filepath.Join(tempDir, "domains.legacy"))
 	openvpnManager := openvpn.NewManager(tempDir, tempDir, db, nil, nil)
 	handler := NewHandler(Dependencies{
-		State:     stateManager,
-		Domains:   domainsManager,
-		OpenVPN:   openvpnManager,
-		DataDir:   tempDir,
-		Events:    nil,
-		Routing:   nil,
-		Status:    nil,
-		Blacklist: nil,
+		State:   stateManager,
+		Domains: domainsManager,
+		OpenVPN: openvpnManager,
+		DataDir: tempDir,
+		Events:  nil,
+		Routing: nil,
+		Status:  nil,
 	})
 
 	initialState := config.State{

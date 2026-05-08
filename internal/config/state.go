@@ -37,6 +37,26 @@ type Rule struct {
 	Enabled          bool     `json:"enabled"`
 }
 
+type PriorityPolicy struct {
+	ID         string                   `json:"id"`
+	ProviderID string                   `json:"providerId"`
+	Name       string                   `json:"name"`
+	Enabled    bool                     `json:"enabled"`
+	Entries    []string                 `json:"entries"`
+	Targets    []PriorityTarget         `json:"targets"`
+	Schedule   []PriorityScheduleWindow `json:"schedule"`
+}
+
+type PriorityTarget struct {
+	Location string `json:"location"`
+}
+
+type PriorityScheduleWindow struct {
+	Start    string `json:"start"`
+	End      string `json:"end"`
+	Location string `json:"location"`
+}
+
 type RoutingSettings struct {
 	VPNGateway        string `json:"vpnGateway"`
 	VPNRouteMode      string `json:"vpnRouteMode"`
@@ -66,13 +86,14 @@ type AutomationSettings struct {
 }
 
 type State struct {
-	Providers     []Provider         `json:"providers"`
-	Rules         []Rule             `json:"rules"`
-	Routing       RoutingSettings    `json:"routing"`
-	Automation    AutomationSettings `json:"automation"`
-	LastAppliedAt string             `json:"lastAppliedAt"`
-	LastError     string             `json:"lastError"`
-	UpdatedAt     string             `json:"updatedAt"`
+	Providers        []Provider         `json:"providers"`
+	Rules            []Rule             `json:"rules"`
+	PriorityPolicies []PriorityPolicy   `json:"priorityPolicies"`
+	Routing          RoutingSettings    `json:"routing"`
+	Automation       AutomationSettings `json:"automation"`
+	LastAppliedAt    string             `json:"lastAppliedAt"`
+	LastError        string             `json:"lastError"`
+	UpdatedAt        string             `json:"updatedAt"`
 }
 
 type Manager struct {
@@ -92,10 +113,11 @@ func NewManager(db *sql.DB, legacyPath string) *Manager {
 
 func DefaultState() State {
 	return State{
-		Providers:  []Provider{},
-		Rules:      []Rule{},
-		Routing:    DefaultRoutingSettings(),
-		Automation: DefaultAutomationSettings(),
+		Providers:        []Provider{},
+		Rules:            []Rule{},
+		PriorityPolicies: []PriorityPolicy{},
+		Routing:          DefaultRoutingSettings(),
+		Automation:       DefaultAutomationSettings(),
 	}
 }
 
@@ -318,6 +340,36 @@ func ensureStateSchema(db *sql.DB) error {
 			PRIMARY KEY (rule_id, domain),
 			FOREIGN KEY (rule_id) REFERENCES rules(id) ON DELETE CASCADE
 		)`,
+		`CREATE TABLE IF NOT EXISTS priority_policies (
+			id TEXT PRIMARY KEY,
+			provider_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			enabled INTEGER NOT NULL,
+			position INTEGER NOT NULL,
+			FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS priority_policy_entries (
+			policy_id TEXT NOT NULL,
+			entry TEXT NOT NULL,
+			position INTEGER NOT NULL,
+			PRIMARY KEY (policy_id, entry),
+			FOREIGN KEY (policy_id) REFERENCES priority_policies(id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS priority_policy_targets (
+			policy_id TEXT NOT NULL,
+			location TEXT NOT NULL,
+			position INTEGER NOT NULL,
+			PRIMARY KEY (policy_id, location),
+			FOREIGN KEY (policy_id) REFERENCES priority_policies(id) ON DELETE CASCADE
+		)`,
+		`CREATE TABLE IF NOT EXISTS priority_policy_schedule (
+			policy_id TEXT NOT NULL,
+			start_time TEXT NOT NULL,
+			end_time TEXT NOT NULL,
+			location TEXT NOT NULL,
+			position INTEGER NOT NULL,
+			FOREIGN KEY (policy_id) REFERENCES priority_policies(id) ON DELETE CASCADE
+		)`,
 		`CREATE TABLE IF NOT EXISTS routing_settings (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
 			vpn_gateway TEXT NOT NULL,
@@ -353,6 +405,10 @@ func ensureStateSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_providers_position ON providers(position)`,
 		`CREATE INDEX IF NOT EXISTS idx_rules_position ON rules(position)`,
 		`CREATE INDEX IF NOT EXISTS idx_rule_domains_rule_position ON rule_domains(rule_id, position)`,
+		`CREATE INDEX IF NOT EXISTS idx_priority_policies_provider_position ON priority_policies(provider_id, position)`,
+		`CREATE INDEX IF NOT EXISTS idx_priority_policy_entries_position ON priority_policy_entries(policy_id, position)`,
+		`CREATE INDEX IF NOT EXISTS idx_priority_policy_targets_position ON priority_policy_targets(policy_id, position)`,
+		`CREATE INDEX IF NOT EXISTS idx_priority_policy_schedule_position ON priority_policy_schedule(policy_id, position)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return err
@@ -412,6 +468,7 @@ func stateDataPresent(db *sql.DB) (bool, error) {
 		SELECT
 			EXISTS(SELECT 1 FROM providers LIMIT 1) OR
 			EXISTS(SELECT 1 FROM rules LIMIT 1) OR
+			EXISTS(SELECT 1 FROM priority_policies LIMIT 1) OR
 			EXISTS(SELECT 1 FROM routing_settings LIMIT 1) OR
 			EXISTS(SELECT 1 FROM automation_settings LIMIT 1) OR
 			EXISTS(SELECT 1 FROM app_meta LIMIT 1)
@@ -438,6 +495,18 @@ func loadLegacyState(path string) (State, error) {
 }
 
 func saveStateTx(tx *sql.Tx, state State) error {
+	if _, err := tx.Exec(`DELETE FROM priority_policy_schedule`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM priority_policy_targets`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM priority_policy_entries`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM priority_policies`); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM rule_domains`); err != nil {
 		return err
 	}
@@ -466,6 +535,24 @@ func saveStateTx(tx *sql.Tx, state State) error {
 		}
 
 		if err := replaceRuleDomainsTx(tx, rule.ID, rule.Domains); err != nil {
+			return err
+		}
+	}
+
+	for policyIndex, policy := range state.PriorityPolicies {
+		if _, err := tx.Exec(`
+			INSERT INTO priority_policies (id, provider_id, name, enabled, position)
+			VALUES (?, ?, ?, ?, ?)
+		`, policy.ID, policy.ProviderID, policy.Name, boolToInt(policy.Enabled), policyIndex); err != nil {
+			return err
+		}
+		if err := replacePriorityPolicyEntriesTx(tx, policy.ID, policy.Entries); err != nil {
+			return err
+		}
+		if err := replacePriorityPolicyTargetsTx(tx, policy.ID, policy.Targets); err != nil {
+			return err
+		}
+		if err := replacePriorityPolicyScheduleTx(tx, policy.ID, policy.Schedule); err != nil {
 			return err
 		}
 	}
@@ -543,6 +630,57 @@ func replaceRuleDomainsTx(tx *sql.Tx, ruleID string, domains []string) error {
 	return nil
 }
 
+func replacePriorityPolicyEntriesTx(tx *sql.Tx, policyID string, entries []string) error {
+	if _, err := tx.Exec(`DELETE FROM priority_policy_entries WHERE policy_id = ?`, policyID); err != nil {
+		return err
+	}
+
+	for index, entry := range entries {
+		if _, err := tx.Exec(`
+			INSERT INTO priority_policy_entries (policy_id, entry, position)
+			VALUES (?, ?, ?)
+		`, policyID, entry, index); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func replacePriorityPolicyTargetsTx(tx *sql.Tx, policyID string, targets []PriorityTarget) error {
+	if _, err := tx.Exec(`DELETE FROM priority_policy_targets WHERE policy_id = ?`, policyID); err != nil {
+		return err
+	}
+
+	for index, target := range targets {
+		if _, err := tx.Exec(`
+			INSERT INTO priority_policy_targets (policy_id, location, position)
+			VALUES (?, ?, ?)
+		`, policyID, target.Location, index); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func replacePriorityPolicyScheduleTx(tx *sql.Tx, policyID string, schedule []PriorityScheduleWindow) error {
+	if _, err := tx.Exec(`DELETE FROM priority_policy_schedule WHERE policy_id = ?`, policyID); err != nil {
+		return err
+	}
+
+	for index, window := range schedule {
+		if _, err := tx.Exec(`
+			INSERT INTO priority_policy_schedule (policy_id, start_time, end_time, location, position)
+			VALUES (?, ?, ?, ?, ?)
+		`, policyID, window.Start, window.End, window.Location, index); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func saveMetaTx(tx *sql.Tx, key string, value string) error {
 	_, err := tx.Exec(`
 		INSERT INTO app_meta (key, value)
@@ -608,6 +746,47 @@ func (m *Manager) loadUnlocked() (State, error) {
 
 	for index := range state.Rules {
 		state.Rules[index].Domains, err = loadRuleDomains(m.db, state.Rules[index].ID)
+		if err != nil {
+			return State{}, err
+		}
+	}
+
+	policyRows, err := m.db.Query(`
+		SELECT id, provider_id, name, enabled
+		FROM priority_policies
+		ORDER BY position ASC, rowid ASC
+	`)
+	if err != nil {
+		return State{}, err
+	}
+	defer policyRows.Close()
+
+	for policyRows.Next() {
+		var policy PriorityPolicy
+		var enabled int
+		if err := policyRows.Scan(&policy.ID, &policy.ProviderID, &policy.Name, &enabled); err != nil {
+			return State{}, err
+		}
+		policy.Enabled = intToBool(enabled)
+		state.PriorityPolicies = append(state.PriorityPolicies, policy)
+	}
+	if err := policyRows.Err(); err != nil {
+		return State{}, err
+	}
+	if err := policyRows.Close(); err != nil {
+		return State{}, err
+	}
+
+	for index := range state.PriorityPolicies {
+		state.PriorityPolicies[index].Entries, err = loadPriorityPolicyEntries(m.db, state.PriorityPolicies[index].ID)
+		if err != nil {
+			return State{}, err
+		}
+		state.PriorityPolicies[index].Targets, err = loadPriorityPolicyTargets(m.db, state.PriorityPolicies[index].ID)
+		if err != nil {
+			return State{}, err
+		}
+		state.PriorityPolicies[index].Schedule, err = loadPriorityPolicySchedule(m.db, state.PriorityPolicies[index].ID)
 		if err != nil {
 			return State{}, err
 		}
@@ -718,9 +897,91 @@ func loadRuleDomains(db *sql.DB, ruleID string) ([]string, error) {
 	return domains, nil
 }
 
+func loadPriorityPolicyEntries(db *sql.DB, policyID string) ([]string, error) {
+	rows, err := db.Query(`
+		SELECT entry
+		FROM priority_policy_entries
+		WHERE policy_id = ?
+		ORDER BY position ASC, entry ASC
+	`, policyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	entries := make([]string, 0, 8)
+	for rows.Next() {
+		var entry string
+		if err := rows.Scan(&entry); err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return entries, nil
+}
+
+func loadPriorityPolicyTargets(db *sql.DB, policyID string) ([]PriorityTarget, error) {
+	rows, err := db.Query(`
+		SELECT location
+		FROM priority_policy_targets
+		WHERE policy_id = ?
+		ORDER BY position ASC, location ASC
+	`, policyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	targets := make([]PriorityTarget, 0, 4)
+	for rows.Next() {
+		var target PriorityTarget
+		if err := rows.Scan(&target.Location); err != nil {
+			return nil, err
+		}
+		targets = append(targets, target)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return targets, nil
+}
+
+func loadPriorityPolicySchedule(db *sql.DB, policyID string) ([]PriorityScheduleWindow, error) {
+	rows, err := db.Query(`
+		SELECT start_time, end_time, location
+		FROM priority_policy_schedule
+		WHERE policy_id = ?
+		ORDER BY position ASC, rowid ASC
+	`, policyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	schedule := make([]PriorityScheduleWindow, 0, 4)
+	for rows.Next() {
+		var window PriorityScheduleWindow
+		if err := rows.Scan(&window.Start, &window.End, &window.Location); err != nil {
+			return nil, err
+		}
+		schedule = append(schedule, window)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return schedule, nil
+}
+
 func normalize(state State) State {
 	state.Providers = normalizeProviders(state.Providers)
 	state.Rules = normalizeRules(state.Rules)
+	state.PriorityPolicies = normalizePriorityPolicies(state.PriorityPolicies)
 	state.Routing = normalizeRoutingSettings(state.Routing)
 	state.Automation = normalizeAutomationSettings(state.Automation)
 	state.LastAppliedAt = strings.TrimSpace(state.LastAppliedAt)
@@ -768,6 +1029,57 @@ func normalizeRules(rules []Rule) []Rule {
 		}
 
 		out = append(out, rule)
+	}
+	return out
+}
+
+func normalizePriorityPolicies(policies []PriorityPolicy) []PriorityPolicy {
+	out := make([]PriorityPolicy, 0, len(policies))
+	for _, policy := range policies {
+		policy.ID = strings.TrimSpace(policy.ID)
+		policy.ProviderID = strings.TrimSpace(policy.ProviderID)
+		policy.Name = strings.TrimSpace(policy.Name)
+		policy.Entries = normalizeDomains(policy.Entries)
+		policy.Targets = normalizePriorityTargets(policy.Targets)
+		policy.Schedule = normalizePrioritySchedule(policy.Schedule)
+
+		if policy.ID == "" || policy.ProviderID == "" || policy.Name == "" {
+			continue
+		}
+
+		out = append(out, policy)
+	}
+	return out
+}
+
+func normalizePriorityTargets(targets []PriorityTarget) []PriorityTarget {
+	out := make([]PriorityTarget, 0, len(targets))
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		target.Location = strings.TrimSpace(target.Location)
+		if target.Location == "" {
+			continue
+		}
+		key := strings.ToLower(target.Location)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, target)
+	}
+	return out
+}
+
+func normalizePrioritySchedule(schedule []PriorityScheduleWindow) []PriorityScheduleWindow {
+	out := make([]PriorityScheduleWindow, 0, len(schedule))
+	for _, window := range schedule {
+		window.Start = strings.TrimSpace(window.Start)
+		window.End = strings.TrimSpace(window.End)
+		window.Location = strings.TrimSpace(window.Location)
+		if window.Start == "" || window.End == "" || window.Location == "" {
+			continue
+		}
+		out = append(out, window)
 	}
 	return out
 }
@@ -869,7 +1181,7 @@ func normalizeAutomationSettings(settings AutomationSettings) AutomationSettings
 
 	settings.FailoverAllDownMode = strings.ToLower(strings.TrimSpace(settings.FailoverAllDownMode))
 	switch settings.FailoverAllDownMode {
-	case "direct", "keep":
+	case "keep":
 	default:
 		settings.FailoverAllDownMode = defaults.FailoverAllDownMode
 	}

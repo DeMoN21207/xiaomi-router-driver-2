@@ -22,6 +22,17 @@ func TestManagerRoundTripSQLite(t *testing.T) {
 		Rules: []Rule{
 			{ID: "rule_1", Name: "OpenAI", ProviderID: "provider_1", SelectedLocation: "USA", Domains: []string{"OpenAI.com", "chatgpt.com"}, Enabled: true},
 		},
+		PriorityPolicies: []PriorityPolicy{
+			{
+				ID:         "policy_1",
+				Name:       "Priority",
+				ProviderID: "provider_1",
+				Enabled:    true,
+				Entries:    []string{"Telegram.org", "149.154.160.0/20"},
+				Targets:    []PriorityTarget{{Location: "Germany"}, {Location: "Netherlands"}},
+				Schedule:   []PriorityScheduleWindow{{Start: "09:00", End: "18:00", Location: "Germany"}},
+			},
+		},
 		Routing: RoutingSettings{
 			VPNGateway:        "10.8.0.1",
 			VPNRouteMode:      "gateway",
@@ -54,6 +65,18 @@ func TestManagerRoundTripSQLite(t *testing.T) {
 	if len(loaded.Rules) != 1 || len(loaded.Rules[0].Domains) != 2 {
 		t.Fatalf("unexpected rules: %+v", loaded.Rules)
 	}
+	if len(loaded.PriorityPolicies) != 1 {
+		t.Fatalf("unexpected priority policies: %+v", loaded.PriorityPolicies)
+	}
+	if loaded.PriorityPolicies[0].Entries[0] != "telegram.org" {
+		t.Fatalf("expected normalized priority entries, got %+v", loaded.PriorityPolicies[0].Entries)
+	}
+	if got := loaded.PriorityPolicies[0].Targets[1].Location; got != "Netherlands" {
+		t.Fatalf("expected target order to survive, got %+v", loaded.PriorityPolicies[0].Targets)
+	}
+	if got := loaded.PriorityPolicies[0].Schedule[0].Start; got != "09:00" {
+		t.Fatalf("expected schedule to survive, got %+v", loaded.PriorityPolicies[0].Schedule)
+	}
 	if loaded.Rules[0].Domains[0] != "openai.com" {
 		t.Fatalf("expected normalized domains, got %+v", loaded.Rules[0].Domains)
 	}
@@ -74,6 +97,13 @@ func TestDefaultAutomationSettingsTrafficCleanup(t *testing.T) {
 	}
 	if got := DefaultAutomationSettings().FailoverAllDownMode; got != "keep" {
 		t.Fatalf("expected default all-down mode keep, got %q", got)
+	}
+}
+
+func TestNormalizeAutomationSettingsDoesNotAllowDirectAllDownMode(t *testing.T) {
+	state := normalize(State{Automation: AutomationSettings{FailoverAllDownMode: "direct"}})
+	if got := state.Automation.FailoverAllDownMode; got != "keep" {
+		t.Fatalf("expected direct all-down mode to normalize to keep, got %q", got)
 	}
 }
 

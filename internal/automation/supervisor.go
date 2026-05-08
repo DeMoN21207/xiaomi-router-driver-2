@@ -31,6 +31,8 @@ type Supervisor struct {
 	lastCleanup time.Time
 	failoverMu  sync.RWMutex
 	failover    failoverRuntime
+	priorityMu  sync.RWMutex
+	priority    priorityRuntime
 }
 
 func NewSupervisor(
@@ -57,6 +59,7 @@ func NewSupervisor(
 		recordEvent: recordEvent,
 		interval:    interval,
 		failover:    newFailoverRuntime(),
+		priority:    newPriorityRuntime(),
 	}
 }
 
@@ -130,7 +133,12 @@ func (s *Supervisor) tick(ctx context.Context) {
 		return
 	}
 
-	if snapshot.WAN.State == "up" && state.Automation.ProviderFailover && s.maybeProviderFailover(ctx, state, snapshot) {
+	if snapshot.WAN.State == "up" && s.maybePriorityPolicies(ctx, state, snapshot) {
+		return
+	}
+
+	priorityState := s.priorityAppliedState(state)
+	if snapshot.WAN.State == "up" && state.Automation.ProviderFailover && s.maybeProviderFailover(ctx, priorityState, snapshot) {
 		return
 	}
 
@@ -138,7 +146,7 @@ func (s *Supervisor) tick(ctx context.Context) {
 		return
 	}
 
-	runtimeState := s.failoverAppliedState(state)
+	runtimeState := s.failoverAppliedState(priorityState)
 	if previousWAN != "up" && snapshot.WAN.State == "up" {
 		if err := s.applyStateRespectingFailover(ctx, state); err != nil {
 			s.record("error", "automation.reconcile_failed", fmt.Sprintf("WAN recovery failed: %v", err))
@@ -268,6 +276,15 @@ func hasEnabledRules(state config.State) bool {
 		}
 		provider, exists := providersByID[rule.ProviderID]
 		if exists && provider.Enabled {
+			return true
+		}
+	}
+	for _, policy := range state.PriorityPolicies {
+		if !policy.Enabled || len(policy.Targets) == 0 {
+			continue
+		}
+		provider, exists := providersByID[policy.ProviderID]
+		if exists && provider.Enabled && provider.Type == config.ProviderTypeSubscription {
 			return true
 		}
 	}

@@ -225,16 +225,22 @@ export default function DashboardPage() {
             {events.length === 0 ? (
               <p className="py-6 text-center text-sm text-on-surface-variant">{t("dashboard.noEvents")}</p>
             ) : (
-              events.map((event) => (
-                <div key={event.id} className="rounded-lg border border-outline-variant/10 bg-surface-container-high p-4">
-                  <div className="mb-2 flex items-center justify-between">
-                    <span className={`rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest ${levelBadge(event.level)}`}>{levelLabel(event.level, t)}</span>
-                    <span className="font-mono text-[10px] text-outline">{formatDate(event.occurredAt)}</span>
+              events.map((event) => {
+                const help = eventHelpText(event.kind, t);
+                return (
+                  <div key={event.id} className="rounded-lg border border-outline-variant/10 bg-surface-container-high p-4">
+                    <div className="mb-2 flex items-center justify-between">
+                      <span className={`rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest ${levelBadge(event.level)}`}>{levelLabel(event.level, t)}</span>
+                      <span className="font-mono text-[10px] text-outline">{formatDate(event.occurredAt)}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm font-medium text-on-surface">{eventKindLabel(event.kind, t)}</p>
+                      {help ? <EventHelp text={help} label={t("events.help")} compact /> : null}
+                    </div>
+                    <p className="mt-1 text-xs text-on-surface-variant">{event.message}</p>
                   </div>
-                  <p className="text-sm font-medium text-on-surface">{t(`kind.${event.kind}`) || event.kind}</p>
-                  <p className="mt-1 text-xs text-on-surface-variant">{event.message}</p>
-                </div>
-              ))
+                );
+              })
             )}
           </div>
         </div>
@@ -828,6 +834,36 @@ function HealthItem({ label, value, ok }) {
       <span className="text-sm text-on-surface-variant">{label}</span>
       <span className={`text-sm font-medium ${ok === true ? "text-secondary" : ok === false ? "text-error" : "text-on-surface"}`}>{value}</span>
     </div>
+  );
+}
+
+function eventKindLabel(kind, t) {
+  const key = `kind.${kind}`;
+  const label = t(key);
+  return label === key ? kind : label;
+}
+
+function eventHelpText(kind, t) {
+  const key = `help.${kind}`;
+  const help = t(key);
+  return help === key ? "" : help;
+}
+
+function EventHelp({ text, label, compact = false }) {
+  return (
+    <span className="group relative inline-flex">
+      <button
+        type="button"
+        title={text}
+        aria-label={label}
+        className={`${compact ? "h-5 w-5" : "h-6 w-6"} inline-flex items-center justify-center rounded-full border border-outline-variant/20 bg-surface-container-highest text-outline transition-colors hover:border-primary/30 hover:text-primary`}
+      >
+        <Icon name="help_outline" className={compact ? "h-3.5 w-3.5" : "h-4 w-4"} />
+      </button>
+      <span className="pointer-events-none absolute left-1/2 top-full z-40 mt-2 hidden w-72 -translate-x-1/2 rounded-lg border border-outline-variant/20 bg-surface-container-highest px-3 py-2 text-xs font-normal leading-relaxed text-on-surface shadow-xl group-hover:block">
+        {text}
+      </span>
+    </span>
   );
 }
 

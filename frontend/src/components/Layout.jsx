@@ -8,7 +8,6 @@ const navItems = [
   { to: "/", icon: "dashboard", labelKey: "nav.dashboard" },
   { to: "/connections", icon: "vpn_lock", labelKey: "nav.connections" },
   { to: "/traffic", icon: "bar_chart", labelKey: "nav.traffic" },
-  { to: "/blacklist", icon: "block", labelKey: "nav.blacklist" },
   { to: "/events", icon: "history", labelKey: "nav.events" },
   { to: "/settings", icon: "settings", labelKey: "nav.settings" },
 ];
@@ -17,7 +16,6 @@ const subtitleKeys = {
   "/": "topbar.management",
   "/connections": "topbar.connections",
   "/traffic": "topbar.traffic",
-  "/blacklist": "topbar.blacklist",
   "/events": "topbar.events",
   "/settings": "topbar.settings",
 };

@@ -76,6 +76,7 @@ func (r *Runner) RunWithOptions(ctx context.Context, action string, options RunO
 		"PRIME_MAX_DOMAINS":         strconv.Itoa(resolveIntEnvWithFallback(loadProfile.PrimeMaxDomains, "VPN_MANAGER_PRIME_MAX_DOMAINS", "PRIME_MAX_DOMAINS")),
 		"IPSET_TIMEOUT":             strconv.Itoa(resolveIntEnvWithFallback(loadProfile.IPSetTimeout, "VPN_MANAGER_IPSET_TIMEOUT", "IPSET_TIMEOUT")),
 		"IPSET_FLUSH_ON_SYNC":       boolToScriptValue(resolveBoolEnvWithFallback(loadProfile.IPSetFlushOnSync, "VPN_MANAGER_IPSET_FLUSH_ON_SYNC", "IPSET_FLUSH_ON_SYNC")),
+		"CONNTRACK_FLUSH_ON_APPLY":  boolToScriptValue(resolveBoolEnvWithFallback(loadProfile.ConntrackFlushOnApply, "VPN_MANAGER_CONNTRACK_FLUSH_ON_APPLY", "CONNTRACK_FLUSH_ON_APPLY")),
 		"VPN_GATEWAY":               options.Settings.VPNGateway,
 		"VPN_ROUTE_MODE":            options.Settings.VPNRouteMode,
 		"VPN_MASQUERADE":            boolToScriptValue(options.Settings.VPNMasquerade),
