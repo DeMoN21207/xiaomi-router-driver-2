@@ -196,7 +196,7 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 	trafficRoutes := buildTrafficRoutes(state, openvpnRuntime, subscriptionRuntime, domainsByProvider)
 	openvpnRuntimeByProvider := indexOpenVPNRuntimeByProvider(openvpnRuntime)
 	subscriptionRuntimeByKey := indexSubscriptionRuntimeByKey(subscriptionRuntime)
-	expectedSubscriptionKeys := expectedSubscriptionKeysByProvider(state)
+	expectedSubscriptionKeys := expectedSubscriptionKeysByProvider(state, subscriptionRuntime)
 
 	for _, provider := range state.Providers {
 		runtime := ProviderRuntime{
@@ -560,7 +560,7 @@ func indexSubscriptionRuntimeByKey(snapshots []subscription.RuntimeSnapshot) map
 	return index
 }
 
-func expectedSubscriptionKeysByProvider(state config.State) map[string][]string {
+func expectedSubscriptionKeysByProvider(state config.State, runtimeSnapshots []subscription.RuntimeSnapshot) map[string][]string {
 	providersByID := make(map[string]config.Provider, len(state.Providers))
 	for _, provider := range state.Providers {
 		providersByID[provider.ID] = provider
@@ -568,8 +568,12 @@ func expectedSubscriptionKeysByProvider(state config.State) map[string][]string 
 
 	byProvider := make(map[string][]string)
 	seen := make(map[string]map[string]struct{})
+	priorityProviders := subscriptionPriorityProviders(state, providersByID)
 	for _, rule := range state.Rules {
 		if !rule.Enabled {
+			continue
+		}
+		if _, controlled := priorityProviders[rule.ProviderID]; controlled {
 			continue
 		}
 
@@ -586,18 +590,148 @@ func expectedSubscriptionKeysByProvider(state config.State) map[string][]string 
 			continue
 		}
 
-		key := provider.ID + "::" + strings.ToLower(location)
-		if seen[provider.ID] == nil {
-			seen[provider.ID] = make(map[string]struct{})
-		}
-		if _, exists := seen[provider.ID][key]; exists {
+		addSubscriptionKey(byProvider, seen, provider.ID, location)
+	}
+
+	for _, policy := range state.PriorityPolicies {
+		provider, exists := providersByID[policy.ProviderID]
+		if !exists || !priorityPolicyControlsSubscriptionProvider(state, policy, provider) {
 			continue
 		}
-		seen[provider.ID][key] = struct{}{}
-		byProvider[provider.ID] = append(byProvider[provider.ID], key)
+		targets := priorityPolicyTargetSet(policy)
+		addedRuntime := false
+		for _, snapshot := range runtimeSnapshots {
+			if snapshot.ProviderID != provider.ID {
+				continue
+			}
+			if _, ok := targets[strings.ToLower(strings.TrimSpace(snapshot.Location))]; !ok {
+				continue
+			}
+			addSubscriptionKey(byProvider, seen, provider.ID, snapshot.Location)
+			addedRuntime = true
+		}
+		if addedRuntime {
+			continue
+		}
+		addSubscriptionKey(byProvider, seen, provider.ID, preferredPriorityPolicyLocation(policy, time.Now()))
 	}
 
 	return byProvider
+}
+
+func addSubscriptionKey(byProvider map[string][]string, seen map[string]map[string]struct{}, providerID string, location string) {
+	providerID = strings.TrimSpace(providerID)
+	location = strings.TrimSpace(location)
+	if providerID == "" || location == "" {
+		return
+	}
+
+	key := providerID + "::" + strings.ToLower(location)
+	if seen[providerID] == nil {
+		seen[providerID] = make(map[string]struct{})
+	}
+	if _, exists := seen[providerID][key]; exists {
+		return
+	}
+	seen[providerID][key] = struct{}{}
+	byProvider[providerID] = append(byProvider[providerID], key)
+}
+
+func subscriptionPriorityProviders(state config.State, providersByID map[string]config.Provider) map[string]struct{} {
+	controlled := make(map[string]struct{})
+	for _, policy := range state.PriorityPolicies {
+		provider, exists := providersByID[policy.ProviderID]
+		if !exists || !priorityPolicyControlsSubscriptionProvider(state, policy, provider) {
+			continue
+		}
+		controlled[policy.ProviderID] = struct{}{}
+	}
+	return controlled
+}
+
+func priorityPolicyControlsSubscriptionProvider(state config.State, policy config.PriorityPolicy, provider config.Provider) bool {
+	if !policy.Enabled || len(policy.Targets) == 0 {
+		return false
+	}
+	if !provider.Enabled || provider.Type != config.ProviderTypeSubscription {
+		return false
+	}
+	return providerHasRoutedDomains(state, provider.ID)
+}
+
+func providerHasRoutedDomains(state config.State, providerID string) bool {
+	for _, rule := range state.Rules {
+		if rule.Enabled && rule.ProviderID == providerID && ruleHasDomains(rule) {
+			return true
+		}
+	}
+	return false
+}
+
+func priorityPolicyTargetSet(policy config.PriorityPolicy) map[string]struct{} {
+	targets := make(map[string]struct{}, len(policy.Targets))
+	for _, target := range policy.Targets {
+		location := strings.ToLower(strings.TrimSpace(target.Location))
+		if location != "" {
+			targets[location] = struct{}{}
+		}
+	}
+	return targets
+}
+
+func preferredPriorityPolicyLocation(policy config.PriorityPolicy, now time.Time) string {
+	minute := now.Hour()*60 + now.Minute()
+	for _, window := range policy.Schedule {
+		start, okStart := parsePriorityPolicyClock(window.Start)
+		end, okEnd := parsePriorityPolicyClock(window.End)
+		if !okStart || !okEnd || start == end {
+			continue
+		}
+		if priorityPolicyWindowContains(start, end, minute) {
+			return strings.TrimSpace(window.Location)
+		}
+	}
+	for _, target := range policy.Targets {
+		if location := strings.TrimSpace(target.Location); location != "" {
+			return location
+		}
+	}
+	return ""
+}
+
+func parsePriorityPolicyClock(value string) (int, bool) {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) != 2 {
+		return 0, false
+	}
+	hour, okHour := parseClockPart(parts[0], 0, 23)
+	minute, okMinute := parseClockPart(parts[1], 0, 59)
+	if !okHour || !okMinute {
+		return 0, false
+	}
+	return hour*60 + minute, true
+}
+
+func parseClockPart(value string, min int, max int) (int, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	n := 0
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n, n >= min && n <= max
+}
+
+func priorityPolicyWindowContains(start int, end int, minute int) bool {
+	if start < end {
+		return minute >= start && minute < end
+	}
+	return minute >= start || minute < end
 }
 
 func readInterfaceTraffic(interfaceName string) (uint64, uint64) {

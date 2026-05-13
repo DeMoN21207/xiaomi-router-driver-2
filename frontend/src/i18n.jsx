@@ -1338,6 +1338,49 @@ Object.assign(translations.en, {
   "connections.priorityOverrideCleared": "Manual selection cleared",
 });
 
+Object.assign(translations.ru, {
+  "settings.updates": "Обновления",
+  "settings.updateStatus": "Статус обновления",
+  "settings.updateRepository": "GitHub repository",
+  "settings.updateAsset": "Release asset",
+  "settings.updateInstalled": "Установлено",
+  "settings.updateLatest": "Доступно",
+  "settings.updateCheck": "Проверить обновление",
+  "settings.updateChecking": "Проверяю...",
+  "settings.updateInstall": "Установить обновление",
+  "settings.updateInstalling": "Устанавливаю...",
+  "settings.updateUpload": "Загрузить архив",
+  "settings.updateUploading": "Загружаю...",
+  "settings.updateChecked": "Проверка завершена",
+  "settings.updateRestarting": "Обновление установлено, сервис перезапускается",
+  "settings.updateInstallConfirm": "Установить обновление и перезапустить сервис?",
+  "settings.updateUploadConfirm": "Загрузить архив, установить обновление и перезапустить сервис?",
+  "settings.updateUnsupported": "Установка недоступна",
+  "settings.updateUnsupportedHint": "Установка обновлений поддерживается только на Linux/OpenWrt роутере.",
+  "error.update": "Ошибка обновления",
+});
+
+Object.assign(translations.en, {
+  "settings.updates": "Updates",
+  "settings.updateStatus": "Update status",
+  "settings.updateRepository": "GitHub repository",
+  "settings.updateAsset": "Release asset",
+  "settings.updateInstalled": "Installed",
+  "settings.updateLatest": "Available",
+  "settings.updateCheck": "Check update",
+  "settings.updateChecking": "Checking...",
+  "settings.updateInstall": "Install update",
+  "settings.updateInstalling": "Installing...",
+  "settings.updateUpload": "Upload archive",
+  "settings.updateUploading": "Uploading...",
+  "settings.updateChecked": "Update check completed",
+  "settings.updateRestarting": "Update installed, service is restarting",
+  "settings.updateInstallConfirm": "Install the update and restart the service?",
+  "settings.updateUploadConfirm": "Upload this archive, install the update, and restart the service?",
+  "settings.updateUnsupported": "Install unavailable",
+  "settings.updateUnsupportedHint": "Installing updates is supported only on the Linux/OpenWrt router.",
+  "error.update": "Update error",
+});
 
 export const languages = [
   { code: "ru", label: "Русский" },

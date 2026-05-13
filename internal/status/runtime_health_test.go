@@ -89,7 +89,7 @@ func TestProviderHealthIgnoresSubscriptionRulesWithoutDomains(t *testing.T) {
 		},
 	}
 
-	subscriptionKeys := expectedSubscriptionKeysByProvider(state)
+	subscriptionKeys := expectedSubscriptionKeysByProvider(state, nil)
 	if len(subscriptionKeys[provider.ID]) != 0 {
 		t.Fatalf("expected no runtime keys for empty-domain rule, got %+v", subscriptionKeys[provider.ID])
 	}
@@ -100,5 +100,58 @@ func TestProviderHealthIgnoresSubscriptionRulesWithoutDomains(t *testing.T) {
 	}
 	if detail != "subscription provider has no active locations yet" {
 		t.Fatalf("providerHealth() detail = %q, want subscription draft warning", detail)
+	}
+}
+
+func TestProviderHealthUsesPriorityPolicyRuntimeLocation(t *testing.T) {
+	provider := config.Provider{
+		ID:      "provider-sub",
+		Name:    "FizzVPN Subscription",
+		Type:    config.ProviderTypeSubscription,
+		Enabled: true,
+		Source:  "https://provider.example/sub",
+	}
+	state := config.State{
+		Providers: []config.Provider{provider},
+		Rules: []config.Rule{
+			{
+				ID:               "rule-primary",
+				Name:             "FizzVPN route",
+				ProviderID:       provider.ID,
+				SelectedLocation: "NL #1",
+				Domains:          []string{"example.com"},
+				Enabled:          true,
+			},
+		},
+		PriorityPolicies: []config.PriorityPolicy{
+			{
+				ID:         "policy-priority",
+				Name:       "FizzVPN priority",
+				ProviderID: provider.ID,
+				Enabled:    true,
+				Targets: []config.PriorityTarget{
+					{Location: "NL #2"},
+					{Location: "Germany #1"},
+				},
+			},
+		},
+	}
+	runtime := []subscription.RuntimeSnapshot{
+		{
+			Key:        "provider-sub::nl #2",
+			ProviderID: provider.ID,
+			Location:   "NL #2",
+			Status:     "running",
+		},
+	}
+
+	subscriptionKeys := expectedSubscriptionKeysByProvider(state, runtime)
+	if got := subscriptionKeys[provider.ID]; len(got) != 1 || got[0] != "provider-sub::nl #2" {
+		t.Fatalf("expected priority runtime key, got %+v", got)
+	}
+
+	health, detail := providerHealth(provider, true, 1, nil, subscriptionKeys[provider.ID], indexSubscriptionRuntimeByKey(runtime))
+	if health != "ready" {
+		t.Fatalf("providerHealth() health = %q detail = %q, want ready", health, detail)
 	}
 }

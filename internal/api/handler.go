@@ -31,6 +31,7 @@ import (
 	"xiomi-router-driver/internal/routing"
 	"xiomi-router-driver/internal/status"
 	"xiomi-router-driver/internal/subscription"
+	"xiomi-router-driver/internal/update"
 )
 
 type Dependencies struct {
@@ -42,6 +43,7 @@ type Dependencies struct {
 	OpenVPN               *openvpn.Manager
 	Subscriptions         *subscription.Manager
 	Status                *status.Service
+	Update                *update.Manager
 	FailoverStatus        func() automation.FailoverStatus
 	PriorityStatus        func() automation.PriorityStatus
 	SetPriorityOverride   func(policyID string, location string) error
@@ -59,6 +61,7 @@ type Handler struct {
 	openvpn               *openvpn.Manager
 	subscriptions         *subscription.Manager
 	status                *status.Service
+	update                *update.Manager
 	failoverStatus        func() automation.FailoverStatus
 	priorityStatus        func() automation.PriorityStatus
 	setPriorityOverride   func(policyID string, location string) error
@@ -116,6 +119,7 @@ func NewHandler(deps Dependencies) *Handler {
 		openvpn:               deps.OpenVPN,
 		subscriptions:         deps.Subscriptions,
 		status:                deps.Status,
+		update:                deps.Update,
 		failoverStatus:        deps.FailoverStatus,
 		priorityStatus:        deps.PriorityStatus,
 		setPriorityOverride:   deps.SetPriorityOverride,
@@ -153,6 +157,11 @@ func NewHandler(deps Dependencies) *Handler {
 	mux.HandleFunc("/api/domains", handler.handleDomainsPreview)
 	mux.HandleFunc("/api/system/resources", handler.handleSystemResources)
 	mux.HandleFunc("/api/system/reboot", handler.handleReboot)
+	mux.HandleFunc("/api/system/update", handler.handleSystemUpdate)
+	mux.HandleFunc("/api/system/update/settings", handler.handleSystemUpdateSettings)
+	mux.HandleFunc("/api/system/update/check", handler.handleSystemUpdateCheck)
+	mux.HandleFunc("/api/system/update/install", handler.handleSystemUpdateInstall)
+	mux.HandleFunc("/api/system/update/upload", handler.handleSystemUpdateUpload)
 	handler.router = mux
 	return handler
 }
@@ -277,6 +286,112 @@ func (h *Handler) handleReboot(w http.ResponseWriter, r *http.Request) {
 			log.Printf("reboot command failed: %v", err)
 		}
 	}()
+}
+
+func (h *Handler) handleSystemUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	if h.update == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("update manager is not configured"))
+		return
+	}
+
+	status, err := h.update.Status(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (h *Handler) handleSystemUpdateSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		writeMethodNotAllowed(w, http.MethodPut)
+		return
+	}
+	if h.update == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("update manager is not configured"))
+		return
+	}
+
+	var settings config.UpdateSettings
+	if err := decodeJSON(r, &settings); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	status, err := h.update.SaveSettings(r.Context(), settings)
+	if err != nil {
+		writeUpdateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (h *Handler) handleSystemUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if h.update == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("update manager is not configured"))
+		return
+	}
+
+	status, err := h.update.Check(r.Context())
+	if err != nil {
+		writeUpdateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (h *Handler) handleSystemUpdateInstall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if h.update == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("update manager is not configured"))
+		return
+	}
+
+	result, err := h.update.InstallLatest(r.Context())
+	if err != nil {
+		writeUpdateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) handleSystemUpdateUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if h.update == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("update manager is not configured"))
+		return
+	}
+
+	if err := r.ParseMultipartForm(128 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	file, header, err := r.FormFile("archive")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("archive file is required"))
+		return
+	}
+	defer file.Close()
+
+	result, err := h.update.InstallUploaded(r.Context(), file, header.Filename)
+	if err != nil {
+		writeUpdateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (h *Handler) handleTrafficHistory(w http.ResponseWriter, r *http.Request) {
@@ -2328,6 +2443,19 @@ func writeError(w http.ResponseWriter, statusCode int, err error) {
 	writeJSON(w, statusCode, map[string]string{
 		"error": err.Error(),
 	})
+}
+
+func writeUpdateError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, update.ErrOperationInProgress):
+		writeError(w, http.StatusConflict, err)
+	case errors.Is(err, update.ErrUnsupportedRuntime):
+		writeError(w, http.StatusServiceUnavailable, err)
+	case errors.Is(err, update.ErrInvalidBundle), errors.Is(err, update.ErrReleaseAssetNotFound):
+		writeError(w, http.StatusBadRequest, err)
+	default:
+		writeError(w, http.StatusInternalServerError, err)
+	}
 }
 
 func writeMethodNotAllowed(w http.ResponseWriter, methods ...string) {

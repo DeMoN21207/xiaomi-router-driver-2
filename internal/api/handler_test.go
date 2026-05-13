@@ -1,10 +1,14 @@
 package api
 
 import (
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"xiomi-router-driver/internal/config"
+	"xiomi-router-driver/internal/update"
 )
 
 func TestValidateRuleEntriesRejectsDuplicateAcrossActiveProviders(t *testing.T) {
@@ -25,6 +29,77 @@ func TestValidateRuleEntriesRejectsDuplicateAcrossActiveProviders(t *testing.T) 
 		if !strings.Contains(err.Error(), fragment) {
 			t.Fatalf("validateRuleEntries() error = %q, want fragment %q", err.Error(), fragment)
 		}
+	}
+}
+
+func TestUpdateStatusEndpoint(t *testing.T) {
+	tempDir := t.TempDir()
+	db := openAPITestDB(t, tempDir+"/vpn-manager.db")
+	stateManager := config.NewManager(db, tempDir+"/vpn-state.json")
+	updateManager := update.NewManager(update.Options{
+		AppDir:  tempDir,
+		DataDir: tempDir + "/data",
+		State:   stateManager,
+		Restart: func() {},
+	})
+	handler := NewHandler(Dependencies{
+		State:   stateManager,
+		Update:  updateManager,
+		DataDir: tempDir + "/data",
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/system/update", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ServeHTTP() status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"repository":"DeMoN21207/xiaomi-router-driver-2"`) {
+		t.Fatalf("expected default update repository in response, got %s", rec.Body.String())
+	}
+}
+
+func TestUpdateUploadRejectsNonLinux(t *testing.T) {
+	tempDir := t.TempDir()
+	db := openAPITestDB(t, tempDir+"/vpn-manager.db")
+	stateManager := config.NewManager(db, tempDir+"/vpn-state.json")
+	updateManager := update.NewManager(update.Options{
+		AppDir:    tempDir,
+		DataDir:   tempDir + "/data",
+		State:     stateManager,
+		RuntimeOS: "darwin",
+		Restart:   func() {},
+	})
+	handler := NewHandler(Dependencies{
+		State:   stateManager,
+		Update:  updateManager,
+		DataDir: tempDir + "/data",
+	})
+
+	body := &strings.Builder{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("archive", "bundle.tar.gz")
+	if err != nil {
+		t.Fatalf("CreateFormFile() error = %v", err)
+	}
+	if _, err := part.Write([]byte("not an archive")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/system/update/upload", strings.NewReader(body.String()))
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("ServeHTTP() status = %d, want %d, body=%s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Linux") {
+		t.Fatalf("expected Linux unsupported message, got %s", rec.Body.String())
 	}
 }
 

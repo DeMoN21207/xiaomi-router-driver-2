@@ -20,6 +20,11 @@ const DEFAULT_AUTOMATION = {
   trafficCleanupDays: 14,
 };
 
+const DEFAULT_UPDATE_SETTINGS = {
+  repository: "DeMoN21207/xiaomi-router-driver-2",
+  assetPattern: "vpn-manager-linux-arm64.tar.gz",
+};
+
 export default function SettingsPage() {
   const { t, lang, setLang } = useI18n();
   const [status, setStatus] = useState(null);
@@ -34,6 +39,13 @@ export default function SettingsPage() {
   const [automationError, setAutomationError] = useState("");
   const [automationMessage, setAutomationMessage] = useState("");
   const [savingAutomation, setSavingAutomation] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState(null);
+  const [updateSettings, setUpdateSettings] = useState(DEFAULT_UPDATE_SETTINGS);
+  const [updateError, setUpdateError] = useState("");
+  const [updateMessage, setUpdateMessage] = useState("");
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [uploadingUpdate, setUploadingUpdate] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const [dashboardRefreshMs, setDashboardRefreshMs] = useState(() => readDashboardRefreshInterval());
@@ -45,15 +57,27 @@ export default function SettingsPage() {
     localStorage.setItem("theme", next ? "dark" : "light");
   };
 
+  const applyUpdateStatus = (nextUpdateStatus) => {
+    setUpdateStatus(nextUpdateStatus || null);
+    setUpdateSettings(nextUpdateStatus?.settings || DEFAULT_UPDATE_SETTINGS);
+  };
+
+  const refreshUpdateStatus = async () => {
+    const nextUpdateStatus = await fetchJSON("/api/system/update");
+    applyUpdateStatus(nextUpdateStatus);
+    return nextUpdateStatus;
+  };
+
   useEffect(() => {
     let active = true;
 
     const loadInitial = async () => {
       try {
-        const [nextStatus, nextConfig, nextDomainTraffic] = await Promise.all([
+        const [nextStatus, nextConfig, nextDomainTraffic, nextUpdateStatus] = await Promise.all([
           fetchJSON("/api/status"),
           fetchJSON("/api/config"),
           fetchJSON(TOP_ROUTING_DOMAINS_QUERY),
+          fetchJSON("/api/system/update"),
         ]);
         if (!active) return;
 
@@ -62,6 +86,7 @@ export default function SettingsPage() {
         setDomainTraffic(nextDomainTraffic || { domains: [], totalBytes: 0, updatedAt: "" });
         setRouting(nextConfig.routing || null);
         setAutomation(nextConfig.automation || DEFAULT_AUTOMATION);
+        applyUpdateStatus(nextUpdateStatus);
         setError("");
       } catch (err) {
         if (!active) return;
@@ -96,10 +121,11 @@ export default function SettingsPage() {
   const refreshAll = async () => {
     setRefreshing(true);
     try {
-      const [nextStatus, nextConfig, nextDomainTraffic] = await Promise.all([
+      const [nextStatus, nextConfig, nextDomainTraffic, nextUpdateStatus] = await Promise.all([
         fetchJSON("/api/status"),
         fetchJSON("/api/config"),
         fetchJSON(TOP_ROUTING_DOMAINS_QUERY),
+        fetchJSON("/api/system/update"),
       ]);
 
       setStatus(nextStatus);
@@ -107,6 +133,7 @@ export default function SettingsPage() {
       setDomainTraffic(nextDomainTraffic || { domains: [], totalBytes: 0, updatedAt: "" });
       setRouting(nextConfig.routing || null);
       setAutomation(nextConfig.automation || DEFAULT_AUTOMATION);
+      applyUpdateStatus(nextUpdateStatus);
       setError("");
     } catch (err) {
       setError(err.message);
@@ -135,6 +162,12 @@ export default function SettingsPage() {
     setAutomation((current) => ({ ...current, [field]: value }));
     setAutomationError("");
     setAutomationMessage("");
+  };
+
+  const updateUpdateField = (field, value) => {
+    setUpdateSettings((current) => ({ ...current, [field]: value }));
+    setUpdateError("");
+    setUpdateMessage("");
   };
 
   const saveRoutingSettings = async (event) => {
@@ -204,6 +237,87 @@ export default function SettingsPage() {
       setAutomationError(err.message);
     } finally {
       setSavingAutomation(false);
+    }
+  };
+
+  const saveUpdateSettings = async () => {
+    const saved = await fetchJSON("/api/system/update/settings", {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        repository: updateSettings.repository || DEFAULT_UPDATE_SETTINGS.repository,
+        assetPattern: updateSettings.assetPattern || DEFAULT_UPDATE_SETTINGS.assetPattern,
+      }),
+    });
+    applyUpdateStatus(saved);
+    return saved;
+  };
+
+  const checkForUpdates = async () => {
+    setCheckingUpdate(true);
+    setUpdateError("");
+    setUpdateMessage("");
+
+    try {
+      await saveUpdateSettings();
+      const checked = await fetchJSON("/api/system/update/check", { method: "POST" });
+      applyUpdateStatus(checked);
+      setUpdateMessage(t("settings.updateChecked"));
+    } catch (err) {
+      setUpdateError(err.message);
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const installLatestUpdate = async () => {
+    if (!window.confirm(t("settings.updateInstallConfirm"))) return;
+
+    setInstallingUpdate(true);
+    setUpdateError("");
+    setUpdateMessage("");
+
+    try {
+      await saveUpdateSettings();
+      await fetchJSON("/api/system/update/install", { method: "POST" });
+      setUpdateMessage(t("settings.updateRestarting"));
+      window.setTimeout(() => {
+        refreshUpdateStatus().catch(() => {});
+      }, 5000);
+    } catch (err) {
+      setUpdateError(err.message);
+    } finally {
+      setInstallingUpdate(false);
+    }
+  };
+
+  const uploadUpdateArchive = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!window.confirm(t("settings.updateUploadConfirm"))) return;
+
+    setUploadingUpdate(true);
+    setUpdateError("");
+    setUpdateMessage("");
+
+    try {
+      const body = new FormData();
+      body.append("archive", file);
+      await fetchJSON("/api/system/update/upload", {
+        method: "POST",
+        body,
+      });
+      setUpdateMessage(t("settings.updateRestarting"));
+      window.setTimeout(() => {
+        refreshUpdateStatus().catch(() => {});
+      }, 5000);
+    } catch (err) {
+      setUpdateError(err.message);
+    } finally {
+      setUploadingUpdate(false);
     }
   };
 
@@ -390,6 +504,81 @@ export default function SettingsPage() {
               <StatRow label={t("settings.totalDomains")} value={status?.domainsCount ?? 0} />
               <StatRow label={t("settings.lastApply")} value={formatDate(status?.lastAppliedAt || config?.lastAppliedAt) || t("common.notYet")} />
               <StatRow label={t("settings.lastUpdate")} value={formatDate(config?.updatedAt) || "-"} />
+            </div>
+          </Section>
+
+          <Section icon="cloud_sync" iconColor="text-primary" title={t("settings.updates")}>
+            <div className="space-y-4">
+              {updateError ? <InlineNotice tone="error" title={t("error.update")} message={updateError} /> : null}
+              {updateMessage ? <InlineNotice tone="info" title={t("settings.updateStatus")} message={updateMessage} /> : null}
+              {updateStatus && !updateStatus.supported ? (
+                <InlineNotice tone="info" title={t("settings.updateUnsupported")} message={t("settings.updateUnsupportedHint")} />
+              ) : null}
+
+              <div className="grid grid-cols-1 gap-4">
+                <TextInput
+                  label={t("settings.updateRepository")}
+                  value={updateSettings.repository || ""}
+                  onChange={(value) => updateUpdateField("repository", value)}
+                  placeholder={DEFAULT_UPDATE_SETTINGS.repository}
+                />
+                <TextInput
+                  label={t("settings.updateAsset")}
+                  value={updateSettings.assetPattern || ""}
+                  onChange={(value) => updateUpdateField("assetPattern", value)}
+                  placeholder={DEFAULT_UPDATE_SETTINGS.assetPattern}
+                />
+              </div>
+
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <RuntimeMeta label={t("settings.updateInstalled")} value={formatBundleTarget(updateStatus?.installed, t)} />
+                <RuntimeMeta label={t("settings.updateLatest")} value={formatReleaseCandidate(updateStatus?.latest, t)} />
+              </div>
+
+              {updateStatus?.latest ? (
+                <div className="rounded-lg bg-surface-container p-3">
+                  <p className="font-headline text-sm font-bold text-on-surface">{updateStatus.latest.assetName}</p>
+                  <p className="mt-1 text-xs text-on-surface-variant">
+                    {updateStatus.latest.tagName || "-"} · {formatBytes(updateStatus.latest.assetSize || 0)} · {formatDate(updateStatus.latest.publishedAt) || t("common.notYet")}
+                  </p>
+                </div>
+              ) : null}
+
+              <div className="flex flex-wrap gap-3">
+                <button
+                  type="button"
+                  onClick={checkForUpdates}
+                  disabled={checkingUpdate}
+                  className="inline-flex items-center gap-2 rounded-xl bg-primary px-4 py-2.5 font-headline text-sm font-bold text-on-primary transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Icon name="refresh" className={`h-4 w-4${checkingUpdate ? " animate-spin" : ""}`} />
+                  {checkingUpdate ? t("settings.updateChecking") : t("settings.updateCheck")}
+                </button>
+                <button
+                  type="button"
+                  onClick={installLatestUpdate}
+                  disabled={installingUpdate || !updateStatus?.latest || updateStatus?.supported === false}
+                  className="inline-flex items-center gap-2 rounded-xl bg-secondary px-4 py-2.5 font-headline text-sm font-bold text-on-primary transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Icon name="download" className="h-4 w-4" />
+                  {installingUpdate ? t("settings.updateInstalling") : t("settings.updateInstall")}
+                </button>
+                <label
+                  className={`inline-flex items-center gap-2 rounded-xl border border-outline-variant/20 bg-surface-container-high px-4 py-2.5 font-headline text-sm font-bold text-on-surface transition-colors hover:bg-surface-variant ${
+                    uploadingUpdate || updateStatus?.supported === false ? "cursor-not-allowed opacity-50" : "cursor-pointer"
+                  }`}
+                >
+                  <Icon name="upload_file" className="h-4 w-4 text-primary" />
+                  {uploadingUpdate ? t("settings.updateUploading") : t("settings.updateUpload")}
+                  <input
+                    type="file"
+                    accept=".tar.gz,application/gzip"
+                    disabled={uploadingUpdate || updateStatus?.supported === false}
+                    onChange={uploadUpdateArchive}
+                    className="hidden"
+                  />
+                </label>
+              </div>
             </div>
           </Section>
 
@@ -768,4 +957,15 @@ function formatHostLabel(status) {
 
   const parts = [status.hostName, status.runtimeOS].filter(Boolean);
   return parts.length > 0 ? parts.join(" · ") : "-";
+}
+
+function formatBundleTarget(bundle, t) {
+  if (!bundle) return t("common.notYet");
+  const target = [bundle.goos, bundle.goarch].filter(Boolean).join("/");
+  return [bundle.version || bundle.commit, target].filter(Boolean).join(" · ") || t("common.notYet");
+}
+
+function formatReleaseCandidate(candidate, t) {
+  if (!candidate) return t("common.notYet");
+  return [candidate.tagName, candidate.assetName].filter(Boolean).join(" · ") || t("common.notYet");
 }
