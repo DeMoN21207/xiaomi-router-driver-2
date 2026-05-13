@@ -97,7 +97,7 @@ pushd "%ROOT_DIR%" >nul || (
 set "CGO_ENABLED=0"
 set "GOOS=%ROUTER_GOOS%"
 set "GOARCH=%ROUTER_GOARCH%"
-"%GO_EXE%" build -o "%ROUTER_PACKAGE_DIR%\%ROUTER_BINARY_NAME%" ".\cmd\vpn-manager"
+"%GO_EXE%" build -buildvcs=false -o "%ROUTER_PACKAGE_DIR%\%ROUTER_BINARY_NAME%" ".\cmd\vpn-manager"
 if errorlevel 1 (
     popd >nul
     echo [error] Go build failed.

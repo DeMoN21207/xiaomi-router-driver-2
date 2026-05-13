@@ -76,7 +76,7 @@ npm run build
 
 echo "[2/4] Building $ROUTER_GOOS/$ROUTER_GOARCH binary..."
 cd "$ROOT_DIR"
-CGO_ENABLED=0 GOOS="$ROUTER_GOOS" GOARCH="$ROUTER_GOARCH" "$GO_EXE" build -o "$ROUTER_PACKAGE_DIR/$ROUTER_BINARY_NAME" ./cmd/vpn-manager
+CGO_ENABLED=0 GOOS="$ROUTER_GOOS" GOARCH="$ROUTER_GOARCH" "$GO_EXE" build -buildvcs=false -o "$ROUTER_PACKAGE_DIR/$ROUTER_BINARY_NAME" ./cmd/vpn-manager
 chmod +x "$ROUTER_PACKAGE_DIR/$ROUTER_BINARY_NAME" 2>/dev/null || true
 
 echo "[3/4] Preparing router bundle..."
