@@ -25,20 +25,6 @@ if exist "%LOCAL_ENV_FILE%" (
     call "%LOCAL_ENV_FILE%"
 )
 
-if not defined ROUTER_VERSION (
-    where git.exe >nul 2>nul
-    if not errorlevel 1 (
-        for /f "usebackq delims=" %%v in (`git.exe -C "%ROOT_DIR%" describe --tags --always --dirty 2^>nul`) do set "ROUTER_VERSION=%%v"
-    )
-)
-
-if not defined ROUTER_COMMIT (
-    where git.exe >nul 2>nul
-    if not errorlevel 1 (
-        for /f "usebackq delims=" %%v in (`git.exe -C "%ROOT_DIR%" rev-parse --short HEAD 2^>nul`) do set "ROUTER_COMMIT=%%v"
-    )
-)
-
 if not exist "%GO_EXE%" (
     where go.exe >nul 2>nul
     if errorlevel 1 (

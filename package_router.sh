@@ -25,14 +25,6 @@ if [[ -f "$LOCAL_ENV_FILE" ]]; then
   source "$LOCAL_ENV_FILE"
 fi
 
-if [[ -z "$ROUTER_VERSION" ]] && command -v git >/dev/null 2>&1; then
-  ROUTER_VERSION="$(git -C "$ROOT_DIR" describe --tags --always --dirty 2>/dev/null || true)"
-fi
-
-if [[ -z "$ROUTER_COMMIT" ]] && command -v git >/dev/null 2>&1; then
-  ROUTER_COMMIT="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || true)"
-fi
-
 if [[ ! -x "$GO_EXE" ]]; then
   if ! command -v go >/dev/null 2>&1; then
     echo "[error] Go was not found. Install Go or place it in .tools/go." >&2
