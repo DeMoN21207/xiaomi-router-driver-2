@@ -36,6 +36,8 @@ const (
 	maxTrafficPageSize                     = 200
 )
 
+var conntrackTablePaths = []string{"/proc/net/nf_conntrack", "/proc/net/ip_conntrack"}
+
 type SiteTrafficStat struct {
 	Domain     string `json:"domain"`
 	Bytes      uint64 `json:"bytes"`
@@ -344,18 +346,10 @@ func (s *Service) ingestDNSObservationLog() error {
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 16*1024), 1024*1024)
 
-	observations := make([]dnsObservation, 0, 32)
 	now := time.Now().UTC().Format(time.RFC3339)
+	collector := newDNSObservationCollector(now)
 	for scanner.Scan() {
-		domain, ip, ok := parseDNSObservationLine(scanner.Text())
-		if !ok {
-			continue
-		}
-		observations = append(observations, dnsObservation{
-			Domain: domain,
-			IP:     ip,
-			At:     now,
-		})
+		collector.Add(scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("scan dns observer log: %w", err)
@@ -366,8 +360,8 @@ func (s *Service) ingestDNSObservationLog() error {
 		return fmt.Errorf("read dns observer offset: %w", err)
 	}
 
-	if len(observations) > 0 {
-		if err := s.siteTraffic.UpsertObservedIPs(observations); err != nil {
+	if len(collector.observations) > 0 {
+		if err := s.siteTraffic.UpsertObservedIPs(collector.observations); err != nil {
 			return err
 		}
 	}
@@ -381,25 +375,142 @@ func (s *Service) ingestDNSObservationLog() error {
 	return s.siteTraffic.SetLogOffset(currentOffset)
 }
 
-var dnsReplyPattern = regexp.MustCompile(`\b(?:reply|cached)\s+([^\s]+)\s+is\s+((?:\d{1,3}\.){3}\d{1,3})\b`)
+var (
+	dnsReplyPattern = regexp.MustCompile(`\b(?:reply|cached)\s+([^\s]+)\s+is\s+((?:\d{1,3}\.){3}\d{1,3})\b`)
+	dnsCNAMEPattern = regexp.MustCompile(`\b(?:reply|cached)\s+([^\s]+)\s+is\s+<CNAME>\b`)
+)
+
+type dnsObservationCollector struct {
+	now          string
+	queryDomains map[string]string
+	observations []dnsObservation
+}
+
+func newDNSObservationCollector(now string) *dnsObservationCollector {
+	return &dnsObservationCollector{
+		now:          now,
+		queryDomains: make(map[string]string),
+		observations: make([]dnsObservation, 0, 32),
+	}
+}
+
+func dnsObservationsFromLines(lines []string, now string) []dnsObservation {
+	collector := newDNSObservationCollector(now)
+	for _, line := range lines {
+		collector.Add(line)
+	}
+	return collector.observations
+}
+
+func (c *dnsObservationCollector) Add(line string) {
+	if serial, domain, ok := parseDNSQueryLine(line); ok && serial != "" {
+		c.queryDomains[serial] = domain
+		return
+	}
+
+	if serial, domain, ok := parseDNSCNAMELine(line); ok && serial != "" {
+		if _, exists := c.queryDomains[serial]; !exists {
+			c.queryDomains[serial] = domain
+		}
+		return
+	}
+
+	serial, domain, ip, ok := parseDNSReplyLine(line)
+	if !ok {
+		return
+	}
+	if serial != "" {
+		if queryDomain := normalizeObservedDomain(c.queryDomains[serial]); queryDomain != "" {
+			domain = queryDomain
+		}
+	}
+	c.observations = append(c.observations, dnsObservation{
+		Domain: domain,
+		IP:     ip,
+		At:     c.now,
+	})
+}
 
 func parseDNSObservationLine(line string) (string, string, bool) {
-	match := dnsReplyPattern.FindStringSubmatch(strings.TrimSpace(line))
+	_, domain, ip, ok := parseDNSReplyLine(line)
+	return domain, ip, ok
+}
+
+func parseDNSReplyLine(line string) (string, string, string, bool) {
+	serial, message := dnsLogMessageAndSerial(line)
+	match := dnsReplyPattern.FindStringSubmatch(message)
 	if len(match) < 3 {
-		return "", "", false
+		return "", "", "", false
 	}
 
 	domain := normalizeObservedDomain(match[1])
 	if domain == "" {
-		return "", "", false
+		return "", "", "", false
 	}
 
 	ip := strings.TrimSpace(match[2])
 	if net.ParseIP(ip) == nil || strings.Contains(ip, ":") {
-		return "", "", false
+		return "", "", "", false
 	}
 
-	return domain, ip, true
+	return serial, domain, ip, true
+}
+
+func parseDNSQueryLine(line string) (string, string, bool) {
+	serial, message := dnsLogMessageAndSerial(line)
+	fields := strings.Fields(message)
+	for index, field := range fields {
+		if !strings.HasPrefix(field, "query[") || index+1 >= len(fields) {
+			continue
+		}
+		domain := normalizeObservedDomain(fields[index+1])
+		if domain == "" {
+			return "", "", false
+		}
+		return serial, domain, true
+	}
+	return "", "", false
+}
+
+func parseDNSCNAMELine(line string) (string, string, bool) {
+	serial, message := dnsLogMessageAndSerial(line)
+	match := dnsCNAMEPattern.FindStringSubmatch(message)
+	if len(match) < 2 {
+		return "", "", false
+	}
+	domain := normalizeObservedDomain(match[1])
+	if domain == "" {
+		return "", "", false
+	}
+	return serial, domain, true
+}
+
+func dnsLogMessageAndSerial(line string) (string, string) {
+	message := strings.TrimSpace(line)
+	if index := strings.LastIndex(message, "]:"); index >= 0 {
+		message = strings.TrimSpace(message[index+2:])
+	}
+
+	fields := strings.Fields(message)
+	if len(fields) == 0 {
+		return "", ""
+	}
+	if isDigits(fields[0]) {
+		return fields[0], strings.Join(fields[1:], " ")
+	}
+	return "", message
+}
+
+func isDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeObservedDomain(raw string) string {
@@ -603,9 +714,9 @@ func readConntrackSiteTraffic(state config.State, observedIPs map[string]string,
 	}
 	matcher := buildRouteMatcher(state)
 
-	file, err := os.Open("/proc/net/nf_conntrack")
+	file, err := openConntrackTable()
 	if err != nil {
-		return nil, fmt.Errorf("open nf_conntrack: %w", err)
+		return nil, err
 	}
 	defer file.Close()
 
@@ -650,6 +761,25 @@ func readConntrackSiteTraffic(state config.State, observedIPs map[string]string,
 	}
 
 	return entries, nil
+}
+
+func openConntrackTable() (*os.File, error) {
+	var lastErr error
+	for _, path := range conntrackTablePaths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		file, err := os.Open(path)
+		if err == nil {
+			return file, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = os.ErrNotExist
+	}
+	return nil, fmt.Errorf("open conntrack table (%s): %w", strings.Join(conntrackTablePaths, ", "), lastErr)
 }
 
 type conntrackLine struct {

@@ -91,10 +91,10 @@ const iconMap = {
   ),
   sync: (
     <>
-      <path d="M20 7v5h-5" />
-      <path d="M4 17v-5h5" />
-      <path d="M7 17a7 7 0 0 0 11-3" />
-      <path d="M17 7A7 7 0 0 0 6 10" />
+      <path d="M21 12a9 9 0 0 1-15.2 6.5L3 16" />
+      <path d="M3 21v-5h5" />
+      <path d="M3 12a9 9 0 0 1 15.2-6.5L21 8" />
+      <path d="M21 3v5h-5" />
     </>
   ),
   edit: (
@@ -112,8 +112,8 @@ const iconMap = {
   ),
   refresh: (
     <>
-      <path d="M21 12a9 9 0 1 1-3-6.7" />
-      <path d="M21 4v6h-6" />
+      <path d="M21 12a9 9 0 1 1-2.6-6.4" />
+      <path d="M21 3v6h-6" />
     </>
   ),
   play_arrow: <path d="m8 6 10 6-10 6z" />,

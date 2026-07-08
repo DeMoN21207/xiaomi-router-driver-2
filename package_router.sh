@@ -18,6 +18,7 @@ PACKAGE_TEMPLATE_DIR="$ROOT_DIR/packaging/router"
 : "${ROUTER_SINGBOX_BIN:=}"
 : "${ROUTER_VERSION:=}"
 : "${ROUTER_COMMIT:=}"
+: "${ROUTER_BUILT_AT:=}"
 : "${ROUTER_ARCHIVE_NAME:=vpn-manager-${ROUTER_GOOS}-${ROUTER_GOARCH}.tar.gz}"
 
 if [[ -f "$LOCAL_ENV_FILE" ]]; then
@@ -116,6 +117,17 @@ fi
 
 chmod +x "$ROUTER_PACKAGE_DIR/bin/"* 2>/dev/null || true
 
+if [[ -z "$ROUTER_COMMIT" ]] && command -v git >/dev/null 2>&1 && git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  ROUTER_COMMIT="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+  if [[ -n "$ROUTER_COMMIT" ]] && [[ -n "$(git -C "$ROOT_DIR" status --porcelain 2>/dev/null)" ]]; then
+    ROUTER_COMMIT="${ROUTER_COMMIT}-dirty"
+  fi
+fi
+
+if [[ -z "$ROUTER_BUILT_AT" ]]; then
+  ROUTER_BUILT_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+fi
+
 cat > "$ROUTER_PACKAGE_DIR/bundle-info.txt" <<EOF
 binary=$ROUTER_BINARY_NAME
 goos=$ROUTER_GOOS
@@ -131,6 +143,9 @@ if [[ -n "$ROUTER_VERSION" ]]; then
 fi
 if [[ -n "$ROUTER_COMMIT" ]]; then
   echo "commit=$ROUTER_COMMIT" >> "$ROUTER_PACKAGE_DIR/bundle-info.txt"
+fi
+if [[ -n "$ROUTER_BUILT_AT" ]]; then
+  echo "built_at=$ROUTER_BUILT_AT" >> "$ROUTER_PACKAGE_DIR/bundle-info.txt"
 fi
 
 ROUTER_ARCHIVE_PATH="$ROOT_DIR/build/$ROUTER_ARCHIVE_NAME"

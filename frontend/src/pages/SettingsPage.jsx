@@ -375,6 +375,8 @@ export default function SettingsPage() {
                 <p className="mb-2 text-[10px] font-bold uppercase tracking-widest text-outline">{t("settings.healthFiles")}</p>
                 <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                   <HealthCard icon="description" label={t("settings.updateRoutes")} value={status?.files?.updateRoutes ? t("common.inPlace") : t("common.notFound")} ok={status?.files?.updateRoutes} />
+                  <HealthCard icon="terminal" label={t("settings.bundle")} value={formatBundleTarget(status?.bundle, t)} />
+                  <HealthCard icon="memory" label={t("settings.builtAt")} value={formatDate(status?.bundle?.builtAt) || t("common.notYet")} />
                   <HealthCard icon="folder" label={t("settings.rootDir")} value={status?.projectDirectory || "-"} />
                   <HealthCard icon="database" label={t("settings.dataDir")} value={status?.dataDirectory || "-"} />
                   <HealthCard icon="computer" label={t("settings.host")} value={formatHostLabel(status)} />

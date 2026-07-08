@@ -21,6 +21,7 @@ type BundleInfo struct {
 	SingBoxPath string `json:"singboxPath,omitempty"`
 	Version     string `json:"version,omitempty"`
 	Commit      string `json:"commit,omitempty"`
+	BuiltAt     string `json:"builtAt,omitempty"`
 }
 
 var ErrInvalidBundle = errors.New("invalid update bundle")
@@ -137,6 +138,8 @@ func ParseBundleInfo(path string) (BundleInfo, error) {
 			info.Version = value
 		case "commit":
 			info.Commit = value
+		case "built_at":
+			info.BuiltAt = value
 		}
 	}
 	if err := scanner.Err(); err != nil {

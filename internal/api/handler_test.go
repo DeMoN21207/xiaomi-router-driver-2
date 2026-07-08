@@ -1,9 +1,11 @@
 package api
 
 import (
+	"encoding/json"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -100,6 +102,56 @@ func TestUpdateUploadRejectsNonLinux(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "Linux") {
 		t.Fatalf("expected Linux unsupported message, got %s", rec.Body.String())
+	}
+}
+
+func TestProviderRefreshEndpointRefreshesSubscriptionWithoutActiveRules(t *testing.T) {
+	tempDir := t.TempDir()
+	db := openAPITestDB(t, filepath.Join(tempDir, "vpn-manager.db"))
+	stateManager := config.NewManager(db, filepath.Join(tempDir, "vpn-state.json"))
+	state := config.DefaultState()
+	state.Providers = []config.Provider{
+		{
+			ID:      "provider-sub",
+			Name:    "Sub",
+			Type:    config.ProviderTypeSubscription,
+			Source:  testSubscriptionSource(),
+			Enabled: true,
+		},
+	}
+	if _, err := stateManager.Save(state); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	handler := NewHandler(Dependencies{
+		State:   stateManager,
+		DataDir: tempDir,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/providers/provider-sub/refresh", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ServeHTTP() status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var payload struct {
+		Status  string `json:"status"`
+		Entries int    `json:"entries"`
+		Applied bool   `json:"applied"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Status != "refreshed" {
+		t.Fatalf("status = %q, want refreshed", payload.Status)
+	}
+	if payload.Entries == 0 {
+		t.Fatalf("expected refreshed entries count, got %d", payload.Entries)
+	}
+	if payload.Applied {
+		t.Fatalf("expected no apply without active rules")
 	}
 }
 

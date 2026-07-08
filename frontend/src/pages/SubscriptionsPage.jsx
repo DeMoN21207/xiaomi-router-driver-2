@@ -22,6 +22,8 @@ export default function SubscriptionsPage() {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState(defaultForm);
   const [busy, setBusy] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [refreshingProviderId, setRefreshingProviderId] = useState("");
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
 
@@ -82,6 +84,37 @@ export default function SubscriptionsPage() {
 
   const providers = (config?.providers ?? []).filter((provider) => provider.type === "subscription");
 
+  async function refreshProvider(provider) {
+    setRefreshingProviderId(provider.id);
+    try {
+      const result = await fetchJSON(`/api/providers/${encodeURIComponent(provider.id)}/refresh`, { method: "POST" });
+      showToast(t("subscriptions.refreshed", { count: String(result.entries ?? 0) }));
+      await refresh();
+    } catch (err) {
+      showToast(err.message, true);
+    } finally {
+      setRefreshingProviderId("");
+    }
+  }
+
+  async function syncSubscriptions() {
+    if (providers.length === 0) {
+      return;
+    }
+    setSyncing(true);
+    try {
+      for (const provider of providers) {
+        await fetchJSON(`/api/providers/${encodeURIComponent(provider.id)}/refresh`, { method: "POST" });
+      }
+      showToast(t("subscriptions.synced", { count: String(providers.length) }));
+      await refresh();
+    } catch (err) {
+      showToast(err.message, true);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
   return (
     <div className="space-y-8">
       <header className="flex flex-col justify-between gap-6 md:flex-row md:items-end">
@@ -92,18 +125,21 @@ export default function SubscriptionsPage() {
         <div className="flex gap-3">
           <button
             type="button"
+            disabled={busy}
             onClick={() => setShowForm((v) => !v)}
-            className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-primary to-primary-container px-6 py-2.5 font-bold text-on-primary shadow-lg shadow-primary/10 transition-all hover:brightness-110 active:scale-95"
+            className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-primary to-primary-container px-6 py-2.5 font-bold text-on-primary shadow-lg shadow-primary/10 transition-all hover:brightness-110 active:scale-95 disabled:opacity-50"
           >
             <Icon name={showForm ? "close" : "add"} className="h-5 w-5" />
             {showForm ? t("subscriptions.close") : t("subscriptions.add")}
           </button>
           <button
             type="button"
-            className="flex items-center gap-2 rounded-xl border border-outline-variant/30 bg-surface-container-high px-5 py-2.5 font-headline text-sm font-medium text-on-surface transition-colors hover:bg-surface-variant"
+            onClick={syncSubscriptions}
+            disabled={busy || syncing || providers.length === 0 || Boolean(refreshingProviderId)}
+            className="flex items-center gap-2 rounded-xl border border-outline-variant/30 bg-surface-container-high px-5 py-2.5 font-headline text-sm font-medium text-on-surface transition-colors hover:bg-surface-variant disabled:opacity-50"
           >
-            <Icon name="cloud_sync" className="h-5 w-5 text-primary" />
-            {t("subscriptions.sync")}
+            <Icon name="cloud_sync" className={`h-5 w-5 text-primary ${syncing ? "animate-spin" : ""}`} />
+            {syncing ? t("subscriptions.syncing") : t("subscriptions.sync")}
           </button>
         </div>
       </header>
@@ -206,10 +242,12 @@ export default function SubscriptionsPage() {
             <div className="mt-6 flex gap-3 border-t border-outline-variant/20 pt-4">
               <button
                 type="button"
-                className="flex items-center gap-1.5 font-headline text-xs font-bold uppercase tracking-wider text-primary transition-colors hover:text-on-surface"
+                onClick={() => refreshProvider(provider)}
+                disabled={busy || syncing || Boolean(refreshingProviderId)}
+                className="flex items-center gap-1.5 font-headline text-xs font-bold uppercase tracking-wider text-primary transition-colors hover:text-on-surface disabled:opacity-50"
               >
-                <Icon name="sync" className="h-4 w-4" />
-                {t("subscriptions.update")}
+                <Icon name="sync" className={`h-4 w-4 ${refreshingProviderId === provider.id ? "animate-spin" : ""}`} />
+                {refreshingProviderId === provider.id ? t("subscriptions.refreshing") : t("subscriptions.update")}
               </button>
               <button
                 type="button"

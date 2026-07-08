@@ -1156,9 +1156,18 @@ func (h *Handler) handleProviderLatency(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *Handler) handleProvider(w http.ResponseWriter, r *http.Request) {
-	id, err := extractID(r.URL.Path, "/api/providers/")
+	id, action, err := extractProviderAction(r.URL.Path)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if action != "" {
+		switch action {
+		case "refresh":
+			h.handleProviderRefresh(w, r, id)
+		default:
+			writeError(w, http.StatusNotFound, fmt.Errorf("provider action %q not found", action))
+		}
 		return
 	}
 
@@ -1255,6 +1264,58 @@ func (h *Handler) handleProvider(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeMethodNotAllowed(w, http.MethodPut, http.MethodDelete)
 	}
+}
+
+func (h *Handler) handleProviderRefresh(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+
+	state, err := h.state.Load()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	index := findProviderIndex(state.Providers, id)
+	if index < 0 {
+		writeError(w, http.StatusNotFound, fmt.Errorf("provider %s not found", id))
+		return
+	}
+
+	provider := state.Providers[index]
+	if provider.Type != config.ProviderTypeSubscription {
+		writeError(w, http.StatusBadRequest, errors.New("provider is not a subscription"))
+		return
+	}
+
+	entries, err := subscription.RefreshEntriesCached(provider.Source, h.subscriptionRuntimeDir())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Errorf("refresh subscription %q: %w", provider.Name, err))
+		return
+	}
+
+	payload := map[string]any{
+		"status":  "refreshed",
+		"entries": len(entries),
+		"applied": false,
+	}
+	if provider.Enabled && providerHasEnabledRules(state, provider.ID) {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), applyRequestTimeout)
+		defer cancel()
+
+		result, err := h.applyCurrentRules(ctx)
+		if err != nil {
+			writeApplyError(w, err)
+			return
+		}
+		payload["applied"] = true
+		payload["apply"] = result
+	}
+
+	writeJSON(w, http.StatusOK, payload)
+	h.recordEvent("info", "subscription.refreshed", fmt.Sprintf("Subscription %q refreshed (%d entries)", provider.Name, len(entries)))
 }
 
 func (h *Handler) handleRules(w http.ResponseWriter, r *http.Request) {
@@ -1507,14 +1568,22 @@ func (h *Handler) applyStateRules(ctx context.Context, state config.State, persi
 	defer h.applyMu.Unlock()
 	savedState := state
 	state = automation.ApplyPriorityDefaults(state, time.Now())
+	var previousDomains []string
+	domainReplaceAttempted := false
 
 	fail := func(err error) (applyResult, error) {
+		finalErr := err
+		if domainReplaceAttempted && h.domains != nil {
+			if restoreErr := h.domains.ReplaceAll(previousDomains); restoreErr != nil {
+				finalErr = fmt.Errorf("%w; restore domains failed: %v", err, restoreErr)
+			}
+		}
 		if persistState {
-			savedState.LastError = err.Error()
+			savedState.LastError = finalErr.Error()
 			_, _ = h.state.Save(savedState)
 		}
-		h.recordEvent("error", "rules.apply_failed", err.Error())
-		return applyResult{}, err
+		h.recordEvent("error", "rules.apply_failed", finalErr.Error())
+		return applyResult{}, finalErr
 	}
 
 	if err := validateActiveRuleEntries(state); err != nil {
@@ -1569,6 +1638,15 @@ func (h *Handler) applyStateRules(ctx context.Context, state config.State, persi
 		}
 	}
 
+	if h.domains == nil {
+		return fail(errors.New("domains manager is not configured"))
+	}
+	var err error
+	previousDomains, err = h.domains.List()
+	if err != nil {
+		return fail(err)
+	}
+	domainReplaceAttempted = true
 	if err := h.domains.ReplaceAll(domainsToApply); err != nil {
 		return fail(err)
 	}
@@ -2366,6 +2444,36 @@ func extractID(path string, prefix string) (string, error) {
 	return id, nil
 }
 
+func extractProviderAction(path string) (string, string, error) {
+	raw := strings.TrimPrefix(path, "/api/providers/")
+	if raw == "" || raw == path {
+		return "", "", errors.New("id is required")
+	}
+
+	parts := strings.Split(strings.Trim(raw, "/"), "/")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return "", "", errors.New("id is required")
+	}
+	if len(parts) > 2 {
+		return "", "", fmt.Errorf("provider path %q not found", path)
+	}
+
+	id, err := url.PathUnescape(parts[0])
+	if err != nil {
+		return "", "", err
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", "", errors.New("id is required")
+	}
+
+	action := ""
+	if len(parts) == 2 {
+		action = strings.TrimSpace(parts[1])
+	}
+	return id, action, nil
+}
+
 func findProviderIndex(providers []config.Provider, id string) int {
 	for index, provider := range providers {
 		if provider.ID == id {
@@ -2373,6 +2481,15 @@ func findProviderIndex(providers []config.Provider, id string) int {
 		}
 	}
 	return -1
+}
+
+func providerHasEnabledRules(state config.State, providerID string) bool {
+	for _, rule := range state.Rules {
+		if rule.ProviderID == providerID && rule.Enabled {
+			return true
+		}
+	}
+	return false
 }
 
 func findRuleIndex(rules []config.Rule, id string) int {

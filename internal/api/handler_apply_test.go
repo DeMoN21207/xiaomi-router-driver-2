@@ -105,6 +105,67 @@ func TestHandleRuleApplyRollbackOnFailure(t *testing.T) {
 	}
 }
 
+func TestHandleManualApplyRestoresCurrentDomainsOnFailure(t *testing.T) {
+	tempDir := t.TempDir()
+	db := openAPITestDB(t, filepath.Join(tempDir, "vpn-manager.db"))
+	stateManager := config.NewManager(db, filepath.Join(tempDir, "vpn-state.json"))
+	domainsManager := domains.NewManager(db, filepath.Join(tempDir, "domains.current"), filepath.Join(tempDir, "domains.legacy"))
+	openvpnManager := openvpn.NewManager(tempDir, tempDir, db, nil, nil)
+	handler := NewHandler(Dependencies{
+		State:   stateManager,
+		Domains: domainsManager,
+		OpenVPN: openvpnManager,
+		DataDir: tempDir,
+	})
+
+	if err := domainsManager.ReplaceAll([]string{"previous.example.com"}); err != nil {
+		t.Fatalf("ReplaceAll() error = %v", err)
+	}
+
+	state := config.State{
+		Providers: []config.Provider{
+			{
+				ID:      "provider-openvpn",
+				Name:    "FizzVPN",
+				Type:    config.ProviderTypeOpenVPN,
+				Source:  "profiles/missing.ovpn",
+				Enabled: true,
+			},
+		},
+		Rules: []config.Rule{
+			{
+				ID:               "rule-1",
+				Name:             "Media",
+				ProviderID:       "provider-openvpn",
+				SelectedLocation: "NL",
+				Domains:          []string{"new.example.com"},
+				Enabled:          true,
+			},
+		},
+		Routing:    config.DefaultRoutingSettings(),
+		Automation: config.DefaultAutomationSettings(),
+	}
+	if _, err := stateManager.Save(state); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/rules/apply", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("ServeHTTP() status = %d, want %d, body=%s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	}
+
+	currentDomains, err := domainsManager.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(currentDomains) != 1 || currentDomains[0] != "previous.example.com" {
+		t.Fatalf("expected failed apply to restore previous domains, got %+v", currentDomains)
+	}
+}
+
 func openAPITestDB(t *testing.T, path string) *sql.DB {
 	t.Helper()
 

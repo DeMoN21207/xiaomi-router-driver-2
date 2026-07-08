@@ -22,6 +22,7 @@ import (
 	"xiomi-router-driver/internal/runtimebin"
 	"xiomi-router-driver/internal/runtimehealth"
 	"xiomi-router-driver/internal/subscription"
+	"xiomi-router-driver/internal/update"
 )
 
 type FileStatus struct {
@@ -75,6 +76,8 @@ type Snapshot struct {
 	LastAppliedAt       string                         `json:"lastAppliedAt"`
 	LastError           string                         `json:"lastError"`
 	UpdatedAt           string                         `json:"updatedAt"`
+	UptimeSeconds       uint64                         `json:"uptimeSeconds"`
+	UptimeFormatted     string                         `json:"uptimeFormatted"`
 	Files               FileStatus                     `json:"files"`
 	Binaries            BinaryStatus                   `json:"binaries"`
 	WAN                 WANStatus                      `json:"wan"`
@@ -86,6 +89,7 @@ type Snapshot struct {
 	DataDirectory       string                         `json:"dataDirectory"`
 	RuntimeOS           string                         `json:"runtimeOS"`
 	HostName            string                         `json:"hostName"`
+	Bundle              *update.BundleInfo             `json:"bundle,omitempty"`
 }
 
 type Service struct {
@@ -98,6 +102,7 @@ type Service struct {
 	dataDir                     string
 	openvpnBinary               string
 	singboxBinary               string
+	uptimePath                  string
 	wanProbe                    string
 	wanProbeTimeout             time.Duration
 	wanCacheTTL                 time.Duration
@@ -146,6 +151,7 @@ func NewService(
 		dataDir:                     dataDir,
 		openvpnBinary:               openvpnBinary,
 		singboxBinary:               singboxBinary,
+		uptimePath:                  defaultUptimePath,
 		wanProbe:                    wanProbe,
 		wanProbeTimeout:             wanProbeTimeout,
 		wanCacheTTL:                 wanCacheTTL,
@@ -223,15 +229,19 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		hostName = ""
 	}
+	bundle := s.bundleInfo()
+	uptime := readSystemUptimeFile(s.uptimePath)
 
 	return Snapshot{
-		ProvidersCount: len(state.Providers),
-		RulesCount:     len(state.Rules),
-		EnabledRules:   enabledRules,
-		DomainsCount:   domainCount,
-		LastAppliedAt:  state.LastAppliedAt,
-		LastError:      state.LastError,
-		UpdatedAt:      state.UpdatedAt,
+		ProvidersCount:  len(state.Providers),
+		RulesCount:      len(state.Rules),
+		EnabledRules:    enabledRules,
+		DomainsCount:    domainCount,
+		LastAppliedAt:   state.LastAppliedAt,
+		LastError:       state.LastError,
+		UpdatedAt:       state.UpdatedAt,
+		UptimeSeconds:   uptime.Seconds,
+		UptimeFormatted: uptime.Formatted,
 		Files: FileStatus{
 			UpdateRoutes: fileExists(s.updateRoutesPath),
 		},
@@ -245,7 +255,20 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 		DataDirectory:       s.dataDir,
 		RuntimeOS:           runtime.GOOS,
 		HostName:            strings.TrimSpace(hostName),
+		Bundle:              bundle,
 	}, nil
+}
+
+func (s *Service) bundleInfo() *update.BundleInfo {
+	if s == nil || strings.TrimSpace(s.appDir) == "" {
+		return nil
+	}
+	info, err := update.ParseBundleInfo(filepath.Join(s.appDir, "bundle-info.txt"))
+	if err != nil {
+		return nil
+	}
+	info.Root = s.appDir
+	return &info
 }
 
 func providerHealth(provider config.Provider, binaryAvailable bool, rulesCount int, openvpnSnapshot *openvpn.RuntimeSnapshot, subscriptionKeys []string, subscriptionRuntime map[string]subscription.RuntimeSnapshot) (string, string) {
@@ -764,38 +787,53 @@ func interfaceStatus(name string) string {
 // older than the given cutoff time.
 func (s *Service) PurgeTrafficOlderThan(cutoff time.Time) error {
 	cutoffStr := cutoff.UTC().Format(time.RFC3339)
+	var cleanupErrors []error
 
 	if s.history != nil {
 		s.history.mu.Lock()
-		if err := s.history.ensureReadyLocked(); err == nil {
-			_, _ = s.history.db.Exec(`DELETE FROM traffic_history_samples WHERE collected_at < ?`, cutoffStr)
+		if err := s.history.ensureReadyLocked(); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("traffic history cleanup: %w", err))
+		} else if _, err := s.history.db.Exec(`DELETE FROM traffic_history_samples WHERE collected_at < ?`, cutoffStr); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("traffic history cleanup: %w", err))
 		}
 		s.history.mu.Unlock()
 	}
 
 	if s.domainTraffic != nil {
-		if err := s.domainTraffic.ensureReady(); err == nil {
+		if err := s.domainTraffic.ensureReady(); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("domain traffic cleanup: %w", err))
+		} else {
 			s.domainTraffic.mu.Lock()
-			_, _ = s.domainTraffic.db.Exec(`DELETE FROM domain_traffic WHERE updated_at < ?`, cutoffStr)
+			if _, err := s.domainTraffic.db.Exec(`DELETE FROM domain_traffic WHERE updated_at < ?`, cutoffStr); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("domain traffic cleanup: %w", err))
+			}
 			s.domainTraffic.mu.Unlock()
 		}
 	}
 
 	if s.siteTraffic != nil {
-		if err := s.siteTraffic.ensureReady(); err == nil {
+		if err := s.siteTraffic.ensureReady(); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("site traffic cleanup: %w", err))
+		} else {
 			s.siteTraffic.mu.Lock()
-			_, _ = s.siteTraffic.db.Exec(`DELETE FROM site_traffic WHERE updated_at < ?`, cutoffStr)
-			_, _ = s.siteTraffic.db.Exec(`DELETE FROM site_traffic_connections WHERE last_seen < ?`, cutoffStr)
-			_, _ = s.siteTraffic.db.Exec(`DELETE FROM site_dns_observations WHERE observed_at < ?`, cutoffStr)
-			_, _ = s.siteTraffic.db.Exec(`DELETE FROM device_traffic WHERE updated_at < ?`, cutoffStr)
-			_, _ = s.siteTraffic.db.Exec(`DELETE FROM device_site_traffic WHERE updated_at < ?`, cutoffStr)
-			_, _ = s.siteTraffic.db.Exec(`DELETE FROM device_traffic_history WHERE bucket_at < ?`, cutoffStr)
-			_, _ = s.siteTraffic.db.Exec(`DELETE FROM device_site_traffic_history WHERE bucket_at < ?`, cutoffStr)
+			for _, stmt := range []string{
+				`DELETE FROM site_traffic WHERE updated_at < ?`,
+				`DELETE FROM site_traffic_connections WHERE last_seen < ?`,
+				`DELETE FROM site_dns_observations WHERE observed_at < ?`,
+				`DELETE FROM device_traffic WHERE updated_at < ?`,
+				`DELETE FROM device_site_traffic WHERE updated_at < ?`,
+				`DELETE FROM device_traffic_history WHERE bucket_at < ?`,
+				`DELETE FROM device_site_traffic_history WHERE bucket_at < ?`,
+			} {
+				if _, err := s.siteTraffic.db.Exec(stmt, cutoffStr); err != nil {
+					cleanupErrors = append(cleanupErrors, fmt.Errorf("site traffic cleanup: %w", err))
+				}
+			}
 			s.siteTraffic.mu.Unlock()
 		}
 	}
 
-	return nil
+	return errors.Join(cleanupErrors...)
 }
 
 func firstNonEmpty(values ...string) string {
