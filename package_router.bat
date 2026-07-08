@@ -17,6 +17,9 @@ if not defined ROUTER_PACKAGE_DIR set "ROUTER_PACKAGE_DIR=%ROOT_DIR%\build\route
 if not defined ROUTER_DATA_DIR_NAME set "ROUTER_DATA_DIR_NAME=data"
 if not defined ROUTER_OPENVPN_BIN set "ROUTER_OPENVPN_BIN="
 if not defined ROUTER_SINGBOX_BIN set "ROUTER_SINGBOX_BIN="
+if not defined ROUTER_VERSION set "ROUTER_VERSION="
+if not defined ROUTER_COMMIT set "ROUTER_COMMIT="
+if not defined ROUTER_ARCHIVE_NAME set "ROUTER_ARCHIVE_NAME=vpn-manager-%ROUTER_GOOS%-%ROUTER_GOARCH%.tar.gz"
 
 if exist "%LOCAL_ENV_FILE%" (
     call "%LOCAL_ENV_FILE%"
@@ -94,7 +97,7 @@ pushd "%ROOT_DIR%" >nul || (
 set "CGO_ENABLED=0"
 set "GOOS=%ROUTER_GOOS%"
 set "GOARCH=%ROUTER_GOARCH%"
-"%GO_EXE%" build -o "%ROUTER_PACKAGE_DIR%\%ROUTER_BINARY_NAME%" ".\cmd\vpn-manager"
+"%GO_EXE%" build -buildvcs=false -o "%ROUTER_PACKAGE_DIR%\%ROUTER_BINARY_NAME%" ".\cmd\vpn-manager"
 if errorlevel 1 (
     popd >nul
     echo [error] Go build failed.
@@ -115,6 +118,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
+if exist "%ROUTER_PACKAGE_DIR%\openvpn" del /F /Q "%ROUTER_PACKAGE_DIR%\openvpn" >nul 2>nul
+if exist "%ROUTER_PACKAGE_DIR%\sing-box" del /F /Q "%ROUTER_PACKAGE_DIR%\sing-box" >nul 2>nul
+
 set "OPENVPN_BUNDLE_PATH="
 set "SINGBOX_BUNDLE_PATH="
 
@@ -128,19 +134,9 @@ if defined ROUTER_OPENVPN_BIN (
         echo [error] Failed to copy openvpn into the router bundle.
         exit /b 1
     )
-    copy /Y "%ROUTER_OPENVPN_BIN%" "%ROUTER_PACKAGE_DIR%\openvpn" >nul
-    if errorlevel 1 (
-        echo [error] Failed to copy root-level openvpn into the router bundle.
-        exit /b 1
-    )
-    set "OPENVPN_BUNDLE_PATH=openvpn"
+    set "OPENVPN_BUNDLE_PATH=bin/openvpn"
 ) else if exist "%ROUTER_PACKAGE_DIR%\bin\openvpn" (
-    copy /Y "%ROUTER_PACKAGE_DIR%\bin\openvpn" "%ROUTER_PACKAGE_DIR%\openvpn" >nul
-    if errorlevel 1 (
-        echo [error] Failed to refresh root-level openvpn in the router bundle.
-        exit /b 1
-    )
-    set "OPENVPN_BUNDLE_PATH=openvpn"
+    set "OPENVPN_BUNDLE_PATH=bin/openvpn"
 )
 
 if defined ROUTER_SINGBOX_BIN (
@@ -153,19 +149,9 @@ if defined ROUTER_SINGBOX_BIN (
         echo [error] Failed to copy sing-box into the router bundle.
         exit /b 1
     )
-    copy /Y "%ROUTER_SINGBOX_BIN%" "%ROUTER_PACKAGE_DIR%\sing-box" >nul
-    if errorlevel 1 (
-        echo [error] Failed to copy root-level sing-box into the router bundle.
-        exit /b 1
-    )
-    set "SINGBOX_BUNDLE_PATH=sing-box"
+    set "SINGBOX_BUNDLE_PATH=bin/sing-box"
 ) else if exist "%ROUTER_PACKAGE_DIR%\bin\sing-box" (
-    copy /Y "%ROUTER_PACKAGE_DIR%\bin\sing-box" "%ROUTER_PACKAGE_DIR%\sing-box" >nul
-    if errorlevel 1 (
-        echo [error] Failed to refresh root-level sing-box in the router bundle.
-        exit /b 1
-    )
-    set "SINGBOX_BUNDLE_PATH=sing-box"
+    set "SINGBOX_BUNDLE_PATH=bin/sing-box"
 )
 
 (
@@ -178,6 +164,22 @@ if defined ROUTER_SINGBOX_BIN (
     echo openvpn_path=%OPENVPN_BUNDLE_PATH%
     echo singbox_path=%SINGBOX_BUNDLE_PATH%
 ) > "%ROUTER_PACKAGE_DIR%\bundle-info.txt"
+if defined ROUTER_VERSION echo version=%ROUTER_VERSION%>> "%ROUTER_PACKAGE_DIR%\bundle-info.txt"
+if defined ROUTER_COMMIT echo commit=%ROUTER_COMMIT%>> "%ROUTER_PACKAGE_DIR%\bundle-info.txt"
+
+if not exist "%ROOT_DIR%\build" mkdir "%ROOT_DIR%\build"
+set "ROUTER_ARCHIVE_PATH=%ROOT_DIR%\build\%ROUTER_ARCHIVE_NAME%"
+where tar.exe >nul 2>nul
+if errorlevel 1 (
+    echo [warn] tar.exe was not found; release archive was not created.
+) else (
+    tar.exe -C "%ROUTER_PACKAGE_DIR%" -czf "%ROUTER_ARCHIVE_PATH%" .
+    if errorlevel 1 (
+        echo [error] Failed to create release archive.
+        exit /b 1
+    )
+    echo [done] Release archive: %ROUTER_ARCHIVE_PATH%
+)
 
 echo [4/4] Router bundle ready: %ROUTER_PACKAGE_DIR%
 echo [done] Copy the whole directory to the router and start it with ./start.sh

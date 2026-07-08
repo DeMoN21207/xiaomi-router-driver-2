@@ -22,6 +22,7 @@ import (
 	"xiomi-router-driver/internal/runtimebin"
 	"xiomi-router-driver/internal/runtimehealth"
 	"xiomi-router-driver/internal/subscription"
+	"xiomi-router-driver/internal/update"
 )
 
 type FileStatus struct {
@@ -75,6 +76,8 @@ type Snapshot struct {
 	LastAppliedAt       string                         `json:"lastAppliedAt"`
 	LastError           string                         `json:"lastError"`
 	UpdatedAt           string                         `json:"updatedAt"`
+	UptimeSeconds       uint64                         `json:"uptimeSeconds"`
+	UptimeFormatted     string                         `json:"uptimeFormatted"`
 	Files               FileStatus                     `json:"files"`
 	Binaries            BinaryStatus                   `json:"binaries"`
 	WAN                 WANStatus                      `json:"wan"`
@@ -86,6 +89,7 @@ type Snapshot struct {
 	DataDirectory       string                         `json:"dataDirectory"`
 	RuntimeOS           string                         `json:"runtimeOS"`
 	HostName            string                         `json:"hostName"`
+	Bundle              *update.BundleInfo             `json:"bundle,omitempty"`
 }
 
 type Service struct {
@@ -98,6 +102,7 @@ type Service struct {
 	dataDir                     string
 	openvpnBinary               string
 	singboxBinary               string
+	uptimePath                  string
 	wanProbe                    string
 	wanProbeTimeout             time.Duration
 	wanCacheTTL                 time.Duration
@@ -146,6 +151,7 @@ func NewService(
 		dataDir:                     dataDir,
 		openvpnBinary:               openvpnBinary,
 		singboxBinary:               singboxBinary,
+		uptimePath:                  defaultUptimePath,
 		wanProbe:                    wanProbe,
 		wanProbeTimeout:             wanProbeTimeout,
 		wanCacheTTL:                 wanCacheTTL,
@@ -196,7 +202,7 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 	trafficRoutes := buildTrafficRoutes(state, openvpnRuntime, subscriptionRuntime, domainsByProvider)
 	openvpnRuntimeByProvider := indexOpenVPNRuntimeByProvider(openvpnRuntime)
 	subscriptionRuntimeByKey := indexSubscriptionRuntimeByKey(subscriptionRuntime)
-	expectedSubscriptionKeys := expectedSubscriptionKeysByProvider(state)
+	expectedSubscriptionKeys := expectedSubscriptionKeysByProvider(state, subscriptionRuntime)
 
 	for _, provider := range state.Providers {
 		runtime := ProviderRuntime{
@@ -223,15 +229,19 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		hostName = ""
 	}
+	bundle := s.bundleInfo()
+	uptime := readSystemUptimeFile(s.uptimePath)
 
 	return Snapshot{
-		ProvidersCount: len(state.Providers),
-		RulesCount:     len(state.Rules),
-		EnabledRules:   enabledRules,
-		DomainsCount:   domainCount,
-		LastAppliedAt:  state.LastAppliedAt,
-		LastError:      state.LastError,
-		UpdatedAt:      state.UpdatedAt,
+		ProvidersCount:  len(state.Providers),
+		RulesCount:      len(state.Rules),
+		EnabledRules:    enabledRules,
+		DomainsCount:    domainCount,
+		LastAppliedAt:   state.LastAppliedAt,
+		LastError:       state.LastError,
+		UpdatedAt:       state.UpdatedAt,
+		UptimeSeconds:   uptime.Seconds,
+		UptimeFormatted: uptime.Formatted,
 		Files: FileStatus{
 			UpdateRoutes: fileExists(s.updateRoutesPath),
 		},
@@ -245,7 +255,20 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 		DataDirectory:       s.dataDir,
 		RuntimeOS:           runtime.GOOS,
 		HostName:            strings.TrimSpace(hostName),
+		Bundle:              bundle,
 	}, nil
+}
+
+func (s *Service) bundleInfo() *update.BundleInfo {
+	if s == nil || strings.TrimSpace(s.appDir) == "" {
+		return nil
+	}
+	info, err := update.ParseBundleInfo(filepath.Join(s.appDir, "bundle-info.txt"))
+	if err != nil {
+		return nil
+	}
+	info.Root = s.appDir
+	return &info
 }
 
 func providerHealth(provider config.Provider, binaryAvailable bool, rulesCount int, openvpnSnapshot *openvpn.RuntimeSnapshot, subscriptionKeys []string, subscriptionRuntime map[string]subscription.RuntimeSnapshot) (string, string) {
@@ -560,7 +583,7 @@ func indexSubscriptionRuntimeByKey(snapshots []subscription.RuntimeSnapshot) map
 	return index
 }
 
-func expectedSubscriptionKeysByProvider(state config.State) map[string][]string {
+func expectedSubscriptionKeysByProvider(state config.State, runtimeSnapshots []subscription.RuntimeSnapshot) map[string][]string {
 	providersByID := make(map[string]config.Provider, len(state.Providers))
 	for _, provider := range state.Providers {
 		providersByID[provider.ID] = provider
@@ -568,8 +591,12 @@ func expectedSubscriptionKeysByProvider(state config.State) map[string][]string 
 
 	byProvider := make(map[string][]string)
 	seen := make(map[string]map[string]struct{})
+	priorityProviders := subscriptionPriorityProviders(state, providersByID)
 	for _, rule := range state.Rules {
 		if !rule.Enabled {
+			continue
+		}
+		if _, controlled := priorityProviders[rule.ProviderID]; controlled {
 			continue
 		}
 
@@ -586,18 +613,148 @@ func expectedSubscriptionKeysByProvider(state config.State) map[string][]string 
 			continue
 		}
 
-		key := provider.ID + "::" + strings.ToLower(location)
-		if seen[provider.ID] == nil {
-			seen[provider.ID] = make(map[string]struct{})
-		}
-		if _, exists := seen[provider.ID][key]; exists {
+		addSubscriptionKey(byProvider, seen, provider.ID, location)
+	}
+
+	for _, policy := range state.PriorityPolicies {
+		provider, exists := providersByID[policy.ProviderID]
+		if !exists || !priorityPolicyControlsSubscriptionProvider(state, policy, provider) {
 			continue
 		}
-		seen[provider.ID][key] = struct{}{}
-		byProvider[provider.ID] = append(byProvider[provider.ID], key)
+		targets := priorityPolicyTargetSet(policy)
+		addedRuntime := false
+		for _, snapshot := range runtimeSnapshots {
+			if snapshot.ProviderID != provider.ID {
+				continue
+			}
+			if _, ok := targets[strings.ToLower(strings.TrimSpace(snapshot.Location))]; !ok {
+				continue
+			}
+			addSubscriptionKey(byProvider, seen, provider.ID, snapshot.Location)
+			addedRuntime = true
+		}
+		if addedRuntime {
+			continue
+		}
+		addSubscriptionKey(byProvider, seen, provider.ID, preferredPriorityPolicyLocation(policy, time.Now()))
 	}
 
 	return byProvider
+}
+
+func addSubscriptionKey(byProvider map[string][]string, seen map[string]map[string]struct{}, providerID string, location string) {
+	providerID = strings.TrimSpace(providerID)
+	location = strings.TrimSpace(location)
+	if providerID == "" || location == "" {
+		return
+	}
+
+	key := providerID + "::" + strings.ToLower(location)
+	if seen[providerID] == nil {
+		seen[providerID] = make(map[string]struct{})
+	}
+	if _, exists := seen[providerID][key]; exists {
+		return
+	}
+	seen[providerID][key] = struct{}{}
+	byProvider[providerID] = append(byProvider[providerID], key)
+}
+
+func subscriptionPriorityProviders(state config.State, providersByID map[string]config.Provider) map[string]struct{} {
+	controlled := make(map[string]struct{})
+	for _, policy := range state.PriorityPolicies {
+		provider, exists := providersByID[policy.ProviderID]
+		if !exists || !priorityPolicyControlsSubscriptionProvider(state, policy, provider) {
+			continue
+		}
+		controlled[policy.ProviderID] = struct{}{}
+	}
+	return controlled
+}
+
+func priorityPolicyControlsSubscriptionProvider(state config.State, policy config.PriorityPolicy, provider config.Provider) bool {
+	if !policy.Enabled || len(policy.Targets) == 0 {
+		return false
+	}
+	if !provider.Enabled || provider.Type != config.ProviderTypeSubscription {
+		return false
+	}
+	return providerHasRoutedDomains(state, provider.ID)
+}
+
+func providerHasRoutedDomains(state config.State, providerID string) bool {
+	for _, rule := range state.Rules {
+		if rule.Enabled && rule.ProviderID == providerID && ruleHasDomains(rule) {
+			return true
+		}
+	}
+	return false
+}
+
+func priorityPolicyTargetSet(policy config.PriorityPolicy) map[string]struct{} {
+	targets := make(map[string]struct{}, len(policy.Targets))
+	for _, target := range policy.Targets {
+		location := strings.ToLower(strings.TrimSpace(target.Location))
+		if location != "" {
+			targets[location] = struct{}{}
+		}
+	}
+	return targets
+}
+
+func preferredPriorityPolicyLocation(policy config.PriorityPolicy, now time.Time) string {
+	minute := now.Hour()*60 + now.Minute()
+	for _, window := range policy.Schedule {
+		start, okStart := parsePriorityPolicyClock(window.Start)
+		end, okEnd := parsePriorityPolicyClock(window.End)
+		if !okStart || !okEnd || start == end {
+			continue
+		}
+		if priorityPolicyWindowContains(start, end, minute) {
+			return strings.TrimSpace(window.Location)
+		}
+	}
+	for _, target := range policy.Targets {
+		if location := strings.TrimSpace(target.Location); location != "" {
+			return location
+		}
+	}
+	return ""
+}
+
+func parsePriorityPolicyClock(value string) (int, bool) {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) != 2 {
+		return 0, false
+	}
+	hour, okHour := parseClockPart(parts[0], 0, 23)
+	minute, okMinute := parseClockPart(parts[1], 0, 59)
+	if !okHour || !okMinute {
+		return 0, false
+	}
+	return hour*60 + minute, true
+}
+
+func parseClockPart(value string, min int, max int) (int, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	n := 0
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n, n >= min && n <= max
+}
+
+func priorityPolicyWindowContains(start int, end int, minute int) bool {
+	if start < end {
+		return minute >= start && minute < end
+	}
+	return minute >= start || minute < end
 }
 
 func readInterfaceTraffic(interfaceName string) (uint64, uint64) {
@@ -630,38 +787,53 @@ func interfaceStatus(name string) string {
 // older than the given cutoff time.
 func (s *Service) PurgeTrafficOlderThan(cutoff time.Time) error {
 	cutoffStr := cutoff.UTC().Format(time.RFC3339)
+	var cleanupErrors []error
 
 	if s.history != nil {
 		s.history.mu.Lock()
-		if err := s.history.ensureReadyLocked(); err == nil {
-			_, _ = s.history.db.Exec(`DELETE FROM traffic_history_samples WHERE collected_at < ?`, cutoffStr)
+		if err := s.history.ensureReadyLocked(); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("traffic history cleanup: %w", err))
+		} else if _, err := s.history.db.Exec(`DELETE FROM traffic_history_samples WHERE collected_at < ?`, cutoffStr); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("traffic history cleanup: %w", err))
 		}
 		s.history.mu.Unlock()
 	}
 
 	if s.domainTraffic != nil {
-		if err := s.domainTraffic.ensureReady(); err == nil {
+		if err := s.domainTraffic.ensureReady(); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("domain traffic cleanup: %w", err))
+		} else {
 			s.domainTraffic.mu.Lock()
-			_, _ = s.domainTraffic.db.Exec(`DELETE FROM domain_traffic WHERE updated_at < ?`, cutoffStr)
+			if _, err := s.domainTraffic.db.Exec(`DELETE FROM domain_traffic WHERE updated_at < ?`, cutoffStr); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("domain traffic cleanup: %w", err))
+			}
 			s.domainTraffic.mu.Unlock()
 		}
 	}
 
 	if s.siteTraffic != nil {
-		if err := s.siteTraffic.ensureReady(); err == nil {
+		if err := s.siteTraffic.ensureReady(); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("site traffic cleanup: %w", err))
+		} else {
 			s.siteTraffic.mu.Lock()
-			_, _ = s.siteTraffic.db.Exec(`DELETE FROM site_traffic WHERE updated_at < ?`, cutoffStr)
-			_, _ = s.siteTraffic.db.Exec(`DELETE FROM site_traffic_connections WHERE last_seen < ?`, cutoffStr)
-			_, _ = s.siteTraffic.db.Exec(`DELETE FROM site_dns_observations WHERE observed_at < ?`, cutoffStr)
-			_, _ = s.siteTraffic.db.Exec(`DELETE FROM device_traffic WHERE updated_at < ?`, cutoffStr)
-			_, _ = s.siteTraffic.db.Exec(`DELETE FROM device_site_traffic WHERE updated_at < ?`, cutoffStr)
-			_, _ = s.siteTraffic.db.Exec(`DELETE FROM device_traffic_history WHERE bucket_at < ?`, cutoffStr)
-			_, _ = s.siteTraffic.db.Exec(`DELETE FROM device_site_traffic_history WHERE bucket_at < ?`, cutoffStr)
+			for _, stmt := range []string{
+				`DELETE FROM site_traffic WHERE updated_at < ?`,
+				`DELETE FROM site_traffic_connections WHERE last_seen < ?`,
+				`DELETE FROM site_dns_observations WHERE observed_at < ?`,
+				`DELETE FROM device_traffic WHERE updated_at < ?`,
+				`DELETE FROM device_site_traffic WHERE updated_at < ?`,
+				`DELETE FROM device_traffic_history WHERE bucket_at < ?`,
+				`DELETE FROM device_site_traffic_history WHERE bucket_at < ?`,
+			} {
+				if _, err := s.siteTraffic.db.Exec(stmt, cutoffStr); err != nil {
+					cleanupErrors = append(cleanupErrors, fmt.Errorf("site traffic cleanup: %w", err))
+				}
+			}
 			s.siteTraffic.mu.Unlock()
 		}
 	}
 
-	return nil
+	return errors.Join(cleanupErrors...)
 }
 
 func firstNonEmpty(values ...string) string {

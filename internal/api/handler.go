@@ -31,6 +31,7 @@ import (
 	"xiomi-router-driver/internal/routing"
 	"xiomi-router-driver/internal/status"
 	"xiomi-router-driver/internal/subscription"
+	"xiomi-router-driver/internal/update"
 )
 
 type Dependencies struct {
@@ -42,6 +43,7 @@ type Dependencies struct {
 	OpenVPN               *openvpn.Manager
 	Subscriptions         *subscription.Manager
 	Status                *status.Service
+	Update                *update.Manager
 	FailoverStatus        func() automation.FailoverStatus
 	PriorityStatus        func() automation.PriorityStatus
 	SetPriorityOverride   func(policyID string, location string) error
@@ -59,6 +61,7 @@ type Handler struct {
 	openvpn               *openvpn.Manager
 	subscriptions         *subscription.Manager
 	status                *status.Service
+	update                *update.Manager
 	failoverStatus        func() automation.FailoverStatus
 	priorityStatus        func() automation.PriorityStatus
 	setPriorityOverride   func(policyID string, location string) error
@@ -116,6 +119,7 @@ func NewHandler(deps Dependencies) *Handler {
 		openvpn:               deps.OpenVPN,
 		subscriptions:         deps.Subscriptions,
 		status:                deps.Status,
+		update:                deps.Update,
 		failoverStatus:        deps.FailoverStatus,
 		priorityStatus:        deps.PriorityStatus,
 		setPriorityOverride:   deps.SetPriorityOverride,
@@ -153,6 +157,11 @@ func NewHandler(deps Dependencies) *Handler {
 	mux.HandleFunc("/api/domains", handler.handleDomainsPreview)
 	mux.HandleFunc("/api/system/resources", handler.handleSystemResources)
 	mux.HandleFunc("/api/system/reboot", handler.handleReboot)
+	mux.HandleFunc("/api/system/update", handler.handleSystemUpdate)
+	mux.HandleFunc("/api/system/update/settings", handler.handleSystemUpdateSettings)
+	mux.HandleFunc("/api/system/update/check", handler.handleSystemUpdateCheck)
+	mux.HandleFunc("/api/system/update/install", handler.handleSystemUpdateInstall)
+	mux.HandleFunc("/api/system/update/upload", handler.handleSystemUpdateUpload)
 	handler.router = mux
 	return handler
 }
@@ -277,6 +286,112 @@ func (h *Handler) handleReboot(w http.ResponseWriter, r *http.Request) {
 			log.Printf("reboot command failed: %v", err)
 		}
 	}()
+}
+
+func (h *Handler) handleSystemUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	if h.update == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("update manager is not configured"))
+		return
+	}
+
+	status, err := h.update.Status(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (h *Handler) handleSystemUpdateSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		writeMethodNotAllowed(w, http.MethodPut)
+		return
+	}
+	if h.update == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("update manager is not configured"))
+		return
+	}
+
+	var settings config.UpdateSettings
+	if err := decodeJSON(r, &settings); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	status, err := h.update.SaveSettings(r.Context(), settings)
+	if err != nil {
+		writeUpdateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (h *Handler) handleSystemUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if h.update == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("update manager is not configured"))
+		return
+	}
+
+	status, err := h.update.Check(r.Context())
+	if err != nil {
+		writeUpdateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (h *Handler) handleSystemUpdateInstall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if h.update == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("update manager is not configured"))
+		return
+	}
+
+	result, err := h.update.InstallLatest(r.Context())
+	if err != nil {
+		writeUpdateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) handleSystemUpdateUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if h.update == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("update manager is not configured"))
+		return
+	}
+
+	if err := r.ParseMultipartForm(128 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	file, header, err := r.FormFile("archive")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("archive file is required"))
+		return
+	}
+	defer file.Close()
+
+	result, err := h.update.InstallUploaded(r.Context(), file, header.Filename)
+	if err != nil {
+		writeUpdateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (h *Handler) handleTrafficHistory(w http.ResponseWriter, r *http.Request) {
@@ -1041,9 +1156,18 @@ func (h *Handler) handleProviderLatency(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *Handler) handleProvider(w http.ResponseWriter, r *http.Request) {
-	id, err := extractID(r.URL.Path, "/api/providers/")
+	id, action, err := extractProviderAction(r.URL.Path)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if action != "" {
+		switch action {
+		case "refresh":
+			h.handleProviderRefresh(w, r, id)
+		default:
+			writeError(w, http.StatusNotFound, fmt.Errorf("provider action %q not found", action))
+		}
 		return
 	}
 
@@ -1140,6 +1264,58 @@ func (h *Handler) handleProvider(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeMethodNotAllowed(w, http.MethodPut, http.MethodDelete)
 	}
+}
+
+func (h *Handler) handleProviderRefresh(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+
+	state, err := h.state.Load()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	index := findProviderIndex(state.Providers, id)
+	if index < 0 {
+		writeError(w, http.StatusNotFound, fmt.Errorf("provider %s not found", id))
+		return
+	}
+
+	provider := state.Providers[index]
+	if provider.Type != config.ProviderTypeSubscription {
+		writeError(w, http.StatusBadRequest, errors.New("provider is not a subscription"))
+		return
+	}
+
+	entries, err := subscription.RefreshEntriesCached(provider.Source, h.subscriptionRuntimeDir())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Errorf("refresh subscription %q: %w", provider.Name, err))
+		return
+	}
+
+	payload := map[string]any{
+		"status":  "refreshed",
+		"entries": len(entries),
+		"applied": false,
+	}
+	if provider.Enabled && providerHasEnabledRules(state, provider.ID) {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), applyRequestTimeout)
+		defer cancel()
+
+		result, err := h.applyCurrentRules(ctx)
+		if err != nil {
+			writeApplyError(w, err)
+			return
+		}
+		payload["applied"] = true
+		payload["apply"] = result
+	}
+
+	writeJSON(w, http.StatusOK, payload)
+	h.recordEvent("info", "subscription.refreshed", fmt.Sprintf("Subscription %q refreshed (%d entries)", provider.Name, len(entries)))
 }
 
 func (h *Handler) handleRules(w http.ResponseWriter, r *http.Request) {
@@ -1392,14 +1568,22 @@ func (h *Handler) applyStateRules(ctx context.Context, state config.State, persi
 	defer h.applyMu.Unlock()
 	savedState := state
 	state = automation.ApplyPriorityDefaults(state, time.Now())
+	var previousDomains []string
+	domainReplaceAttempted := false
 
 	fail := func(err error) (applyResult, error) {
+		finalErr := err
+		if domainReplaceAttempted && h.domains != nil {
+			if restoreErr := h.domains.ReplaceAll(previousDomains); restoreErr != nil {
+				finalErr = fmt.Errorf("%w; restore domains failed: %v", err, restoreErr)
+			}
+		}
 		if persistState {
-			savedState.LastError = err.Error()
+			savedState.LastError = finalErr.Error()
 			_, _ = h.state.Save(savedState)
 		}
-		h.recordEvent("error", "rules.apply_failed", err.Error())
-		return applyResult{}, err
+		h.recordEvent("error", "rules.apply_failed", finalErr.Error())
+		return applyResult{}, finalErr
 	}
 
 	if err := validateActiveRuleEntries(state); err != nil {
@@ -1454,6 +1638,15 @@ func (h *Handler) applyStateRules(ctx context.Context, state config.State, persi
 		}
 	}
 
+	if h.domains == nil {
+		return fail(errors.New("domains manager is not configured"))
+	}
+	var err error
+	previousDomains, err = h.domains.List()
+	if err != nil {
+		return fail(err)
+	}
+	domainReplaceAttempted = true
 	if err := h.domains.ReplaceAll(domainsToApply); err != nil {
 		return fail(err)
 	}
@@ -2251,6 +2444,36 @@ func extractID(path string, prefix string) (string, error) {
 	return id, nil
 }
 
+func extractProviderAction(path string) (string, string, error) {
+	raw := strings.TrimPrefix(path, "/api/providers/")
+	if raw == "" || raw == path {
+		return "", "", errors.New("id is required")
+	}
+
+	parts := strings.Split(strings.Trim(raw, "/"), "/")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return "", "", errors.New("id is required")
+	}
+	if len(parts) > 2 {
+		return "", "", fmt.Errorf("provider path %q not found", path)
+	}
+
+	id, err := url.PathUnescape(parts[0])
+	if err != nil {
+		return "", "", err
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", "", errors.New("id is required")
+	}
+
+	action := ""
+	if len(parts) == 2 {
+		action = strings.TrimSpace(parts[1])
+	}
+	return id, action, nil
+}
+
 func findProviderIndex(providers []config.Provider, id string) int {
 	for index, provider := range providers {
 		if provider.ID == id {
@@ -2258,6 +2481,15 @@ func findProviderIndex(providers []config.Provider, id string) int {
 		}
 	}
 	return -1
+}
+
+func providerHasEnabledRules(state config.State, providerID string) bool {
+	for _, rule := range state.Rules {
+		if rule.ProviderID == providerID && rule.Enabled {
+			return true
+		}
+	}
+	return false
 }
 
 func findRuleIndex(rules []config.Rule, id string) int {
@@ -2328,6 +2560,19 @@ func writeError(w http.ResponseWriter, statusCode int, err error) {
 	writeJSON(w, statusCode, map[string]string{
 		"error": err.Error(),
 	})
+}
+
+func writeUpdateError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, update.ErrOperationInProgress):
+		writeError(w, http.StatusConflict, err)
+	case errors.Is(err, update.ErrUnsupportedRuntime):
+		writeError(w, http.StatusServiceUnavailable, err)
+	case errors.Is(err, update.ErrInvalidBundle), errors.Is(err, update.ErrReleaseAssetNotFound):
+		writeError(w, http.StatusBadRequest, err)
+	default:
+		writeError(w, http.StatusInternalServerError, err)
+	}
 }
 
 func writeMethodNotAllowed(w http.ResponseWriter, methods ...string) {

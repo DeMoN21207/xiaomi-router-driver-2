@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -306,6 +307,93 @@ func TestFetchEntriesCachedWritesAndReusesCache(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Name != "Germany" {
 		t.Fatalf("unexpected reused cache entries: %+v", entries)
+	}
+}
+
+func TestRefreshEntriesCachedBypassesFreshCacheAndRewritesCache(t *testing.T) {
+	t.Setenv("VPN_MANAGER_SUBSCRIPTION_CACHE_TTL", "10m")
+
+	var hits atomic.Int32
+	liveRaw := testSubscriptionPayload(t, "Fresh")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(liveRaw))
+	}))
+	defer server.Close()
+
+	cacheDir := t.TempDir()
+	cachePath := entriesCachePath(cacheDir, server.URL)
+	staleRaw := testSubscriptionPayload(t, "Cached")
+	if err := saveEntriesCache(cachePath, server.URL, staleRaw, time.Now().UTC()); err != nil {
+		t.Fatalf("saveEntriesCache() error = %v", err)
+	}
+
+	entries, err := RefreshEntriesCached(server.URL, cacheDir)
+	if err != nil {
+		t.Fatalf("RefreshEntriesCached() error = %v", err)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("expected refresh to hit the network once, got %d", hits.Load())
+	}
+	if len(entries) != 1 || entries[0].Name != "Fresh" {
+		t.Fatalf("unexpected refreshed entries: %+v", entries)
+	}
+
+	entries, mode, err := FetchEntriesCached(server.URL, cacheDir)
+	if err != nil {
+		t.Fatalf("FetchEntriesCached() after refresh error = %v", err)
+	}
+	if mode != entriesFetchFreshCache {
+		t.Fatalf("FetchEntriesCached() mode = %q, want %q", mode, entriesFetchFreshCache)
+	}
+	if len(entries) != 1 || entries[0].Name != "Fresh" {
+		t.Fatalf("expected rewritten cache to contain Fresh, got %+v", entries)
+	}
+}
+
+func TestRefreshEntriesCachedRetriesWithHappProfileAfterHTTPError(t *testing.T) {
+	var hits atomic.Int32
+	liveRaw := testSubscriptionPayload(t, "Happ")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.Header.Get("User-Agent") != "Happ" {
+			http.Error(w, "gateway timeout", http.StatusGatewayTimeout)
+			return
+		}
+		if r.Header.Get("X-Device-OS") != "OpenWrt" {
+			http.Error(w, "missing device headers", http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(liveRaw))
+	}))
+	defer server.Close()
+
+	entries, err := RefreshEntriesCached(server.URL, t.TempDir())
+	if err != nil {
+		t.Fatalf("RefreshEntriesCached() error = %v", err)
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("expected default request and Happ retry, got %d hits", hits.Load())
+	}
+	if len(entries) != 1 || entries[0].Name != "Happ" {
+		t.Fatalf("unexpected entries: %+v", entries)
+	}
+}
+
+func TestRefreshEntriesCachedReturnsCacheWriteError(t *testing.T) {
+	raw := testSubscriptionPayload(t, "Fresh")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(raw))
+	}))
+	defer server.Close()
+
+	runtimeDir := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(runtimeDir, []byte("file"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := RefreshEntriesCached(server.URL, runtimeDir); err == nil {
+		t.Fatal("RefreshEntriesCached() error = nil, want cache write error")
 	}
 }
 

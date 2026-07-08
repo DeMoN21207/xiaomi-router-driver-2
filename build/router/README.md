@@ -8,11 +8,13 @@ Build entrypoints:
 - `package_router.bat`
 - `package_router.sh`
 
+Release archive:
+- `package_router.sh` and `package_router.bat` also create `build/vpn-manager-linux-arm64.tar.gz` for GitHub Releases.
+
 Files:
 - `vpn-manager` is the Linux router binary.
-- `openvpn` and `sing-box` are placed next to `vpn-manager` for compatibility with the existing router layout.
+- `bin/openvpn` and `bin/sing-box` are bundled runtime helper binaries.
 - `start.sh` starts the app from this directory.
-- `bin/` may contain bundled `openvpn` and `sing-box` binaries.
 - `data/` is the runtime data directory. The app fills it on first start.
 - `bundle-info.txt` contains the bundle build settings.
 
@@ -22,7 +24,7 @@ Copy:
 
 Start:
 1. `cd /path/to/vpn-manager`
-2. `chmod +x vpn-manager start.sh`
+2. `chmod +x vpn-manager start.sh bin/openvpn bin/sing-box 2>/dev/null || true`
 3. `VPN_MANAGER_PORT=18080 ./start.sh`
 
 What the app creates on first start:

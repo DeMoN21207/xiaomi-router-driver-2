@@ -85,12 +85,18 @@ type AutomationSettings struct {
 	TrafficCleanupDays     int    `json:"trafficCleanupDays"`
 }
 
+type UpdateSettings struct {
+	Repository   string `json:"repository"`
+	AssetPattern string `json:"assetPattern"`
+}
+
 type State struct {
 	Providers        []Provider         `json:"providers"`
 	Rules            []Rule             `json:"rules"`
 	PriorityPolicies []PriorityPolicy   `json:"priorityPolicies"`
 	Routing          RoutingSettings    `json:"routing"`
 	Automation       AutomationSettings `json:"automation"`
+	Update           UpdateSettings     `json:"update"`
 	LastAppliedAt    string             `json:"lastAppliedAt"`
 	LastError        string             `json:"lastError"`
 	UpdatedAt        string             `json:"updatedAt"`
@@ -118,6 +124,7 @@ func DefaultState() State {
 		PriorityPolicies: []PriorityPolicy{},
 		Routing:          DefaultRoutingSettings(),
 		Automation:       DefaultAutomationSettings(),
+		Update:           DefaultUpdateSettings(),
 	}
 }
 
@@ -150,6 +157,13 @@ func DefaultAutomationSettings() AutomationSettings {
 		FailoverRestoreSeconds: 60,
 		FailoverAllDownMode:    "keep",
 		TrafficCleanupDays:     14,
+	}
+}
+
+func DefaultUpdateSettings() UpdateSettings {
+	return UpdateSettings{
+		Repository:   "DeMoN21207/xiaomi-router-driver-2",
+		AssetPattern: "vpn-manager-linux-arm64.tar.gz",
 	}
 }
 
@@ -601,9 +615,11 @@ func saveStateTx(tx *sql.Tx, state State) error {
 	}
 
 	for key, value := range map[string]string{
-		"lastAppliedAt": state.LastAppliedAt,
-		"lastError":     state.LastError,
-		"updatedAt":     state.UpdatedAt,
+		"lastAppliedAt":      state.LastAppliedAt,
+		"lastError":          state.LastError,
+		"updatedAt":          state.UpdatedAt,
+		"updateRepository":   state.Update.Repository,
+		"updateAssetPattern": state.Update.AssetPattern,
 	} {
 		if err := saveMetaTx(tx, key, value); err != nil {
 			return err
@@ -861,6 +877,10 @@ func (m *Manager) loadUnlocked() (State, error) {
 			state.LastError = value
 		case "updatedAt":
 			state.UpdatedAt = value
+		case "updateRepository":
+			state.Update.Repository = value
+		case "updateAssetPattern":
+			state.Update.AssetPattern = value
 		}
 	}
 	if err := metaRows.Err(); err != nil {
@@ -984,6 +1004,7 @@ func normalize(state State) State {
 	state.PriorityPolicies = normalizePriorityPolicies(state.PriorityPolicies)
 	state.Routing = normalizeRoutingSettings(state.Routing)
 	state.Automation = normalizeAutomationSettings(state.Automation)
+	state.Update = normalizeUpdateSettings(state.Update)
 	state.LastAppliedAt = strings.TrimSpace(state.LastAppliedAt)
 	state.LastError = strings.TrimSpace(state.LastError)
 	state.UpdatedAt = strings.TrimSpace(state.UpdatedAt)
@@ -1188,6 +1209,31 @@ func normalizeAutomationSettings(settings AutomationSettings) AutomationSettings
 
 	if settings.TrafficCleanupDays < 0 {
 		settings.TrafficCleanupDays = 0
+	}
+
+	return settings
+}
+
+func normalizeUpdateSettings(settings UpdateSettings) UpdateSettings {
+	defaults := DefaultUpdateSettings()
+
+	settings.Repository = strings.TrimSpace(settings.Repository)
+	if settings.Repository == "" {
+		settings.Repository = defaults.Repository
+	}
+	settings.Repository = strings.TrimPrefix(settings.Repository, "https://github.com/")
+	settings.Repository = strings.TrimSuffix(settings.Repository, ".git")
+	settings.Repository = strings.Trim(settings.Repository, "/")
+	if parts := strings.Split(settings.Repository, "/"); len(parts) >= 2 {
+		settings.Repository = parts[len(parts)-2] + "/" + parts[len(parts)-1]
+	}
+	if settings.Repository == "" || !strings.Contains(settings.Repository, "/") {
+		settings.Repository = defaults.Repository
+	}
+
+	settings.AssetPattern = strings.TrimSpace(settings.AssetPattern)
+	if settings.AssetPattern == "" {
+		settings.AssetPattern = defaults.AssetPattern
 	}
 
 	return settings

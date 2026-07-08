@@ -2,6 +2,7 @@ package status
 
 import (
 	"database/sql"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -87,6 +88,17 @@ func TestSiteTrafficStoreListSupportsSourceIPFilterAndPagination(t *testing.T) {
 	}
 	if filtered.TotalBytes != 6144 {
 		t.Fatalf("expected filtered bytes 6144, got %d", filtered.TotalBytes)
+	}
+
+	direct, err := store.List("direct", "packets", "asc", "", "", 1, 10)
+	if err != nil {
+		t.Fatalf("List() direct scope error = %v", err)
+	}
+	if direct.TotalCount != 1 {
+		t.Fatalf("expected one direct site, got %d", direct.TotalCount)
+	}
+	if len(direct.Stats) != 1 || direct.Stats[0].Domain != "youtube.com" || direct.Stats[0].ViaTunnel {
+		t.Fatalf("unexpected direct scope stats: %+v", direct.Stats)
 	}
 }
 
@@ -574,6 +586,64 @@ func TestBuildRouteMatcherResolvesIPv4AndCIDREntries(t *testing.T) {
 
 	if viaTunnel, _ := matcher.resolve("149.154.200.1"); viaTunnel {
 		t.Fatalf("expected unrelated ip to stay outside the route")
+	}
+}
+
+func TestDNSObservationsPreferOriginalQueryDomainForCNAMEReply(t *testing.T) {
+	observations := dnsObservationsFromLines([]string{
+		"Wed Jul  8 12:00:00 2026 daemon.info dnsmasq[1234]: 42 192.168.31.10/5353 query[A] chat.openai.com from 192.168.31.10",
+		"Wed Jul  8 12:00:00 2026 daemon.info dnsmasq[1234]: 42 192.168.31.10/5353 reply chat.openai.com is <CNAME>",
+		"Wed Jul  8 12:00:00 2026 daemon.info dnsmasq[1234]: 42 192.168.31.10/5353 reply chat.openai.com.cdn.cloudflare.net is 104.18.33.45",
+	}, "2026-07-08T09:00:00Z")
+
+	if len(observations) != 1 {
+		t.Fatalf("expected one observation, got %+v", observations)
+	}
+	if observations[0].Domain != "chat.openai.com" {
+		t.Fatalf("expected original query domain, got %q", observations[0].Domain)
+	}
+	if observations[0].IP != "104.18.33.45" {
+		t.Fatalf("expected observed IP, got %q", observations[0].IP)
+	}
+}
+
+func TestDNSObservationsHandlePlainReplyWithoutExtraPrefix(t *testing.T) {
+	observations := dnsObservationsFromLines([]string{
+		"dnsmasq[1234]: reply youtube.com is 142.250.185.206",
+	}, "2026-07-08T09:00:00Z")
+
+	if len(observations) != 1 {
+		t.Fatalf("expected one observation, got %+v", observations)
+	}
+	if observations[0].Domain != "youtube.com" || observations[0].IP != "142.250.185.206" {
+		t.Fatalf("unexpected observation: %+v", observations[0])
+	}
+}
+
+func TestOpenConntrackTableFallsBackToLegacyPath(t *testing.T) {
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "ip_conntrack")
+	if err := os.WriteFile(legacyPath, []byte(""), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	originalPaths := conntrackTablePaths
+	conntrackTablePaths = []string{
+		filepath.Join(dir, "nf_conntrack"),
+		legacyPath,
+	}
+	t.Cleanup(func() {
+		conntrackTablePaths = originalPaths
+	})
+
+	file, err := openConntrackTable()
+	if err != nil {
+		t.Fatalf("openConntrackTable() error = %v", err)
+	}
+	defer file.Close()
+
+	if file.Name() != legacyPath {
+		t.Fatalf("opened %q, want %q", file.Name(), legacyPath)
 	}
 }
 

@@ -16,6 +16,10 @@ PACKAGE_TEMPLATE_DIR="$ROOT_DIR/packaging/router"
 : "${ROUTER_DATA_DIR_NAME:=data}"
 : "${ROUTER_OPENVPN_BIN:=}"
 : "${ROUTER_SINGBOX_BIN:=}"
+: "${ROUTER_VERSION:=}"
+: "${ROUTER_COMMIT:=}"
+: "${ROUTER_BUILT_AT:=}"
+: "${ROUTER_ARCHIVE_NAME:=vpn-manager-${ROUTER_GOOS}-${ROUTER_GOARCH}.tar.gz}"
 
 if [[ -f "$LOCAL_ENV_FILE" ]]; then
   # shellcheck disable=SC1090
@@ -73,13 +77,14 @@ npm run build
 
 echo "[2/4] Building $ROUTER_GOOS/$ROUTER_GOARCH binary..."
 cd "$ROOT_DIR"
-CGO_ENABLED=0 GOOS="$ROUTER_GOOS" GOARCH="$ROUTER_GOARCH" "$GO_EXE" build -o "$ROUTER_PACKAGE_DIR/$ROUTER_BINARY_NAME" ./cmd/vpn-manager
+CGO_ENABLED=0 GOOS="$ROUTER_GOOS" GOARCH="$ROUTER_GOARCH" "$GO_EXE" build -buildvcs=false -o "$ROUTER_PACKAGE_DIR/$ROUTER_BINARY_NAME" ./cmd/vpn-manager
 chmod +x "$ROUTER_PACKAGE_DIR/$ROUTER_BINARY_NAME" 2>/dev/null || true
 
 echo "[3/4] Preparing router bundle..."
 cp "$PACKAGE_TEMPLATE_DIR/README.md" "$ROUTER_PACKAGE_DIR/README.md"
 cp "$PACKAGE_TEMPLATE_DIR/start.sh" "$ROUTER_PACKAGE_DIR/start.sh"
 chmod +x "$ROUTER_PACKAGE_DIR/start.sh"
+rm -f "$ROUTER_PACKAGE_DIR/openvpn" "$ROUTER_PACKAGE_DIR/sing-box"
 
 OPENVPN_BUNDLE_PATH=""
 SINGBOX_BUNDLE_PATH=""
@@ -90,14 +95,11 @@ if [[ -n "$ROUTER_OPENVPN_BIN" ]]; then
     exit 1
   fi
   cp "$ROUTER_OPENVPN_BIN" "$ROUTER_PACKAGE_DIR/bin/openvpn"
-  cp "$ROUTER_OPENVPN_BIN" "$ROUTER_PACKAGE_DIR/openvpn"
   chmod +x "$ROUTER_PACKAGE_DIR/bin/openvpn"
-  chmod +x "$ROUTER_PACKAGE_DIR/openvpn"
-  OPENVPN_BUNDLE_PATH="openvpn"
+  OPENVPN_BUNDLE_PATH="bin/openvpn"
 elif [[ -f "$ROUTER_PACKAGE_DIR/bin/openvpn" ]]; then
-  cp "$ROUTER_PACKAGE_DIR/bin/openvpn" "$ROUTER_PACKAGE_DIR/openvpn"
-  chmod +x "$ROUTER_PACKAGE_DIR/openvpn"
-  OPENVPN_BUNDLE_PATH="openvpn"
+  chmod +x "$ROUTER_PACKAGE_DIR/bin/openvpn"
+  OPENVPN_BUNDLE_PATH="bin/openvpn"
 fi
 
 if [[ -n "$ROUTER_SINGBOX_BIN" ]]; then
@@ -106,19 +108,25 @@ if [[ -n "$ROUTER_SINGBOX_BIN" ]]; then
     exit 1
   fi
   cp "$ROUTER_SINGBOX_BIN" "$ROUTER_PACKAGE_DIR/bin/sing-box"
-  cp "$ROUTER_SINGBOX_BIN" "$ROUTER_PACKAGE_DIR/sing-box"
   chmod +x "$ROUTER_PACKAGE_DIR/bin/sing-box"
-  chmod +x "$ROUTER_PACKAGE_DIR/sing-box"
-  SINGBOX_BUNDLE_PATH="sing-box"
+  SINGBOX_BUNDLE_PATH="bin/sing-box"
 elif [[ -f "$ROUTER_PACKAGE_DIR/bin/sing-box" ]]; then
-  cp "$ROUTER_PACKAGE_DIR/bin/sing-box" "$ROUTER_PACKAGE_DIR/sing-box"
-  chmod +x "$ROUTER_PACKAGE_DIR/sing-box"
-  SINGBOX_BUNDLE_PATH="sing-box"
+  chmod +x "$ROUTER_PACKAGE_DIR/bin/sing-box"
+  SINGBOX_BUNDLE_PATH="bin/sing-box"
 fi
 
 chmod +x "$ROUTER_PACKAGE_DIR/bin/"* 2>/dev/null || true
-chmod +x "$ROUTER_PACKAGE_DIR/openvpn" 2>/dev/null || true
-chmod +x "$ROUTER_PACKAGE_DIR/sing-box" 2>/dev/null || true
+
+if [[ -z "$ROUTER_COMMIT" ]] && command -v git >/dev/null 2>&1 && git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  ROUTER_COMMIT="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+  if [[ -n "$ROUTER_COMMIT" ]] && [[ -n "$(git -C "$ROOT_DIR" status --porcelain 2>/dev/null)" ]]; then
+    ROUTER_COMMIT="${ROUTER_COMMIT}-dirty"
+  fi
+fi
+
+if [[ -z "$ROUTER_BUILT_AT" ]]; then
+  ROUTER_BUILT_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+fi
 
 cat > "$ROUTER_PACKAGE_DIR/bundle-info.txt" <<EOF
 binary=$ROUTER_BINARY_NAME
@@ -130,6 +138,20 @@ data_dir=$ROUTER_DATA_DIR_NAME
 openvpn_path=$OPENVPN_BUNDLE_PATH
 singbox_path=$SINGBOX_BUNDLE_PATH
 EOF
+if [[ -n "$ROUTER_VERSION" ]]; then
+  echo "version=$ROUTER_VERSION" >> "$ROUTER_PACKAGE_DIR/bundle-info.txt"
+fi
+if [[ -n "$ROUTER_COMMIT" ]]; then
+  echo "commit=$ROUTER_COMMIT" >> "$ROUTER_PACKAGE_DIR/bundle-info.txt"
+fi
+if [[ -n "$ROUTER_BUILT_AT" ]]; then
+  echo "built_at=$ROUTER_BUILT_AT" >> "$ROUTER_PACKAGE_DIR/bundle-info.txt"
+fi
+
+ROUTER_ARCHIVE_PATH="$ROOT_DIR/build/$ROUTER_ARCHIVE_NAME"
+mkdir -p "$(dirname "$ROUTER_ARCHIVE_PATH")"
+tar -C "$ROUTER_PACKAGE_DIR" -czf "$ROUTER_ARCHIVE_PATH" .
 
 echo "[4/4] Router bundle ready: $ROUTER_PACKAGE_DIR"
+echo "[done] Release archive: $ROUTER_ARCHIVE_PATH"
 echo "[done] Copy the whole directory to the router and start it with ./start.sh"

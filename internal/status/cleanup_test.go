@@ -2,6 +2,7 @@ package status
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,4 +59,25 @@ func TestPurgeTrafficOlderThanRemovesOldObservedDNSRows(t *testing.T) {
 	assertCount(`SELECT COUNT(1) FROM site_dns_observations`, 1)
 	assertCount(`SELECT COUNT(1) FROM device_traffic_history`, 0)
 	assertCount(`SELECT COUNT(1) FROM device_site_traffic_history`, 0)
+}
+
+func TestPurgeTrafficOlderThanReturnsStoreErrors(t *testing.T) {
+	db, err := sqlitedb.Open(filepath.Join(t.TempDir(), "vpn-manager.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	service := &Service{
+		siteTraffic: newSiteTrafficStore(db),
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	err = service.PurgeTrafficOlderThan(time.Now())
+	if err == nil {
+		t.Fatal("PurgeTrafficOlderThan() error = nil, want store error")
+	}
+	if !strings.Contains(err.Error(), "site traffic cleanup") {
+		t.Fatalf("PurgeTrafficOlderThan() error = %q, want site traffic cleanup context", err.Error())
+	}
 }

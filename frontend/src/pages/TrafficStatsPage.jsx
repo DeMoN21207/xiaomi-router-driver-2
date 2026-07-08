@@ -7,6 +7,7 @@ import InlineNotice from "../components/InlineNotice.jsx";
 import { formatBytes, formatBytesPerSecond, formatDate, formatDateFull } from "../utils.js";
 
 const siteSortOptions = ["bytes", "packets", "domain"];
+const siteScopeOptions = ["", "tunneled", "direct"];
 const deviceHistoryRangeOptions = ["1h", "3h", "1d", "3d", "7d", "30d"];
 const focusedDeviceSiteLimit = 5;
 const sitePageSize = 20;
@@ -21,6 +22,7 @@ export default function TrafficStatsPage() {
   const [error, setError] = useState("");
   const [siteSortBy, setSiteSortBy] = useState("bytes");
   const [siteSortDir, setSiteSortDir] = useState("desc");
+  const [siteScope, setSiteScope] = useState("");
   const [siteSearch, setSiteSearch] = useState("");
   const [selectedDeviceIp, setSelectedDeviceIp] = useState("");
   const [sitePage, setSitePage] = useState(1);
@@ -68,6 +70,9 @@ export default function TrafficStatsPage() {
     if (siteSortDir !== "desc") {
       query.set("order", siteSortDir);
     }
+    if (siteScope) {
+      query.set("scope", siteScope);
+    }
     query.set("page", String(sitePage));
     query.set("pageSize", String(sitePageSize));
     if (siteSearch.trim()) {
@@ -85,18 +90,21 @@ export default function TrafficStatsPage() {
       return `/api/traffic/sites/history?${query.toString()}`;
     }
     return `/api/traffic/sites?${query.toString()}`;
-  }, [deviceHistoryFrom, deviceHistoryRange, deviceHistoryTo, selectedDeviceIp, sitePage, siteSearch, siteSortBy, siteSortDir]);
+  }, [deviceHistoryFrom, deviceHistoryRange, deviceHistoryTo, selectedDeviceIp, sitePage, siteScope, siteSearch, siteSortBy, siteSortDir]);
 
   const buildDevicesURL = useCallback(() => {
     const query = new URLSearchParams();
     query.set("page", "1");
     query.set("pageSize", "1");
     query.set("siteLimit", "0");
+    if (siteScope) {
+      query.set("scope", siteScope);
+    }
     if (selectedDeviceIp) {
       query.set("sourceIp", selectedDeviceIp);
     }
     return `/api/traffic/devices?${query.toString()}`;
-  }, [selectedDeviceIp]);
+  }, [selectedDeviceIp, siteScope]);
 
   const buildSelectedDeviceURL = useCallback(() => {
     if (!selectedDeviceIp) {
@@ -108,8 +116,11 @@ export default function TrafficStatsPage() {
     query.set("page", "1");
     query.set("pageSize", "1");
     query.set("siteLimit", String(focusedDeviceSiteLimit));
+    if (siteScope) {
+      query.set("scope", siteScope);
+    }
     return `/api/traffic/devices?${query.toString()}`;
-  }, [selectedDeviceIp]);
+  }, [selectedDeviceIp, siteScope]);
 
   const buildDeviceHistoryURL = useCallback(() => {
     if (!selectedDeviceIp) {
@@ -218,6 +229,7 @@ export default function TrafficStatsPage() {
   }, [addToProxy, loadRoutesConfig, refresh, routesConfig, showToast, t]);
 
   const handleSortChange = useCallback((key) => {
+    setSitePage(1);
     if (key === siteSortBy) {
       setSiteSortDir((d) => (d === "desc" ? "asc" : "desc"));
     } else {
@@ -226,13 +238,28 @@ export default function TrafficStatsPage() {
     }
   }, [siteSortBy]);
 
-  useEffect(() => {
+  const handleScopeChange = useCallback((value) => {
     setSitePage(1);
-  }, [siteSortBy, siteSortDir, siteSearch, selectedDeviceIp]);
+    setSiteScope(value);
+  }, []);
+
+  const handleSearchChange = useCallback((value) => {
+    setSitePage(1);
+    setSiteSearch(value);
+  }, []);
+
+  const handleDeviceFilterChange = useCallback((value) => {
+    setSitePage(1);
+    setSelectedDeviceIp(value);
+  }, []);
 
   useEffect(() => {
-    if (siteData && siteData.totalPages > 0 && sitePage > siteData.totalPages) {
-      setSitePage(siteData.totalPages);
+    if (!siteData) {
+      return;
+    }
+    const lastPage = Math.max(1, siteData.totalPages || 0);
+    if (sitePage > lastPage) {
+      setSitePage(lastPage);
     }
   }, [siteData, sitePage]);
 
@@ -442,7 +469,7 @@ export default function TrafficStatsPage() {
           </div>
           <button
             type="button"
-            onClick={() => setSelectedDeviceIp("")}
+            onClick={() => handleDeviceFilterChange("")}
             className="rounded-xl border border-primary/20 bg-surface-container px-4 py-2 text-sm font-medium text-on-surface transition-colors hover:border-primary/40 hover:text-primary"
           >
             {t("trafficStats.deviceFilterAll")}
@@ -451,14 +478,18 @@ export default function TrafficStatsPage() {
       ) : null}
 
       {selectedDevice ? (
-        <DeviceActivityHistorySection
+          <DeviceActivityHistorySection
           device={selectedDevice}
           history={selectedDeviceHistory}
           range={deviceHistoryRange}
           customFrom={deviceHistoryFrom}
           customTo={deviceHistoryTo}
-          onRangeChange={setDeviceHistoryRange}
+          onRangeChange={(range) => {
+            setSitePage(1);
+            setDeviceHistoryRange(range);
+          }}
           onApplyCustomRange={(from, to) => {
+            setSitePage(1);
             setDeviceHistoryFrom(from);
             setDeviceHistoryTo(to);
             setDeviceHistoryRange("custom");
@@ -475,7 +506,7 @@ export default function TrafficStatsPage() {
             <input
               type="text"
               value={siteSearch}
-              onChange={(event) => setSiteSearch(event.target.value)}
+              onChange={(event) => handleSearchChange(event.target.value)}
               placeholder={t("trafficStats.searchPlaceholder")}
               className="w-full rounded-xl border border-outline-variant/20 bg-surface-container-lowest/50 py-2.5 pl-10 pr-4 text-sm text-on-surface outline-none transition-colors focus:border-primary/40"
             />
@@ -487,7 +518,7 @@ export default function TrafficStatsPage() {
             <select
               id="traffic-device-filter"
               value={selectedDeviceIp}
-              onChange={(event) => setSelectedDeviceIp(event.target.value)}
+              onChange={(event) => handleDeviceFilterChange(event.target.value)}
               className="w-full appearance-none rounded-xl border border-outline-variant/20 bg-surface-container-lowest/50 py-2.5 pl-10 pr-10 text-sm text-on-surface outline-none transition-colors focus:border-primary/40"
             >
               <option value="">{t("trafficStats.deviceFilterAll")}</option>
@@ -498,6 +529,23 @@ export default function TrafficStatsPage() {
               ))}
             </select>
             <Icon name="expand_more" className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-outline" />
+          </div>
+
+          <div className="flex flex-wrap gap-2" aria-label={t("trafficStats.trafficFilter")}>
+            {siteScopeOptions.map((scope) => (
+              <button
+                key={scope || "all"}
+                type="button"
+                onClick={() => handleScopeChange(scope)}
+                className={`rounded-full border px-3 py-1.5 text-xs font-bold uppercase tracking-wider transition-colors ${
+                  siteScope === scope
+                    ? "border-secondary/30 bg-secondary/10 text-secondary"
+                    : "border-outline-variant/20 bg-surface-container-high text-on-surface-variant hover:border-secondary/30 hover:text-on-surface"
+                }`}
+              >
+                {t(`trafficStats.scope.${scope || "all"}`)}
+              </button>
+            ))}
           </div>
 
           <div className="flex flex-wrap gap-2">

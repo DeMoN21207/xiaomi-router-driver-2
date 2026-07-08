@@ -26,7 +26,7 @@ func FetchEntries(source string) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	entries, _, err := fetchEntriesLive(normalizedSource)
+	entries, _, err := fetchEntriesLive(normalizedSource, true)
 	return entries, err
 }
 

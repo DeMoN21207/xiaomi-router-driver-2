@@ -46,6 +46,7 @@ func TestManagerRoundTripSQLite(t *testing.T) {
 			DNSMasqConfigFile: "/tmp/dnsmasq.d/vpn_dns.conf",
 		},
 		Automation:    AutomationSettings{InstallService: true, AutoRecover: true},
+		Update:        UpdateSettings{Repository: "example/router", AssetPattern: "router-*.tar.gz"},
 		LastAppliedAt: "2026-03-25T00:00:00Z",
 		LastError:     "",
 	}
@@ -83,6 +84,9 @@ func TestManagerRoundTripSQLite(t *testing.T) {
 	if !loaded.Automation.InstallService || !loaded.Automation.AutoRecover {
 		t.Fatalf("unexpected automation settings: %+v", loaded.Automation)
 	}
+	if loaded.Update.Repository != "example/router" || loaded.Update.AssetPattern != "router-*.tar.gz" {
+		t.Fatalf("unexpected update settings: %+v", loaded.Update)
+	}
 	if loaded.Routing.LoadProfile != DefaultRoutingLoadProfile() {
 		t.Fatalf("expected default load profile %q, got %q", DefaultRoutingLoadProfile(), loaded.Routing.LoadProfile)
 	}
@@ -97,6 +101,16 @@ func TestDefaultAutomationSettingsTrafficCleanup(t *testing.T) {
 	}
 	if got := DefaultAutomationSettings().FailoverAllDownMode; got != "keep" {
 		t.Fatalf("expected default all-down mode keep, got %q", got)
+	}
+}
+
+func TestDefaultStateIncludesUpdateSettings(t *testing.T) {
+	state := DefaultState()
+	if state.Update.Repository != "DeMoN21207/xiaomi-router-driver-2" {
+		t.Fatalf("repository = %q", state.Update.Repository)
+	}
+	if state.Update.AssetPattern != "vpn-manager-linux-arm64.tar.gz" {
+		t.Fatalf("asset pattern = %q", state.Update.AssetPattern)
 	}
 }
 

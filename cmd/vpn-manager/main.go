@@ -6,7 +6,8 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/р"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"xiomi-router-driver/internal/status"
 	"xiomi-router-driver/internal/subscription"
 	"xiomi-router-driver/internal/ui"
+	"xiomi-router-driver/internal/update"
 )
 
 func main() {
@@ -86,6 +88,15 @@ func main() {
 	automationManager := automation.NewManager(paths.AppDir, executablePath, port)
 	openvpnManager := openvpn.NewManager(paths.AppDir, paths.DataDir, db, routingRunner, recordEvent)
 	subscriptionManager := subscription.NewManager(paths.AppDir, paths.DataDir, db, routingRunner, recordEvent)
+	updateManager := update.NewManager(update.Options{
+		AppDir:      paths.AppDir,
+		DataDir:     paths.DataDir,
+		State:       stateManager,
+		RecordEvent: recordEvent,
+		Restart: func() {
+			restartSelf(paths.AppDir, filepath.Base(executablePath), port)
+		},
+	})
 	statusService := status.NewService(
 		stateManager,
 		domainManager,
@@ -123,6 +134,7 @@ func main() {
 		OpenVPN:       openvpnManager,
 		Subscriptions: subscriptionManager,
 		Status:        statusService,
+		Update:        updateManager,
 		DataDir:       paths.DataDir,
 	})
 	supervisor := automation.NewSupervisor(stateManager, statusService, apiHandler.ApplyCurrentRules, apiHandler.ApplyRulesFromState, recordEvent, paths.DataDir)
@@ -180,4 +192,30 @@ func requestLogger(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
 	})
+}
+
+func restartSelf(appDir string, binaryName string, port string) {
+	script := `
+app_dir=$1
+binary=$2
+port=$3
+sleep 1
+cd "$app_dir" || exit 1
+export VPN_MANAGER_ROOT="$app_dir"
+export VPN_MANAGER_PORT="$port"
+export PATH="$app_dir:$app_dir/bin:$app_dir/.vpn-manager/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+if [ -x /sbin/start-stop-daemon ]; then
+  /sbin/start-stop-daemon -K -q -p "/tmp/$binary.pid" 2>/dev/null || true
+  rm -f "/tmp/$binary.pid"
+  /sbin/start-stop-daemon -S -q -b -m -p "/tmp/$binary.pid" -x "./$binary"
+else
+  "./$binary" >"/tmp/$binary.log" 2>&1 </dev/null &
+fi
+`
+	cmd := exec.Command("/bin/sh", "-c", script, "vpn-manager-restart", appDir, binaryName, port)
+	if err := cmd.Start(); err != nil {
+		log.Printf("schedule restart failed: %v", err)
+		return
+	}
+	os.Exit(0)
 }

@@ -60,7 +60,7 @@ func FetchEntriesCached(source string, runtimeDir string) ([]Entry, entriesFetch
 		}
 	}
 
-	entries, raw, err := fetchEntriesLive(normalizedSource)
+	entries, raw, err := fetchEntriesLive(normalizedSource, false)
 	if err == nil {
 		if cachePath != "" {
 			_ = saveEntriesCache(cachePath, source, raw, time.Now().UTC())
@@ -76,6 +76,26 @@ func FetchEntriesCached(source string, runtimeDir string) ([]Entry, entriesFetch
 	}
 
 	return nil, entriesFetchLive, err
+}
+
+func RefreshEntriesCached(source string, runtimeDir string) ([]Entry, error) {
+	normalizedSource, err := normalizeSubscriptionSource(source)
+	if err != nil {
+		return nil, err
+	}
+
+	entries, raw, err := fetchEntriesLive(normalizedSource, true)
+	if err != nil {
+		return nil, err
+	}
+
+	cachePath := entriesCachePath(runtimeDir, normalizedSource.CacheKey)
+	if cachePath != "" {
+		if err := saveEntriesCache(cachePath, normalizedSource.CacheKey, raw, time.Now().UTC()); err != nil {
+			return nil, fmt.Errorf("save subscription cache: %w", err)
+		}
+	}
+	return entries, nil
 }
 
 func entriesCachePath(runtimeDir string, source string) string {
@@ -171,7 +191,7 @@ func fetchEntriesRaw(source string) (string, error) {
 	return fetchEntriesRawWithProfile(normalized.FetchURL, subscriptionFetchProfile{})
 }
 
-func fetchEntriesLive(source subscriptionSource) ([]Entry, string, error) {
+func fetchEntriesLive(source subscriptionSource, retryFetchErrors bool) ([]Entry, string, error) {
 	if source.Inline != "" {
 		entries, err := ParseEntries(source.Inline)
 		if err != nil {
@@ -181,35 +201,30 @@ func fetchEntriesLive(source subscriptionSource) ([]Entry, string, error) {
 	}
 
 	profiles := subscriptionFetchProfiles()
-	raw, err := fetchEntriesRawWithProfile(source.FetchURL, profiles[0])
-	if err != nil {
-		return nil, "", err
-	}
-	entries, err := ParseEntries(raw)
-	if err == nil && entriesLookUsable(entries) {
-		return entries, raw, nil
-	}
-	if err == nil {
-		err = errors.New("subscription returned only compatibility placeholder entries")
-	}
-	lastParseErr := err
-
-	for _, profile := range profiles[1:] {
-		raw, err = fetchEntriesRawWithProfile(source.FetchURL, profile)
+	var lastErr error
+	for _, profile := range profiles {
+		raw, err := fetchEntriesRawWithProfile(source.FetchURL, profile)
 		if err != nil {
+			lastErr = err
+			if !retryFetchErrors {
+				break
+			}
 			continue
 		}
-		entries, err = ParseEntries(raw)
+		entries, err := ParseEntries(raw)
 		if err == nil && entriesLookUsable(entries) {
 			return entries, raw, nil
 		}
 		if err == nil {
 			err = errors.New("subscription returned only compatibility placeholder entries")
 		}
-		lastParseErr = err
+		lastErr = err
 	}
 
-	return nil, "", lastParseErr
+	if lastErr == nil {
+		lastErr = errors.New("subscription fetch profiles are not configured")
+	}
+	return nil, "", lastErr
 }
 
 func fetchEntriesRawWithProfile(source string, profile subscriptionFetchProfile) (string, error) {

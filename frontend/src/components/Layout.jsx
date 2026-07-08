@@ -1,5 +1,6 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
+import { fetchJSON } from "../api.js";
 import { useI18n } from "../i18n.jsx";
 import Icon from "./Icon.jsx";
 import GlobalProgress from "./GlobalProgress.jsx";
@@ -24,6 +25,8 @@ export default function Layout() {
   const location = useLocation();
   const { t } = useI18n();
   const subtitleKey = subtitleKeys[location.pathname];
+  const [bundle, setBundle] = useState(null);
+  const [uptimeBase, setUptimeBase] = useState(null);
   const [collapsed, setCollapsed] = useState(() => {
     try {
       return localStorage.getItem("sidebarCollapsed") === "1";
@@ -39,6 +42,37 @@ export default function Layout() {
       /* ignore */
     }
   }, [collapsed]);
+
+  useEffect(() => {
+    let alive = true;
+
+    async function loadStatus() {
+      try {
+        const status = await fetchJSON("/api/status");
+        if (alive) {
+          setBundle(status?.bundle || null);
+          const seconds = Number(status?.uptimeSeconds);
+          if (Number.isFinite(seconds) && (seconds > 0 || status?.uptimeFormatted)) {
+            setUptimeBase({
+              seconds: Math.max(0, Math.floor(seconds)),
+              receivedAt: Date.now(),
+            });
+          }
+        }
+      } catch {
+        if (alive) {
+          setBundle(null);
+        }
+      }
+    }
+
+    loadStatus();
+    const id = window.setInterval(loadStatus, 60_000);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, []);
 
   const sidebarWidth = collapsed ? "w-16" : "w-64";
   const contentOffset = collapsed ? "md:ml-16" : "md:ml-64";
@@ -65,9 +99,12 @@ export default function Layout() {
               RV
             </div>
           ) : (
-            <h1 className="font-headline font-black text-primary text-lg tracking-tight">
-              RouteVPN Manager
-            </h1>
+            <div>
+              <h1 className="font-headline font-black text-primary text-lg tracking-tight">
+                RouteVPN Manager
+              </h1>
+              <BundleVersionBadge bundle={bundle} t={t} className="mt-2 max-w-full" />
+            </div>
           )}
         </div>
 
@@ -92,7 +129,7 @@ export default function Layout() {
           ))}
         </nav>
 
-        <SidebarClock collapsed={collapsed} />
+        <SidebarClock collapsed={collapsed} uptimeBase={uptimeBase} t={t} />
       </aside>
 
       {/* Top Bar */}
@@ -109,6 +146,8 @@ export default function Layout() {
           )}
         </div>
 
+        <BundleVersionBadge bundle={bundle} t={t} className="max-w-[42vw] md:max-w-xs" />
+
       </header>
 
       {/* Main Content */}
@@ -121,9 +160,36 @@ export default function Layout() {
   );
 }
 
-function SidebarClock({ collapsed }) {
+function BundleVersionBadge({ bundle, t, className = "" }) {
+  const label = formatBundleLabel(bundle, t);
+  const target = [bundle?.goos, bundle?.goarch].filter(Boolean).join("/");
+  const title = [
+    `${t("build.version")}: ${label}`,
+    target ? `${t("build.target")}: ${target}` : "",
+    bundle?.builtAt ? `${t("build.builtAt")}: ${bundle.builtAt}` : "",
+  ].filter(Boolean).join(" · ");
+
+  return (
+    <span
+      title={title}
+      className={`inline-flex min-w-0 items-center gap-1.5 rounded-full border border-outline-variant/20 bg-surface-container-high px-2.5 py-1 font-mono text-[10px] font-semibold text-on-surface-variant ${className}`}
+    >
+      <Icon name="terminal" className="h-3.5 w-3.5 shrink-0 text-secondary" />
+      <span className="truncate">{label}</span>
+    </span>
+  );
+}
+
+function formatBundleLabel(bundle, t) {
+  if (!bundle) {
+    return t("build.unknown");
+  }
+  const value = bundle.version || bundle.commit || [bundle.goos, bundle.goarch].filter(Boolean).join("/");
+  return value || t("build.unknown");
+}
+
+function SidebarClock({ collapsed, uptimeBase, t }) {
   const [now, setNow] = useState(() => new Date());
-  const startRef = useRef(Date.now());
 
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 1000);
@@ -132,10 +198,10 @@ function SidebarClock({ collapsed }) {
 
   if (collapsed) return null;
 
-  const elapsed = Math.floor((now.getTime() - startRef.current) / 1000);
-  const h = String(Math.floor(elapsed / 3600)).padStart(2, "0");
-  const m = String(Math.floor((elapsed % 3600) / 60)).padStart(2, "0");
-  const s = String(elapsed % 60).padStart(2, "0");
+  const uptimeSeconds = uptimeBase
+    ? uptimeBase.seconds + Math.max(0, Math.floor((now.getTime() - uptimeBase.receivedAt) / 1000))
+    : null;
+  const uptimeLabel = uptimeSeconds === null ? "--:--:--" : formatUptimeClock(uptimeSeconds);
 
   const date = now.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric" });
   const time = now.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
@@ -146,10 +212,21 @@ function SidebarClock({ collapsed }) {
     <div className="border-t border-outline-variant/10 px-4 pt-4 space-y-1">
       <div className="font-mono text-sm font-semibold text-on-surface tracking-tight">{time}</div>
       <div className="text-xs text-on-surface-variant">{date}, {dayOfWeek}</div>
-      <div className="flex items-center gap-1.5 pt-1">
+      <div className="flex items-center gap-1.5 pt-1" title={t("layout.uptimeTitle")}>
         <Icon name="timer" className="h-3.5 w-3.5 text-primary/70" />
-        <span className="font-mono text-xs text-primary/70">{h}:{m}:{s}</span>
+        <span className="text-[10px] font-bold uppercase tracking-wider text-on-surface-variant">{t("layout.uptime")}</span>
+        <span className="ml-auto font-mono text-xs text-primary/70">{uptimeLabel}</span>
       </div>
     </div>
   );
+}
+
+function formatUptimeClock(totalSeconds) {
+  const safeSeconds = Math.max(0, Math.floor(totalSeconds));
+  const days = Math.floor(safeSeconds / 86400);
+  const h = String(Math.floor((safeSeconds % 86400) / 3600)).padStart(2, "0");
+  const m = String(Math.floor((safeSeconds % 3600) / 60)).padStart(2, "0");
+  const s = String(safeSeconds % 60).padStart(2, "0");
+  const clock = `${h}:${m}:${s}`;
+  return days > 0 ? `${days}д ${clock}` : clock;
 }

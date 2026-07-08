@@ -193,6 +193,7 @@ export default function ConnectionsPage() {
   const [probing, setProbing] = useState(false);
   const [probeResult, setProbeResult] = useState(null);
   const [uploading, setUploading] = useState(false);
+  const [refreshingProviderId, setRefreshingProviderId] = useState("");
   const fileInputRef = useRef(null);
 
   const providers = config?.providers ?? [];
@@ -365,6 +366,22 @@ export default function ConnectionsPage() {
       showToast(message, true);
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function refreshSubscription(provider) {
+    setRefreshingProviderId(provider.id);
+    try {
+      const result = await fetchJSON(`/api/providers/${encodeURIComponent(provider.id)}/refresh`, { method: "POST" });
+      setPageError("");
+      showToast(t("connections.subscriptionRefreshed", { count: String(result.entries ?? 0) }));
+      await refresh();
+    } catch (error) {
+      const message = error.message;
+      setPageError(message);
+      showToast(message, true);
+    } finally {
+      setRefreshingProviderId("");
     }
   }
 
@@ -551,6 +568,8 @@ export default function ConnectionsPage() {
               domainHealthMap={domainHealthMap}
               onDelete={() => remove(provider.id)}
               onToggleEnabled={(nextEnabled) => updateProvider(provider, { enabled: nextEnabled })}
+              onRefreshSubscription={() => refreshSubscription(provider)}
+              refreshingProviderId={refreshingProviderId}
               onDomainsChange={refresh}
               showToast={showToast}
               setPageError={setPageError}
@@ -616,7 +635,7 @@ function formatFailoverOverrideMessage(override, t) {
   return t("connections.failoverProvider", { from: original || override.originalProviderId || "-", to: active || override.activeProviderId || "-" });
 }
 
-function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, isOnline, providerRules, priorityPolicies, priorityStatusMap, busy, failoverOverrides, failoverProvider, domainHealthMap, onDelete, onToggleEnabled, onDomainsChange, showToast, setPageError, t }) {
+function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, isOnline, providerRules, priorityPolicies, priorityStatusMap, busy, failoverOverrides, failoverProvider, domainHealthMap, onDelete, onToggleEnabled, onRefreshSubscription, refreshingProviderId, onDomainsChange, showToast, setPageError, t }) {
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [probing, setProbing] = useState(false);
@@ -630,6 +649,8 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
   const probedRef = useRef(false);
 
   const totalDomains = providerRules.reduce((sum, r) => sum + r.domains.length, 0);
+  const refreshingSubscription = provider.type === "subscription" && refreshingProviderId === provider.id;
+  const providerActionBusy = Boolean(refreshingProviderId);
 
   async function probeProvider() {
     setProbing(true);
@@ -730,52 +751,64 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
 
   return (
     <div className="overflow-hidden rounded-xl border border-transparent bg-surface-container-low shadow-xl transition-all duration-300 hover:border-primary/20">
-      <div className="flex items-center gap-4 p-5">
+      <div className="grid gap-4 p-5 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
         <button
           type="button"
           onClick={() => setExpanded((v) => !v)}
-          className="flex min-w-0 flex-1 items-center justify-between gap-4 rounded-xl px-1 py-1 text-left transition-colors hover:bg-surface-container/50"
+          className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-4 rounded-xl px-1 py-1 text-left transition-colors hover:bg-surface-container/50 max-sm:grid-cols-1"
         >
-        <div className="min-w-0">
-          <h3 className="truncate font-headline text-lg font-bold text-primary">{provider.name}</h3>
-          <div className="mt-1 flex flex-wrap items-center gap-2">
-            <span className="rounded bg-surface-container-highest px-2 py-0.5 font-mono text-[10px] text-on-primary-container">
-              {t(`common.${provider.type}`)}
-            </span>
-            {providerRules.length > 0 && (
-              <span className="rounded bg-surface-container-highest px-2 py-0.5 text-[10px] text-on-surface-variant">
-                {providerRules.length} {t("connections.routes")} · {totalDomains} {t("connections.domainsFor")}
+          <div className="min-w-0">
+            <h3 className="truncate font-headline text-lg font-bold text-primary">{provider.name}</h3>
+            <div className="mt-1 flex flex-wrap items-center gap-2">
+              <span className="rounded bg-surface-container-highest px-2 py-0.5 font-mono text-[10px] text-on-primary-container">
+                {t(`common.${provider.type}`)}
               </span>
-            )}
-            {providerRules.map((rule) => rule.selectedLocation && (
-              <span key={rule.id} className="flex items-center gap-1 rounded bg-primary/10 px-2 py-0.5 text-[10px] text-primary">
-                <Icon name="location_on" className="h-3 w-3" />
-                {rule.selectedLocation}
-              </span>
-            ))}
-            {failoverProvider && failoverProvider.status !== "unknown" ? (
-              <span className="rounded bg-surface-container-highest px-2 py-0.5 text-[10px] text-on-surface-variant">
-                {t("connections.failoverHealth")}: {failoverProvider.status}
-                {failoverProvider.score > 0 ? ` · ${failoverProvider.score}` : ""}
-              </span>
-            ) : null}
+              {providerRules.length > 0 && (
+                <span className="rounded bg-surface-container-highest px-2 py-0.5 text-[10px] text-on-surface-variant">
+                  {providerRules.length} {t("connections.routes")} · {totalDomains} {t("connections.domainsFor")}
+                </span>
+              )}
+              {providerRules.map((rule) => rule.selectedLocation && (
+                <span key={rule.id} className="flex items-center gap-1 rounded bg-primary/10 px-2 py-0.5 text-[10px] text-primary">
+                  <Icon name="location_on" className="h-3 w-3" />
+                  {rule.selectedLocation}
+                </span>
+              ))}
+              {failoverProvider && failoverProvider.status !== "unknown" ? (
+                <span className="rounded bg-surface-container-highest px-2 py-0.5 text-[10px] text-on-surface-variant">
+                  {t("connections.failoverHealth")}: {failoverProvider.status}
+                  {failoverProvider.score > 0 ? ` · ${failoverProvider.score}` : ""}
+                </span>
+              ) : null}
+            </div>
           </div>
-        </div>
-        <div className="flex shrink-0 items-center gap-3">
-          <span className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest ${toneClasses.badge}`}>
-            <span className={`h-2 w-2 rounded-full ${toneClasses.dot} ${isOnline ? "status-glow-success" : ""}`} />
-            {statusLabel}
-          </span>
-          <Icon name={expanded ? "expand_less" : "expand_more"} className="h-5 w-5 text-outline-variant" />
-        </div>
-      </button>
+          <div className="flex shrink-0 items-center justify-end gap-3 max-sm:justify-between">
+            <span className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest ${toneClasses.badge}`}>
+              <span className={`h-2 w-2 rounded-full ${toneClasses.dot} ${isOnline ? "status-glow-success" : ""}`} />
+              {statusLabel}
+            </span>
+            <Icon name={expanded ? "expand_less" : "expand_more"} className="h-5 w-5 text-outline-variant" />
+          </div>
+        </button>
 
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="grid shrink-0 grid-cols-[minmax(0,1fr)_6.375rem_2.25rem] items-start gap-2 lg:grid-cols-[12.3125rem_6.375rem_2.25rem] lg:pt-1">
+          {provider.type === "subscription" ? (
+            <button
+              type="button"
+              onClick={onRefreshSubscription}
+              disabled={busy || saving || providerActionBusy}
+              className="flex min-h-9 min-w-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-full border border-primary/20 bg-primary/10 px-3 py-1.5 text-xs font-bold uppercase tracking-wide text-primary transition-colors hover:bg-primary/15 disabled:opacity-40 max-sm:text-[11px] max-sm:tracking-normal"
+              title={t("connections.refreshSubscription")}
+            >
+              <Icon name="sync" className={`h-4 w-4 ${refreshingSubscription ? "animate-spin" : ""}`} />
+              {refreshingSubscription ? t("connections.refreshingSubscription") : t("connections.refreshSubscription")}
+            </button>
+          ) : null}
           <button
             type="button"
             onClick={() => onToggleEnabled(!provider.enabled)}
-            disabled={busy || saving}
-            className={`rounded-full border px-3 py-1.5 text-xs font-bold uppercase tracking-wide transition-colors disabled:opacity-40 ${
+            disabled={busy || saving || providerActionBusy}
+            className={`min-h-9 w-full whitespace-nowrap rounded-full border px-3 py-1.5 text-center text-xs font-bold uppercase tracking-wide transition-colors disabled:opacity-40 ${
               provider.enabled
                 ? "border-secondary/30 bg-secondary/10 text-secondary hover:bg-secondary/15"
                 : "border-outline-variant/20 bg-surface-container-highest text-on-surface-variant hover:border-primary/30 hover:text-on-surface"
@@ -787,8 +820,8 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
           <button
             type="button"
             onClick={onDelete}
-            disabled={busy || saving}
-            className="rounded-full border border-outline-variant/20 p-2 text-on-surface-variant transition-colors hover:border-error/30 hover:bg-error-container/20 hover:text-error disabled:opacity-40"
+            disabled={busy || saving || providerActionBusy}
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-outline-variant/20 text-on-surface-variant transition-colors hover:border-error/30 hover:bg-error-container/20 hover:text-error disabled:opacity-40"
             title={t("common.deleteProvider")}
           >
             <Icon name="delete" className="h-4 w-4" />

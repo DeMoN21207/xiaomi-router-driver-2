@@ -260,15 +260,15 @@ if [[ "$ROUTER_FETCH_RUNTIME_FROM_DEVICE" == "1" ]]; then
 
   if [[ -z "${ROUTER_OPENVPN_BIN:-}" && ! -f "$PACKAGE_OPENVPN" ]]; then
     echo "[prep] Fetching openvpn from the router..."
-    if ! scp_from "$ROUTER_REMOTE_DIR/openvpn" "$PACKAGE_OPENVPN"; then
-      scp_from "$ROUTER_REMOTE_DIR/bin/openvpn" "$PACKAGE_OPENVPN"
+    if ! scp_from "$ROUTER_REMOTE_DIR/bin/openvpn" "$PACKAGE_OPENVPN"; then
+      scp_from "$ROUTER_REMOTE_DIR/openvpn" "$PACKAGE_OPENVPN"
     fi
   fi
 
   if [[ -z "${ROUTER_SINGBOX_BIN:-}" && ! -f "$PACKAGE_SINGBOX" ]]; then
     echo "[prep] Fetching sing-box from the router..."
-    if ! scp_from "$ROUTER_REMOTE_DIR/sing-box" "$PACKAGE_SINGBOX"; then
-      scp_from "$ROUTER_REMOTE_DIR/bin/sing-box" "$PACKAGE_SINGBOX"
+    if ! scp_from "$ROUTER_REMOTE_DIR/bin/sing-box" "$PACKAGE_SINGBOX"; then
+      scp_from "$ROUTER_REMOTE_DIR/sing-box" "$PACKAGE_SINGBOX"
     fi
   fi
 fi
@@ -322,9 +322,6 @@ for name in openvpn sing-box; do
   if [[ -f "$ROUTER_PACKAGE_DIR/bin/$name" ]]; then
     scp_to "$ROUTER_PACKAGE_DIR/bin/$name" "$ROUTER_REMOTE_DIR/bin/$name"
   fi
-  if [[ -f "$ROUTER_PACKAGE_DIR/$name" ]]; then
-    scp_to "$ROUTER_PACKAGE_DIR/$name" "$ROUTER_REMOTE_DIR/$name"
-  fi
 done
 
 binary_q="$(sh_quote "$ROUTER_BINARY_NAME")"
@@ -345,8 +342,6 @@ health_delay=$health_delay_q
 cd "\$remote_dir"
 chmod +x "\$binary"
 [ -f start.sh ] && chmod +x start.sh
-[ -f openvpn ] && chmod +x openvpn
-[ -f sing-box ] && chmod +x sing-box
 [ -f bin/openvpn ] && chmod +x bin/openvpn
 [ -f bin/sing-box ] && chmod +x bin/sing-box
 pkill -x "\$service" 2>/dev/null || true

@@ -32,10 +32,17 @@ type SystemResources struct {
 	CollectedAt     string  `json:"collectedAt"`
 }
 
+type SystemUptime struct {
+	Seconds   uint64 `json:"uptimeSeconds"`
+	Formatted string `json:"uptimeFormatted"`
+}
+
 type cpuSample struct {
 	idle  uint64
 	total uint64
 }
+
+const defaultUptimePath = "/proc/uptime"
 
 var prevCPUSample cpuSample
 
@@ -149,34 +156,51 @@ func readMemInfo(res *SystemResources) {
 }
 
 func readUptime(res *SystemResources) {
-	data, err := os.ReadFile("/proc/uptime")
+	uptime := readSystemUptimeFile(defaultUptimePath)
+	res.UptimeSeconds = uptime.Seconds
+	res.UptimeFormatted = uptime.Formatted
+}
+
+func readSystemUptimeFile(path string) SystemUptime {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return
+		return SystemUptime{}
 	}
 
-	fields := strings.Fields(string(data))
+	return parseSystemUptime(string(data))
+}
+
+func parseSystemUptime(raw string) SystemUptime {
+	fields := strings.Fields(raw)
 	if len(fields) < 1 {
-		return
+		return SystemUptime{}
 	}
 
 	seconds, err := strconv.ParseFloat(fields[0], 64)
 	if err != nil {
-		return
+		return SystemUptime{}
 	}
 
-	res.UptimeSeconds = uint64(seconds)
+	wholeSeconds := uint64(seconds)
+	return SystemUptime{
+		Seconds:   wholeSeconds,
+		Formatted: formatUptimeShort(wholeSeconds),
+	}
+}
+
+func formatUptimeShort(seconds uint64) string {
 	d := time.Duration(seconds) * time.Second
 	days := int(d.Hours()) / 24
 	hours := int(d.Hours()) % 24
 	minutes := int(d.Minutes()) % 60
 
 	if days > 0 {
-		res.UptimeFormatted = strconv.Itoa(days) + "д " + strconv.Itoa(hours) + "ч " + strconv.Itoa(minutes) + "м"
-	} else if hours > 0 {
-		res.UptimeFormatted = strconv.Itoa(hours) + "ч " + strconv.Itoa(minutes) + "м"
-	} else {
-		res.UptimeFormatted = strconv.Itoa(minutes) + "м"
+		return strconv.Itoa(days) + "д " + strconv.Itoa(hours) + "ч " + strconv.Itoa(minutes) + "м"
 	}
+	if hours > 0 {
+		return strconv.Itoa(hours) + "ч " + strconv.Itoa(minutes) + "м"
+	}
+	return strconv.Itoa(minutes) + "м"
 }
 
 func readLoadAvg(res *SystemResources) {
