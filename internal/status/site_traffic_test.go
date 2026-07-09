@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,6 +100,158 @@ func TestSiteTrafficStoreListSupportsSourceIPFilterAndPagination(t *testing.T) {
 	}
 	if len(direct.Stats) != 1 || direct.Stats[0].Domain != "youtube.com" || direct.Stats[0].ViaTunnel {
 		t.Fatalf("unexpected direct scope stats: %+v", direct.Stats)
+	}
+}
+
+func TestSiteTrafficStoreListCoversSortScopeSearchSourceAndPages(t *testing.T) {
+	store := newSiteTrafficStore(openSiteTrafficTestDB(t))
+	seedTrafficMatrix(t, store)
+
+	tests := []struct {
+		name    string
+		scope   string
+		sortBy  string
+		order   string
+		source  string
+		search  string
+		page    int
+		size    int
+		total   int
+		bytes   uint64
+		domains []string
+	}{
+		{
+			name:    "bytes desc default",
+			sortBy:  "bytes",
+			page:    1,
+			size:    10,
+			total:   4,
+			bytes:   10000,
+			domains: []string{"delta.org", "alpha.com", "gamma.net", "beta.com"},
+		},
+		{
+			name:    "bytes asc",
+			sortBy:  "bytes",
+			order:   "asc",
+			page:    1,
+			size:    10,
+			total:   4,
+			bytes:   10000,
+			domains: []string{"beta.com", "gamma.net", "alpha.com", "delta.org"},
+		},
+		{
+			name:    "packets asc",
+			sortBy:  "packets",
+			order:   "asc",
+			page:    1,
+			size:    10,
+			total:   4,
+			bytes:   10000,
+			domains: []string{"gamma.net", "alpha.com", "delta.org", "beta.com"},
+		},
+		{
+			name:    "domain desc",
+			sortBy:  "domain",
+			order:   "desc",
+			page:    1,
+			size:    10,
+			total:   4,
+			bytes:   10000,
+			domains: []string{"gamma.net", "delta.org", "beta.com", "alpha.com"},
+		},
+		{
+			name:    "updated asc",
+			sortBy:  "updated",
+			order:   "asc",
+			page:    1,
+			size:    10,
+			total:   4,
+			bytes:   10000,
+			domains: []string{"alpha.com", "beta.com", "gamma.net", "delta.org"},
+		},
+		{
+			name:    "tunneled scope",
+			scope:   "tunneled",
+			sortBy:  "domain",
+			order:   "asc",
+			page:    1,
+			size:    10,
+			total:   2,
+			bytes:   5000,
+			domains: []string{"alpha.com", "gamma.net"},
+		},
+		{
+			name:    "direct scope",
+			scope:   "direct",
+			sortBy:  "bytes",
+			page:    1,
+			size:    10,
+			total:   2,
+			bytes:   5000,
+			domains: []string{"delta.org", "beta.com"},
+		},
+		{
+			name:    "source ip filter",
+			source:  "192.168.31.20",
+			sortBy:  "domain",
+			order:   "asc",
+			page:    1,
+			size:    10,
+			total:   2,
+			bytes:   5000,
+			domains: []string{"beta.com", "delta.org"},
+		},
+		{
+			name:    "domain search",
+			search:  "GAMMA",
+			sortBy:  "bytes",
+			page:    1,
+			size:    10,
+			total:   1,
+			bytes:   2000,
+			domains: []string{"gamma.net"},
+		},
+		{
+			name:    "last ip search",
+			search:  "198.51.100.20",
+			sortBy:  "bytes",
+			page:    1,
+			size:    10,
+			total:   1,
+			bytes:   1000,
+			domains: []string{"beta.com"},
+		},
+		{
+			name:    "page two",
+			sortBy:  "bytes",
+			page:    2,
+			size:    2,
+			total:   4,
+			bytes:   10000,
+			domains: []string{"gamma.net", "beta.com"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := store.List(tt.scope, tt.sortBy, tt.order, tt.source, tt.search, tt.page, tt.size)
+			if err != nil {
+				t.Fatalf("List() error = %v", err)
+			}
+			if result.TotalCount != tt.total {
+				t.Fatalf("TotalCount = %d, want %d", result.TotalCount, tt.total)
+			}
+			if result.TotalBytes != tt.bytes {
+				t.Fatalf("TotalBytes = %d, want %d", result.TotalBytes, tt.bytes)
+			}
+			gotDomains := make([]string, 0, len(result.Stats))
+			for _, item := range result.Stats {
+				gotDomains = append(gotDomains, item.Domain)
+			}
+			if strings.Join(gotDomains, ",") != strings.Join(tt.domains, ",") {
+				t.Fatalf("domains = %#v, want %#v", gotDomains, tt.domains)
+			}
+		})
 	}
 }
 
@@ -215,6 +368,255 @@ func TestSiteTrafficStoreListDevicesSupportsSearchPaginationAndOptions(t *testin
 	}
 	if ascending.Devices[0].SourceIP != "192.168.31.10" || ascending.Devices[1].SourceIP != "192.168.31.20" {
 		t.Fatalf("unexpected ascending devices: %#v", ascending.Devices)
+	}
+}
+
+func TestSiteTrafficStoreListDevicesCoversSortScopeSearchSourcePagesAndSiteLimit(t *testing.T) {
+	store := newSiteTrafficStore(openSiteTrafficTestDB(t))
+	seedTrafficMatrix(t, store)
+
+	tests := []struct {
+		name    string
+		scope   string
+		sortBy  string
+		order   string
+		source  string
+		search  string
+		page    int
+		size    int
+		limit   int
+		total   int
+		bytes   uint64
+		devices []string
+	}{
+		{
+			name:    "bytes desc default",
+			sortBy:  "bytes",
+			page:    1,
+			size:    10,
+			limit:   5,
+			total:   3,
+			bytes:   10000,
+			devices: []string{"192.168.31.20", "192.168.31.10", "192.168.31.30"},
+		},
+		{
+			name:    "bytes asc",
+			sortBy:  "bytes",
+			order:   "asc",
+			page:    1,
+			size:    10,
+			limit:   5,
+			total:   3,
+			bytes:   10000,
+			devices: []string{"192.168.31.30", "192.168.31.10", "192.168.31.20"},
+		},
+		{
+			name:    "packets desc",
+			sortBy:  "packets",
+			order:   "desc",
+			page:    1,
+			size:    10,
+			limit:   5,
+			total:   3,
+			bytes:   10000,
+			devices: []string{"192.168.31.20", "192.168.31.10", "192.168.31.30"},
+		},
+		{
+			name:    "name asc",
+			sortBy:  "name",
+			order:   "asc",
+			page:    1,
+			size:    10,
+			limit:   5,
+			total:   3,
+			bytes:   10000,
+			devices: []string{"192.168.31.10", "192.168.31.20", "192.168.31.30"},
+		},
+		{
+			name:    "updated desc",
+			sortBy:  "updated",
+			order:   "desc",
+			page:    1,
+			size:    10,
+			limit:   5,
+			total:   3,
+			bytes:   10000,
+			devices: []string{"192.168.31.20", "192.168.31.30", "192.168.31.10"},
+		},
+		{
+			name:    "tunneled scope",
+			scope:   "tunneled",
+			sortBy:  "name",
+			order:   "asc",
+			page:    1,
+			size:    10,
+			limit:   5,
+			total:   2,
+			bytes:   5000,
+			devices: []string{"192.168.31.10", "192.168.31.30"},
+		},
+		{
+			name:    "direct scope",
+			scope:   "direct",
+			sortBy:  "bytes",
+			page:    1,
+			size:    10,
+			limit:   5,
+			total:   1,
+			bytes:   5000,
+			devices: []string{"192.168.31.20"},
+		},
+		{
+			name:    "source ip filter",
+			source:  "192.168.31.20",
+			sortBy:  "bytes",
+			page:    1,
+			size:    10,
+			limit:   5,
+			total:   1,
+			bytes:   5000,
+			devices: []string{"192.168.31.20"},
+		},
+		{
+			name:    "device name search",
+			search:  "laptop",
+			sortBy:  "bytes",
+			page:    1,
+			size:    10,
+			limit:   5,
+			total:   1,
+			bytes:   5000,
+			devices: []string{"192.168.31.20"},
+		},
+		{
+			name:    "source ip search",
+			search:  "31.30",
+			sortBy:  "bytes",
+			page:    1,
+			size:    10,
+			limit:   5,
+			total:   1,
+			bytes:   2000,
+			devices: []string{"192.168.31.30"},
+		},
+		{
+			name:    "mac search",
+			search:  "ee:10",
+			sortBy:  "bytes",
+			page:    1,
+			size:    10,
+			limit:   5,
+			total:   1,
+			bytes:   3000,
+			devices: []string{"192.168.31.10"},
+		},
+		{
+			name:    "site domain search",
+			search:  "delta",
+			sortBy:  "bytes",
+			page:    1,
+			size:    10,
+			limit:   5,
+			total:   1,
+			bytes:   5000,
+			devices: []string{"192.168.31.20"},
+		},
+		{
+			name:    "page two",
+			sortBy:  "bytes",
+			page:    2,
+			size:    2,
+			limit:   5,
+			total:   3,
+			bytes:   10000,
+			devices: []string{"192.168.31.30"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := store.ListDevices(tt.scope, tt.sortBy, tt.order, tt.source, tt.search, tt.page, tt.size, tt.limit)
+			if err != nil {
+				t.Fatalf("ListDevices() error = %v", err)
+			}
+			if result.TotalCount != tt.total {
+				t.Fatalf("TotalCount = %d, want %d", result.TotalCount, tt.total)
+			}
+			if result.TotalBytes != tt.bytes {
+				t.Fatalf("TotalBytes = %d, want %d", result.TotalBytes, tt.bytes)
+			}
+			gotDevices := make([]string, 0, len(result.Devices))
+			for _, item := range result.Devices {
+				gotDevices = append(gotDevices, item.SourceIP)
+			}
+			if strings.Join(gotDevices, ",") != strings.Join(tt.devices, ",") {
+				t.Fatalf("devices = %#v, want %#v", gotDevices, tt.devices)
+			}
+		})
+	}
+
+	limited, err := store.ListDevices("all", "bytes", "desc", "192.168.31.20", "", 1, 10, 1)
+	if err != nil {
+		t.Fatalf("ListDevices() siteLimit error = %v", err)
+	}
+	if len(limited.Devices) != 1 || len(limited.Devices[0].Sites) != 1 {
+		t.Fatalf("expected one device with one limited site, got %#v", limited.Devices)
+	}
+	if limited.Devices[0].Sites[0].Domain != "delta.org" {
+		t.Fatalf("expected top limited site delta.org, got %+v", limited.Devices[0].Sites[0])
+	}
+}
+
+func TestSiteTrafficStoreListDevicesSupportsUpdatedSort(t *testing.T) {
+	store := newSiteTrafficStore(openSiteTrafficTestDB(t))
+
+	if err := store.UpsertConnections([]siteTrafficConnection{
+		{
+			Key:        "old",
+			SourceIP:   "192.168.31.10",
+			DeviceName: "Old Device",
+			DeviceMAC:  "aa:bb:cc:dd:ee:01",
+			Domain:     "old.example.com",
+			LastIP:     "203.0.113.10",
+			Bytes:      4096,
+			Packets:    32,
+			ViaTunnel:  true,
+			RouteLabel: "FizzVPN / NL",
+		},
+	}, "2026-03-26T12:00:00Z"); err != nil {
+		t.Fatalf("UpsertConnections() old device error = %v", err)
+	}
+	if err := store.UpsertConnections([]siteTrafficConnection{
+		{
+			Key:        "new",
+			SourceIP:   "192.168.31.20",
+			DeviceName: "New Device",
+			DeviceMAC:  "aa:bb:cc:dd:ee:02",
+			Domain:     "new.example.com",
+			LastIP:     "203.0.113.20",
+			Bytes:      1024,
+			Packets:    8,
+			ViaTunnel:  false,
+			RouteLabel: "",
+		},
+	}, "2026-03-26T12:05:00Z"); err != nil {
+		t.Fatalf("UpsertConnections() new device error = %v", err)
+	}
+
+	ascending, err := store.ListDevices("all", "updated", "asc", "", "", 1, 10, 10)
+	if err != nil {
+		t.Fatalf("ListDevices() updated asc error = %v", err)
+	}
+	if len(ascending.Devices) != 2 || ascending.Devices[0].SourceIP != "192.168.31.10" || ascending.Devices[1].SourceIP != "192.168.31.20" {
+		t.Fatalf("unexpected updated ascending order: %#v", ascending.Devices)
+	}
+
+	descending, err := store.ListDevices("all", "updated", "desc", "", "", 1, 10, 10)
+	if err != nil {
+		t.Fatalf("ListDevices() updated desc error = %v", err)
+	}
+	if len(descending.Devices) != 2 || descending.Devices[0].SourceIP != "192.168.31.20" || descending.Devices[1].SourceIP != "192.168.31.10" {
+		t.Fatalf("unexpected updated descending order: %#v", descending.Devices)
 	}
 }
 
@@ -410,6 +812,83 @@ func TestSiteTrafficStoreListHistoryAggregatesDeviceDomainsInRange(t *testing.T)
 	}
 	if result.Stats[1].Domain != "youtube.com" || result.Stats[1].Bytes != 500 || result.Stats[1].ViaTunnel {
 		t.Fatalf("unexpected second history stat: %+v", result.Stats[1])
+	}
+}
+
+func TestSiteTrafficStoreListHistorySupportsFiltersSortingAndPagination(t *testing.T) {
+	store := newSiteTrafficStore(openSiteTrafficTestDB(t))
+
+	if err := store.UpsertConnections([]siteTrafficConnection{
+		{
+			Key:        "alpha",
+			SourceIP:   "192.168.31.10",
+			DeviceName: "Alpha Phone",
+			DeviceMAC:  "aa:bb:cc:dd:ee:10",
+			Domain:     "alpha.com",
+			LastIP:     "203.0.113.10",
+			Bytes:      1000,
+			Packets:    10,
+			ViaTunnel:  true,
+			RouteLabel: "FizzVPN / NL",
+		},
+	}, "2026-03-26T12:00:00Z"); err != nil {
+		t.Fatalf("UpsertConnections() alpha error = %v", err)
+	}
+	if err := store.UpsertConnections([]siteTrafficConnection{
+		{
+			Key:        "beta",
+			SourceIP:   "192.168.31.10",
+			DeviceName: "Alpha Phone",
+			DeviceMAC:  "aa:bb:cc:dd:ee:10",
+			Domain:     "beta.com",
+			LastIP:     "198.51.100.20",
+			Bytes:      2000,
+			Packets:    20,
+			ViaTunnel:  false,
+			RouteLabel: "",
+		},
+	}, "2026-03-26T12:01:00Z"); err != nil {
+		t.Fatalf("UpsertConnections() beta error = %v", err)
+	}
+	if err := store.UpsertConnections([]siteTrafficConnection{
+		{
+			Key:        "gamma",
+			SourceIP:   "192.168.31.10",
+			DeviceName: "Alpha Phone",
+			DeviceMAC:  "aa:bb:cc:dd:ee:10",
+			Domain:     "gamma.net",
+			LastIP:     "203.0.113.30",
+			Bytes:      1500,
+			Packets:    30,
+			ViaTunnel:  true,
+			RouteLabel: "FizzVPN / DE",
+		},
+	}, "2026-03-26T12:02:00Z"); err != nil {
+		t.Fatalf("UpsertConnections() gamma error = %v", err)
+	}
+
+	from := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
+	to := time.Date(2026, time.March, 26, 12, 3, 0, 0, time.UTC)
+	result, err := store.ListHistory("tunneled", "domain", "desc", "192.168.31.10", "", 1, 1, from, to)
+	if err != nil {
+		t.Fatalf("ListHistory() tunneled error = %v", err)
+	}
+	if result.TotalCount != 2 || result.TotalBytes != 2500 {
+		t.Fatalf("unexpected tunneled history totals: %+v", result)
+	}
+	if len(result.Stats) != 1 || result.Stats[0].Domain != "gamma.net" {
+		t.Fatalf("unexpected first tunneled history page: %+v", result.Stats)
+	}
+
+	searched, err := store.ListHistory("direct", "packets", "asc", "192.168.31.10", "198.51.100.20", 1, 10, from, to)
+	if err != nil {
+		t.Fatalf("ListHistory() direct search error = %v", err)
+	}
+	if searched.TotalCount != 1 || searched.TotalBytes != 2000 {
+		t.Fatalf("unexpected direct search totals: %+v", searched)
+	}
+	if len(searched.Stats) != 1 || searched.Stats[0].Domain != "beta.com" || searched.Stats[0].ViaTunnel {
+		t.Fatalf("unexpected direct search history stat: %+v", searched.Stats)
 	}
 }
 
@@ -644,6 +1123,82 @@ func TestOpenConntrackTableFallsBackToLegacyPath(t *testing.T) {
 
 	if file.Name() != legacyPath {
 		t.Fatalf("opened %q, want %q", file.Name(), legacyPath)
+	}
+}
+
+func seedTrafficMatrix(t *testing.T, store *siteTrafficStore) {
+	t.Helper()
+
+	entries := []struct {
+		now   string
+		entry siteTrafficConnection
+	}{
+		{
+			now: "2026-03-26T12:00:00Z",
+			entry: siteTrafficConnection{
+				Key:        "alpha",
+				SourceIP:   "192.168.31.10",
+				DeviceName: "Alpha Phone",
+				DeviceMAC:  "aa:bb:cc:dd:ee:10",
+				Domain:     "alpha.com",
+				LastIP:     "203.0.113.10",
+				Bytes:      3000,
+				Packets:    30,
+				ViaTunnel:  true,
+				RouteLabel: "FizzVPN / NL",
+			},
+		},
+		{
+			now: "2026-03-26T12:01:00Z",
+			entry: siteTrafficConnection{
+				Key:        "beta",
+				SourceIP:   "192.168.31.20",
+				DeviceName: "Beta Laptop",
+				DeviceMAC:  "aa:bb:cc:dd:ee:20",
+				Domain:     "beta.com",
+				LastIP:     "198.51.100.20",
+				Bytes:      1000,
+				Packets:    50,
+				ViaTunnel:  false,
+				RouteLabel: "",
+			},
+		},
+		{
+			now: "2026-03-26T12:02:00Z",
+			entry: siteTrafficConnection{
+				Key:        "gamma",
+				SourceIP:   "192.168.31.30",
+				DeviceName: "Gamma TV",
+				DeviceMAC:  "aa:bb:cc:dd:ee:30",
+				Domain:     "gamma.net",
+				LastIP:     "203.0.113.30",
+				Bytes:      2000,
+				Packets:    10,
+				ViaTunnel:  true,
+				RouteLabel: "FizzVPN / DE",
+			},
+		},
+		{
+			now: "2026-03-26T12:03:00Z",
+			entry: siteTrafficConnection{
+				Key:        "delta",
+				SourceIP:   "192.168.31.20",
+				DeviceName: "Beta Laptop",
+				DeviceMAC:  "aa:bb:cc:dd:ee:20",
+				Domain:     "delta.org",
+				LastIP:     "198.51.100.40",
+				Bytes:      4000,
+				Packets:    40,
+				ViaTunnel:  false,
+				RouteLabel: "",
+			},
+		},
+	}
+
+	for _, item := range entries {
+		if err := store.UpsertConnections([]siteTrafficConnection{item.entry}, item.now); err != nil {
+			t.Fatalf("UpsertConnections(%s) error = %v", item.entry.Domain, err)
+		}
 	}
 }
 

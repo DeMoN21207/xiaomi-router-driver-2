@@ -88,6 +88,10 @@ func (s *Store) Add(level string, kind string, message string) (Event, error) {
 }
 
 func (s *Store) List(limit, offset int) ([]Event, int, error) {
+	return s.ListByLevel("", limit, offset)
+}
+
+func (s *Store) ListByLevel(level string, limit, offset int) ([]Event, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -95,27 +99,39 @@ func (s *Store) List(limit, offset int) ([]Event, int, error) {
 		return nil, 0, err
 	}
 
+	level = strings.ToLower(strings.TrimSpace(level))
+	where := ""
+	args := []any{}
+	if level != "" {
+		where = " WHERE level = ?"
+		args = append(args, level)
+	}
+
 	var total int
-	if err := s.db.QueryRow(`SELECT COUNT(1) FROM events`).Scan(&total); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(1) FROM events`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
 	query := `
 		SELECT id, level, kind, message, occurred_at
 		FROM events
+	` + where + `
 		ORDER BY occurred_at DESC, id DESC
 	`
-	args := []any{}
+	queryArgs := append([]any{}, args...)
 	if limit > 0 {
 		query += ` LIMIT ?`
-		args = append(args, limit)
-	}
-	if offset > 0 {
-		query += ` OFFSET ?`
-		args = append(args, offset)
+		queryArgs = append(queryArgs, limit)
+		if offset > 0 {
+			query += ` OFFSET ?`
+			queryArgs = append(queryArgs, offset)
+		}
+	} else if offset > 0 {
+		query += ` LIMIT -1 OFFSET ?`
+		queryArgs = append(queryArgs, offset)
 	}
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.Query(query, queryArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -134,6 +150,36 @@ func (s *Store) List(limit, offset int) ([]Event, int, error) {
 	}
 
 	return events, total, nil
+}
+
+func (s *Store) CountByLevel() (map[string]int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.ensureReadyLocked(); err != nil {
+		return nil, err
+	}
+
+	rows, err := s.db.Query(`SELECT level, COUNT(1) FROM events GROUP BY level`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	counts := map[string]int{"info": 0, "warn": 0, "error": 0}
+	for rows.Next() {
+		var level string
+		var count int
+		if err := rows.Scan(&level, &count); err != nil {
+			return nil, err
+		}
+		counts[level] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return counts, nil
 }
 
 func (s *Store) Clear() error {
@@ -173,6 +219,10 @@ func (s *Store) ensureReadyLocked() error {
 	}
 
 	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_events_occurred_at ON events(occurred_at DESC)`); err != nil {
+		s.initErr = err
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_events_level_occurred_at ON events(level, occurred_at DESC)`); err != nil {
 		s.initErr = err
 		return err
 	}

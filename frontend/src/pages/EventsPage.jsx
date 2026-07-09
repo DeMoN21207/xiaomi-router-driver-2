@@ -11,6 +11,7 @@ export default function EventsPage() {
   const { t } = useI18n();
   const [events, setEvents] = useState([]);
   const [total, setTotal] = useState(0);
+  const [levelCounts, setLevelCounts] = useState({ info: 0, warn: 0, error: 0 });
   const [filter, setFilter] = useState("");
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -28,19 +29,31 @@ export default function EventsPage() {
     [t],
   );
 
+  const eventsURL = useCallback((offset = 0) => {
+    const params = new URLSearchParams({
+      limit: String(PAGE_SIZE),
+      offset: String(offset),
+    });
+    if (filter) {
+      params.set("level", filter);
+    }
+    return `/api/events?${params.toString()}`;
+  }, [filter]);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await fetchJSON(`/api/events?limit=${PAGE_SIZE}&offset=0`);
+      const data = await fetchJSON(eventsURL(0));
       setEvents(data.events || []);
       setTotal(data.total || 0);
+      setLevelCounts(data.levelCounts || { info: 0, warn: 0, error: 0 });
       setError("");
     } catch (err) {
       setError(err.message);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [eventsURL]);
 
   useEffect(() => {
     void refresh();
@@ -49,10 +62,11 @@ export default function EventsPage() {
   async function loadMore() {
     setLoadingMore(true);
     try {
-      const data = await fetchJSON(`/api/events?limit=${PAGE_SIZE}&offset=${events.length}`);
+      const data = await fetchJSON(eventsURL(events.length));
       const newEvents = data.events || [];
       setEvents((prev) => [...prev, ...newEvents]);
       setTotal(data.total || 0);
+      setLevelCounts(data.levelCounts || { info: 0, warn: 0, error: 0 });
       setError("");
     } catch (err) {
       setError(err.message);
@@ -67,6 +81,7 @@ export default function EventsPage() {
       await fetchJSON("/api/events", { method: "DELETE" });
       setEvents([]);
       setTotal(0);
+      setLevelCounts({ info: 0, warn: 0, error: 0 });
       setError("");
     } catch (err) {
       setError(err.message);
@@ -75,16 +90,7 @@ export default function EventsPage() {
     }
   }
 
-  const filtered = filter ? events.filter((event) => event.level === filter) : events;
   const hasMore = events.length < total;
-
-  const levelCounts = useMemo(() => {
-    const counts = { info: 0, warn: 0, error: 0 };
-    for (const e of events) {
-      if (e.level in counts) counts[e.level]++;
-    }
-    return counts;
-  }, [events]);
 
   return (
     <div className="space-y-8">
@@ -97,7 +103,7 @@ export default function EventsPage() {
               <span className="status-glow-success relative inline-flex h-2 w-2 rounded-full bg-secondary" />
             </span>
             <p className="font-mono text-xs uppercase tracking-widest text-on-surface-variant">
-              {loading ? t("events.loading") : `${filtered.length} / ${total} ${t("events.entries")}`}
+              {loading ? t("events.loading") : `${events.length} / ${total} ${t("events.entries")}`}
             </p>
           </div>
         </div>
@@ -181,13 +187,13 @@ export default function EventsPage() {
       </div>
 
       <div className="space-y-3">
-        {filtered.length === 0 ? (
+        {events.length === 0 ? (
           <div className="rounded-xl bg-surface-container-low p-12 text-center">
             <Icon name="history" className="mx-auto mb-3 h-12 w-12 text-outline-variant" />
             <p className="text-on-surface-variant">{filter ? t("events.emptyFiltered") : t("events.empty")}</p>
           </div>
         ) : (
-          filtered.map((event) => {
+          events.map((event) => {
             const help = eventHelpText(event.kind, t);
             return (
               <div key={event.id} className="rounded-xl border border-outline-variant/10 bg-surface-container-low p-5 transition-colors hover:bg-surface-container">
@@ -208,7 +214,7 @@ export default function EventsPage() {
           })
         )}
 
-        {hasMore && !filter && (
+        {hasMore && (
           <button
             type="button"
             onClick={loadMore}

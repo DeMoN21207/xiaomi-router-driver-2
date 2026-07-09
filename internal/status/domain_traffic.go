@@ -1,6 +1,7 @@
 package status
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -16,6 +17,17 @@ import (
 	"xiomi-router-driver/internal/config"
 	"xiomi-router-driver/internal/routing"
 )
+
+const (
+	// Live counter reads sit on the UI path, so they should wait briefly for
+	// xtables and then let the caller fall back to cached traffic.
+	iptablesCounterLockWaitSeconds = 1
+	iptablesCounterCommandTimeout  = 1500 * time.Millisecond
+)
+
+var runIptablesCounterCommand = func(ctx context.Context, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, "iptables", args...).CombinedOutput()
+}
 
 // DomainTrafficStat represents accumulated traffic for a single domain.
 type DomainTrafficStat struct {
@@ -57,13 +69,42 @@ func newDomainTrafficStore(db *sql.DB) *domainTrafficStore {
 //
 //	1234  56789  all  --  *  *  0.0.0.0/0  0.0.0.0/0  match-set vpn_d_vpn_hosts_a1b2c3d4 dst /* example.com */
 func readIptablesChainCounters(chainName string) ([]DomainTrafficStat, error) {
-	cmd := exec.Command("iptables", "-L", chainName, "-v", "-n", "-x")
-	output, err := cmd.CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), iptablesCounterCommandTimeout)
+	defer cancel()
+
+	args := []string{"-w", strconv.Itoa(iptablesCounterLockWaitSeconds), "-L", chainName, "-v", "-n", "-x"}
+	output, err := runIptablesCounterCommand(ctx, args...)
+	if err != nil && ctx.Err() == nil && isUnsupportedIptablesWaitOutput(output) {
+		args = []string{"-L", chainName, "-v", "-n", "-x"}
+		output, err = runIptablesCounterCommand(ctx, args...)
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("iptables -L %s timed out after %s", chainName, iptablesCounterCommandTimeout)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("iptables -L %s: %s", chainName, strings.TrimSpace(string(output)))
+		return nil, fmt.Errorf("iptables %s: %s", strings.Join(args, " "), iptablesErrorDetail(output, err))
 	}
 
 	return parseIptablesOutput(string(output))
+}
+
+func isUnsupportedIptablesWaitOutput(output []byte) bool {
+	message := strings.ToLower(string(output))
+	return strings.Contains(message, "-w") && (strings.Contains(message, "unknown option") ||
+		strings.Contains(message, "invalid option") ||
+		strings.Contains(message, "bad option") ||
+		strings.Contains(message, "unrecognized option"))
+}
+
+func iptablesErrorDetail(output []byte, err error) string {
+	detail := strings.TrimSpace(string(output))
+	if detail != "" {
+		return detail
+	}
+	if err != nil {
+		return err.Error()
+	}
+	return "unknown error"
 }
 
 var commentRegex = regexp.MustCompile(`/\*\s*(.+?)\s*\*/`)
@@ -134,7 +175,7 @@ func (s *Service) sampleAndStoreDomainTraffic() (bool, error) {
 		return false, nil
 	}
 
-	samples, err := sampleDomainTrafficChains(chains)
+	samples, err := sampleDomainTrafficChainsRunner(chains)
 	if err != nil {
 		return false, err
 	}
@@ -151,6 +192,8 @@ func (s *Service) sampleAndStoreDomainTraffic() (bool, error) {
 
 	return true, nil
 }
+
+var sampleDomainTrafficChainsRunner = sampleDomainTrafficChains
 
 func sampleDomainTrafficChains(chains []string) ([]domainTrafficChainSample, error) {
 	if len(chains) == 0 {
@@ -181,6 +224,16 @@ func sampleDomainTrafficChains(chains []string) ([]domainTrafficChainSample, err
 	}
 
 	return samples, nil
+}
+
+func isTransientIptablesCounterError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "xtables lock") ||
+		strings.Contains(message, "another app is currently holding") ||
+		strings.Contains(message, "resource temporarily unavailable")
 }
 
 func isMissingIptablesChainError(err error) bool {
@@ -252,24 +305,20 @@ func stateHasActiveOpenVPNDomainRules(state config.State) bool {
 	return false
 }
 
-// DomainTraffic returns aggregated per-domain traffic stats.
+// DomainTraffic returns cached per-domain traffic stats. Counter refreshes are
+// done by the sampler or by the explicit POST /api/traffic/domains action.
 func (s *Service) DomainTraffic(sortBy string, limit int) (DomainTrafficResponse, error) {
+	return s.cachedDomainTraffic(sortBy, limit)
+}
+
+func (s *Service) cachedDomainTraffic(sortBy string, limit int) (DomainTrafficResponse, error) {
 	if s.domainTraffic == nil {
 		return DomainTrafficResponse{Domains: []DomainTrafficStat{}}, nil
 	}
-	sampled, err := s.sampleAndStoreDomainTraffic()
-	if err != nil {
-		return DomainTrafficResponse{}, err
-	}
-	if !sampled {
-		return DomainTrafficResponse{Domains: []DomainTrafficStat{}}, nil
-	}
-
 	result, err := s.domainTraffic.List(sortBy, limit)
 	if err != nil {
 		return DomainTrafficResponse{}, err
 	}
-
 	return DomainTrafficResponse{
 		Domains:    result.Stats,
 		TotalBytes: result.TotalBytes,
@@ -284,8 +333,12 @@ func (s *Service) LiveDomainTraffic(sortBy string, limit int) (DomainTrafficResp
 		return DomainTrafficResponse{Domains: []DomainTrafficStat{}}, nil
 	}
 
-	samples, err := sampleDomainTrafficChains(chains)
+	samples, err := sampleDomainTrafficChainsRunner(chains)
 	if err != nil {
+		if isTransientIptablesCounterError(err) {
+			log.Printf("domain traffic: using cached live stats because counters are temporarily locked: %v", err)
+			return s.cachedDomainTraffic(sortBy, limit)
+		}
 		return DomainTrafficResponse{}, err
 	}
 

@@ -40,7 +40,7 @@ func ProbeSource(providerType, source, baseDir string) Result {
 	case "openvpn":
 		return probeOpenVPN(source, baseDir)
 	case "subscription":
-		return probeSubscription(source)
+		return probeSubscription(source, baseDir)
 	default:
 		return Result{Error: fmt.Sprintf("unsupported provider type: %s", providerType)}
 	}
@@ -93,8 +93,15 @@ func probeOpenVPN(source, baseDir string) Result {
 	return Result{Locations: remotes, RawCount: len(remotes)}
 }
 
-func probeSubscription(source string) Result {
-	entries, err := subscription.FetchEntries(source)
+func probeSubscription(source string, baseDir string) Result {
+	runtimeDir := ""
+	if strings.TrimSpace(baseDir) != "" {
+		runtimeDir = filepath.Join(baseDir, ".vpn-manager", "subscriptions")
+	}
+	entries, _, err := subscription.FetchEntriesCached(source, runtimeDir)
+	if err != nil {
+		entries, err = subscription.FetchEntries(source)
+	}
 	if err != nil {
 		return Result{Error: err.Error()}
 	}

@@ -1694,6 +1694,12 @@ func deviceTrafficOrderClause(sortBy, order string) string {
 			primary = asc
 		}
 		return "packets " + primary + ", bytes DESC, source_ip ASC"
+	case "updated":
+		primary := desc
+		if order == "asc" {
+			primary = asc
+		}
+		return "updated_at " + primary + ", bytes DESC, source_ip ASC"
 	default:
 		primary := desc
 		if order == "asc" {

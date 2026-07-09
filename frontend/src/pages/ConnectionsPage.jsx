@@ -658,6 +658,7 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
     try {
       const result = await fetchJSON("/api/providers/probe", {
         method: "POST",
+        trackLoading: false,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ type: provider.type, source: provider.source }),
       });

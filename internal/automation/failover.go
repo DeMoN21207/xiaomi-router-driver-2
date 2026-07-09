@@ -58,15 +58,17 @@ type providerHealthState struct {
 }
 
 type failoverRuntime struct {
-	overrides map[string]failoverOverride
-	health    map[string]providerHealthState
-	lastApply time.Time
+	overrides       map[string]failoverOverride
+	health          map[string]providerHealthState
+	allDownFailures map[string]string
+	lastApply       time.Time
 }
 
 func newFailoverRuntime() failoverRuntime {
 	return failoverRuntime{
-		overrides: make(map[string]failoverOverride),
-		health:    make(map[string]providerHealthState),
+		overrides:       make(map[string]failoverOverride),
+		health:          make(map[string]providerHealthState),
+		allDownFailures: make(map[string]string),
 	}
 }
 
@@ -193,6 +195,9 @@ func (f *failoverRuntime) ensure() {
 	}
 	if f.health == nil {
 		f.health = make(map[string]providerHealthState)
+	}
+	if f.allDownFailures == nil {
+		f.allDownFailures = make(map[string]string)
 	}
 }
 
@@ -353,6 +358,7 @@ func (s *Supervisor) updateProviderHealth(provider config.Provider, probe provid
 		next.ConsecutiveSuccesses++
 		next.ConsecutiveFailures = 0
 		next.LastError = ""
+		delete(s.failover.allDownFailures, provider.ID)
 		if next.HealthySince.IsZero() {
 			next.HealthySince = now
 		}
@@ -619,6 +625,12 @@ func (s *Supervisor) switchProvider(ctx context.Context, baseState config.State,
 }
 
 func (s *Supervisor) applyAllDownPolicy(ctx context.Context, baseState config.State, failedProvider config.Provider, affectedRules []config.Rule, reason string) bool {
+	s.failover.ensure()
+	reason = firstNonEmpty(reason, "health probe failed")
+	if s.failover.allDownFailures[failedProvider.ID] == reason {
+		return true
+	}
+	s.failover.allDownFailures[failedProvider.ID] = reason
 	s.record("error", "automation.provider_failover_failed", fmt.Sprintf("%s is unhealthy (%s), no healthy fallback provider was found; direct internet release is disabled", failedProvider.Name, reason))
 	return true
 }
@@ -854,13 +866,24 @@ func pingHostForFailover(ctx context.Context, host string) providerProbeResult {
 }
 
 func pingHostViaInterfaceForFailover(ctx context.Context, host string, iface string) providerProbeResult {
+	iface = strings.TrimSpace(iface)
+	if host = strings.TrimSpace(host); host == "" {
+		return providerProbeResult{Healthy: false, Detail: "empty probe host"}
+	}
+	if iface == "" {
+		return providerProbeResult{Healthy: false, Detail: "tunnel interface is missing"}
+	}
+	if _, err := net.InterfaceByName(iface); err != nil {
+		return providerProbeResult{Healthy: false, Detail: fmt.Sprintf("tunnel interface is missing: %s", iface)}
+	}
+
 	pingBinary, err := exec.LookPath("ping")
 	if err != nil {
 		return providerProbeResult{Healthy: false, Detail: "ping binary not found"}
 	}
 
 	start := time.Now()
-	cmd := exec.CommandContext(ctx, pingBinary, "-I", iface, "-c", "1", "-W", "2", host)
+	cmd := exec.CommandContext(ctx, pingBinary, "-c", "1", "-W", "2", "-I", iface, host)
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
 		return providerProbeResult{Healthy: false, Detail: "probe timeout"}

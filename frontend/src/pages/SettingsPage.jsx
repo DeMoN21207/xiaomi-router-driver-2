@@ -8,7 +8,7 @@ import { formatBytes, formatDate, formatLatencyMs } from "../utils.js";
 
 const STATUS_REFRESH_MS = 10_000;
 const TOP_ROUTING_DOMAINS_LIMIT = 10;
-const TOP_ROUTING_DOMAINS_QUERY = `/api/traffic/domains?sort=bytes&limit=${TOP_ROUTING_DOMAINS_LIMIT}&live=1`;
+const TOP_ROUTING_DOMAINS_QUERY = `/api/traffic/domains?sort=bytes&limit=${TOP_ROUTING_DOMAINS_LIMIT}`;
 
 const DEFAULT_AUTOMATION = {
   installService: false,
@@ -46,6 +46,12 @@ export default function SettingsPage() {
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [uploadingUpdate, setUploadingUpdate] = useState(false);
+  const [clearingLogs, setClearingLogs] = useState(false);
+  const [logsError, setLogsError] = useState("");
+  const [logsMessage, setLogsMessage] = useState("");
+  const [cleaningOpenVPN, setCleaningOpenVPN] = useState(false);
+  const [runtimeError, setRuntimeError] = useState("");
+  const [runtimeMessage, setRuntimeMessage] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const [dashboardRefreshMs, setDashboardRefreshMs] = useState(() => readDashboardRefreshInterval());
@@ -168,6 +174,42 @@ export default function SettingsPage() {
     setUpdateSettings((current) => ({ ...current, [field]: value }));
     setUpdateError("");
     setUpdateMessage("");
+  };
+
+  const clearLogs = async () => {
+    if (!window.confirm(t("settings.logsClearConfirm"))) return;
+
+    setClearingLogs(true);
+    setLogsError("");
+    setLogsMessage("");
+
+    try {
+      await fetchJSON("/api/events", { method: "DELETE" });
+      setLogsMessage(t("settings.logsCleared"));
+      setError("");
+    } catch (err) {
+      setLogsError(err.message);
+    } finally {
+      setClearingLogs(false);
+    }
+  };
+
+  const cleanupOpenVPN = async () => {
+    if (!window.confirm(t("settings.openvpnCleanupConfirm"))) return;
+
+    setCleaningOpenVPN(true);
+    setRuntimeError("");
+    setRuntimeMessage("");
+
+    try {
+      await fetchJSON("/api/system/openvpn/cleanup", { method: "POST" });
+      setRuntimeMessage(t("settings.openvpnCleaned"));
+      await refreshAll();
+    } catch (err) {
+      setRuntimeError(err.message);
+    } finally {
+      setCleaningOpenVPN(false);
+    }
   };
 
   const saveRoutingSettings = async (event) => {
@@ -458,6 +500,30 @@ export default function SettingsPage() {
                 ))}
               </div>
             )}
+          </Section>
+
+          <Section icon="vpn_lock" iconColor="text-tertiary" title={t("settings.runtimeMaintenance")}>
+            <div className="space-y-4">
+              <p className="text-sm text-on-surface-variant">{t("settings.runtimeMaintenanceHint")}</p>
+
+              {runtimeError ? <InlineNotice tone="error" title={t("error.openvpnCleanup")} message={runtimeError} /> : null}
+              {runtimeMessage ? <InlineNotice tone="info" title={t("settings.runtimeMaintenance")} message={runtimeMessage} /> : null}
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <RuntimeMeta label={t("settings.openvpnRuntime")} value={String(status?.openvpnRuntime?.length ?? 0)} />
+                <RuntimeMeta label={t("settings.subscriptionRuntimeShort")} value={String(subscriptionRuntime.length)} />
+              </div>
+
+              <button
+                type="button"
+                onClick={cleanupOpenVPN}
+                disabled={cleaningOpenVPN}
+                className="inline-flex items-center gap-2 rounded-xl border border-tertiary/25 bg-tertiary/10 px-4 py-2.5 font-headline text-sm font-bold text-tertiary transition-colors hover:bg-tertiary/15 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Icon name="delete_sweep" className="h-4 w-4" />
+                {cleaningOpenVPN ? t("settings.openvpnCleaning") : t("settings.openvpnCleanup")}
+              </button>
+            </div>
           </Section>
 
           <Section icon="dns" iconColor="text-primary" title={t("settings.domains")}>
@@ -763,6 +829,25 @@ export default function SettingsPage() {
                 {savingAutomation ? t("settings.saving") : t("settings.saveAutomation")}
               </button>
             </form>
+          </Section>
+
+          <Section icon="history" iconColor="text-error" title={t("settings.logs")}>
+            <div className="space-y-4">
+              <p className="text-sm text-on-surface-variant">{t("settings.logsHint")}</p>
+
+              {logsError ? <InlineNotice tone="error" title={t("error.logsClear")} message={logsError} /> : null}
+              {logsMessage ? <InlineNotice tone="info" title={t("settings.logs")} message={logsMessage} /> : null}
+
+              <button
+                type="button"
+                onClick={clearLogs}
+                disabled={clearingLogs}
+                className="inline-flex items-center gap-2 rounded-xl border border-error/25 bg-error/10 px-4 py-2.5 font-headline text-sm font-bold text-error transition-colors hover:bg-error/15 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Icon name="delete_sweep" className="h-4 w-4" />
+                {clearingLogs ? t("settings.logsClearing") : t("settings.logsClear")}
+              </button>
+            </div>
           </Section>
 
           <Section icon="palette" iconColor="text-on-surface-variant" title={t("settings.interface")}>

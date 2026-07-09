@@ -1,15 +1,20 @@
 package api
 
 import (
+	"database/sql"
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"xiomi-router-driver/internal/config"
+	eventstore "xiomi-router-driver/internal/events"
+	"xiomi-router-driver/internal/openvpn"
+	"xiomi-router-driver/internal/routing"
 	"xiomi-router-driver/internal/update"
 )
 
@@ -102,6 +107,186 @@ func TestUpdateUploadRejectsNonLinux(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "Linux") {
 		t.Fatalf("expected Linux unsupported message, got %s", rec.Body.String())
+	}
+}
+
+func TestEventsEndpointFiltersByLevelAndPaginates(t *testing.T) {
+	tempDir := t.TempDir()
+	db := openAPITestDB(t, filepath.Join(tempDir, "vpn-manager.db"))
+	eventsStore := eventstore.NewStore(db, filepath.Join(tempDir, "events.json"))
+	for _, level := range []string{"info", "error", "warn", "error"} {
+		if _, err := eventsStore.Add(level, "kind.test", "message"); err != nil {
+			t.Fatalf("Add(%s) error = %v", level, err)
+		}
+	}
+	handler := NewHandler(Dependencies{
+		Events: eventsStore,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/events?level=error&limit=1&offset=1", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ServeHTTP() status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var payload struct {
+		Events []struct {
+			Level string `json:"level"`
+		} `json:"events"`
+		Count       int            `json:"count"`
+		Total       int            `json:"total"`
+		Level       string         `json:"level"`
+		LevelCounts map[string]int `json:"levelCounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Level != "error" || payload.Total != 2 || payload.Count != 1 {
+		t.Fatalf("unexpected filtered response: %+v", payload)
+	}
+	if len(payload.Events) != 1 || payload.Events[0].Level != "error" {
+		t.Fatalf("expected one error event, got %+v", payload.Events)
+	}
+	if payload.LevelCounts["info"] != 1 || payload.LevelCounts["warn"] != 1 || payload.LevelCounts["error"] != 2 {
+		t.Fatalf("unexpected level counts: %+v", payload.LevelCounts)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/events?level=debug", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("ServeHTTP() invalid level status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+func TestEventsEndpointClearRemovesJournalEntries(t *testing.T) {
+	tempDir := t.TempDir()
+	db := openAPITestDB(t, filepath.Join(tempDir, "vpn-manager.db"))
+	eventsStore := eventstore.NewStore(db, filepath.Join(tempDir, "events.json"))
+	for _, level := range []string{"info", "warn", "error"} {
+		if _, err := eventsStore.Add(level, "kind.test", "message"); err != nil {
+			t.Fatalf("Add(%s) error = %v", level, err)
+		}
+	}
+	handler := NewHandler(Dependencies{
+		Events: eventsStore,
+	})
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/events", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ServeHTTP() status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"status":"cleared"`) {
+		t.Fatalf("expected cleared status, got %s", rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/events?limit=25", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ServeHTTP() status after clear = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var payload struct {
+		Events      []eventstore.Event `json:"events"`
+		Count       int                `json:"count"`
+		Total       int                `json:"total"`
+		LevelCounts map[string]int     `json:"levelCounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Total != 0 || payload.Count != 0 || len(payload.Events) != 0 {
+		t.Fatalf("expected empty journal after clear, got %+v", payload)
+	}
+	if payload.LevelCounts["info"] != 0 || payload.LevelCounts["warn"] != 0 || payload.LevelCounts["error"] != 0 {
+		t.Fatalf("expected zero level counts after clear, got %+v", payload.LevelCounts)
+	}
+}
+
+func TestOpenVPNCleanupEndpointStopsUnusedRuntime(t *testing.T) {
+	tempDir := t.TempDir()
+	db := openAPITestDB(t, filepath.Join(tempDir, "vpn-manager.db"))
+	stateManager := config.NewManager(db, filepath.Join(tempDir, "vpn-state.json"))
+	routingRunner := routing.NewRunner(writeOpenVPNCleanupNoopRoutingScript(t, tempDir))
+	openvpnManager := openvpn.NewManager(tempDir, tempDir, db, routingRunner, nil)
+	handler := NewHandler(Dependencies{
+		State:   stateManager,
+		OpenVPN: openvpnManager,
+		DataDir: tempDir,
+	})
+
+	state := config.DefaultState()
+	state.Providers = []config.Provider{
+		{ID: "provider-sub", Name: "FizzVPN", Type: config.ProviderTypeSubscription, Enabled: true},
+	}
+	if _, err := stateManager.Save(state); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	insertOpenVPNRuntimeInstance(t, db, config.DefaultRoutingSettings())
+
+	req := httptest.NewRequest(http.MethodPost, "/api/system/openvpn/cleanup", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ServeHTTP() status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"status":"cleaned"`) {
+		t.Fatalf("expected cleaned status, got %s", rec.Body.String())
+	}
+	snapshots, err := openvpnManager.Snapshots()
+	if err != nil {
+		t.Fatalf("Snapshots() error = %v", err)
+	}
+	if len(snapshots) != 0 {
+		t.Fatalf("expected cleanup to remove openvpn runtime, got %+v", snapshots)
+	}
+}
+
+func TestOpenVPNCleanupEndpointRejectsActiveOpenVPNRules(t *testing.T) {
+	tempDir := t.TempDir()
+	db := openAPITestDB(t, filepath.Join(tempDir, "vpn-manager.db"))
+	stateManager := config.NewManager(db, filepath.Join(tempDir, "vpn-state.json"))
+	routingRunner := routing.NewRunner(writeOpenVPNCleanupNoopRoutingScript(t, tempDir))
+	openvpnManager := openvpn.NewManager(tempDir, tempDir, db, routingRunner, nil)
+	handler := NewHandler(Dependencies{
+		State:   stateManager,
+		OpenVPN: openvpnManager,
+		DataDir: tempDir,
+	})
+
+	state := config.DefaultState()
+	state.Providers = []config.Provider{
+		{ID: "provider-openvpn", Name: "Office VPN", Type: config.ProviderTypeOpenVPN, Enabled: true},
+	}
+	state.Rules = []config.Rule{
+		{ID: "rule-openvpn", Name: "Media", ProviderID: "provider-openvpn", Domains: []string{"youtube.com"}, Enabled: true},
+	}
+	if _, err := stateManager.Save(state); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	insertOpenVPNRuntimeInstance(t, db, config.DefaultRoutingSettings())
+
+	req := httptest.NewRequest(http.MethodPost, "/api/system/openvpn/cleanup", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("ServeHTTP() status = %d, want %d, body=%s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "active openvpn rules") {
+		t.Fatalf("expected active rule error, got %s", rec.Body.String())
+	}
+	snapshots, err := openvpnManager.Snapshots()
+	if err != nil {
+		t.Fatalf("Snapshots() error = %v", err)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("expected active cleanup rejection to keep runtime, got %+v", snapshots)
 	}
 }
 
@@ -272,6 +457,47 @@ func TestBuildPriorityPolicyRejectsScheduleOverlap(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "overlaps") {
 		t.Fatalf("buildPriorityPolicy() error = %q, want overlap", err.Error())
+	}
+}
+
+func writeOpenVPNCleanupNoopRoutingScript(t *testing.T, dir string) string {
+	t.Helper()
+
+	path := filepath.Join(dir, "update_routes.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write routing script: %v", err)
+	}
+	return path
+}
+
+func insertOpenVPNRuntimeInstance(t *testing.T, db interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}, settings config.RoutingSettings) {
+	t.Helper()
+
+	settingsJSON, err := json.Marshal(settings)
+	if err != nil {
+		t.Fatalf("Marshal(settings) error = %v", err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS openvpn_runtime_instances (
+			provider_id TEXT PRIMARY KEY,
+			provider_name TEXT NOT NULL,
+			interface_name TEXT NOT NULL,
+			profile_path TEXT NOT NULL,
+			domain_count INTEGER NOT NULL,
+			settings_json TEXT NOT NULL,
+			pid INTEGER NOT NULL
+		)
+	`); err != nil {
+		t.Fatalf("create runtime table: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO openvpn_runtime_instances (
+			provider_id, provider_name, interface_name, profile_path, domain_count, settings_json, pid
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, "provider-openvpn", "Office VPN", settings.VPNIface, filepath.Join(t.TempDir(), "office.ovpn"), 1, string(settingsJSON), 0); err != nil {
+		t.Fatalf("insert runtime instance: %v", err)
 	}
 }
 

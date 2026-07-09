@@ -9,27 +9,32 @@ import (
 
 // SystemResources holds live system resource metrics read from /proc.
 type SystemResources struct {
-	CPUUsagePercent float64 `json:"cpuUsagePercent"`
-	MemTotalMB      uint64  `json:"memTotalMB"`
-	MemUsedMB       uint64  `json:"memUsedMB"`
-	MemFreePercent  float64 `json:"memFreePercent"`
-	SwapTotalMB     uint64  `json:"swapTotalMB"`
-	SwapUsedMB      uint64  `json:"swapUsedMB"`
-	DiskTotalMB     uint64  `json:"diskTotalMB"`
-	DiskUsedMB      uint64  `json:"diskUsedMB"`
-	DiskFreePercent float64 `json:"diskFreePercent"`
-	DiskPath        string  `json:"diskPath"`
-	DataDiskTotalMB uint64  `json:"dataDiskTotalMB"`
-	DataDiskUsedMB  uint64  `json:"dataDiskUsedMB"`
-	DataDiskFreePct float64 `json:"dataDiskFreePercent"`
-	DataDiskPath    string  `json:"dataDiskPath"`
-	UptimeSeconds   uint64  `json:"uptimeSeconds"`
-	UptimeFormatted string  `json:"uptimeFormatted"`
-	LoadAvg1        float64 `json:"loadAvg1"`
-	LoadAvg5        float64 `json:"loadAvg5"`
-	LoadAvg15       float64 `json:"loadAvg15"`
-	ProcessCount    int     `json:"processCount"`
-	CollectedAt     string  `json:"collectedAt"`
+	CPUUsagePercent          float64 `json:"cpuUsagePercent"`
+	MemTotalMB               uint64  `json:"memTotalMB"`
+	MemUsedMB                uint64  `json:"memUsedMB"`
+	MemFreeMB                uint64  `json:"memFreeMB"`
+	MemAvailableMB           uint64  `json:"memAvailableMB"`
+	MemCacheMB               uint64  `json:"memCacheMB"`
+	MemSlabMB                uint64  `json:"memSlabMB"`
+	MemKernelUnreclaimableMB uint64  `json:"memKernelUnreclaimableMB"`
+	MemFreePercent           float64 `json:"memFreePercent"`
+	SwapTotalMB              uint64  `json:"swapTotalMB"`
+	SwapUsedMB               uint64  `json:"swapUsedMB"`
+	DiskTotalMB              uint64  `json:"diskTotalMB"`
+	DiskUsedMB               uint64  `json:"diskUsedMB"`
+	DiskFreePercent          float64 `json:"diskFreePercent"`
+	DiskPath                 string  `json:"diskPath"`
+	DataDiskTotalMB          uint64  `json:"dataDiskTotalMB"`
+	DataDiskUsedMB           uint64  `json:"dataDiskUsedMB"`
+	DataDiskFreePct          float64 `json:"dataDiskFreePercent"`
+	DataDiskPath             string  `json:"dataDiskPath"`
+	UptimeSeconds            uint64  `json:"uptimeSeconds"`
+	UptimeFormatted          string  `json:"uptimeFormatted"`
+	LoadAvg1                 float64 `json:"loadAvg1"`
+	LoadAvg5                 float64 `json:"loadAvg5"`
+	LoadAvg15                float64 `json:"loadAvg15"`
+	ProcessCount             int     `json:"processCount"`
+	CollectedAt              string  `json:"collectedAt"`
 }
 
 type SystemUptime struct {
@@ -121,8 +126,12 @@ func readMemInfo(res *SystemResources) {
 		return
 	}
 
+	applyMemInfo(res, string(data))
+}
+
+func applyMemInfo(res *SystemResources, raw string) {
 	info := map[string]uint64{}
-	for _, line := range strings.Split(string(data), "\n") {
+	for _, line := range strings.Split(raw, "\n") {
 		parts := strings.SplitN(line, ":", 2)
 		if len(parts) != 2 {
 			continue
@@ -139,12 +148,28 @@ func readMemInfo(res *SystemResources) {
 	memFree := info["MemFree"]
 	buffers := info["Buffers"]
 	cached := info["Cached"]
+	available := info["MemAvailable"]
+	sReclaimable := info["SReclaimable"]
+	if sReclaimable == 0 {
+		sReclaimable = info["KReclaimable"]
+	}
 
 	res.MemTotalMB = memTotal / 1024
-	memUsed := memTotal - memFree - buffers - cached
-	if memTotal > 0 && memUsed <= memTotal {
+	res.MemFreeMB = memFree / 1024
+	res.MemAvailableMB = available / 1024
+	res.MemCacheMB = (buffers + cached + sReclaimable) / 1024
+	res.MemSlabMB = info["Slab"] / 1024
+	res.MemKernelUnreclaimableMB = info["SUnreclaim"] / 1024
+
+	reclaimableFree := memFree + buffers + cached
+	if memTotal > 0 && reclaimableFree <= memTotal {
+		memUsed := memTotal - reclaimableFree
 		res.MemUsedMB = memUsed / 1024
-		res.MemFreePercent = float64(memTotal-memUsed) / float64(memTotal) * 100
+		freeForPressure := reclaimableFree
+		if available > 0 && available <= memTotal {
+			freeForPressure = available
+		}
+		res.MemFreePercent = float64(freeForPressure) / float64(memTotal) * 100
 	}
 
 	swapTotal := info["SwapTotal"]

@@ -600,8 +600,9 @@ function SystemResourcesCard({ t, autoRefreshMs }) {
   }, [autoRefreshMs]);
 
   const cpuColor = (res?.cpuUsagePercent ?? 0) > 80 ? "text-error" : (res?.cpuUsagePercent ?? 0) > 50 ? "text-tertiary" : "text-secondary";
-  const memPercent = res?.memTotalMB ? ((res.memUsedMB / res.memTotalMB) * 100) : 0;
+  const memPercent = res?.memTotalMB ? (100 - (res.memFreePercent ?? 0)) : 0;
   const memColor = memPercent > 85 ? "text-error" : memPercent > 60 ? "text-tertiary" : "text-secondary";
+  const memoryDetails = formatMemoryDetails(res, t);
   const diskPercent = res?.diskTotalMB ? ((res.diskUsedMB / res.diskTotalMB) * 100) : 0;
   const diskColor = diskPercent > 90 ? "text-error" : diskPercent > 70 ? "text-tertiary" : "text-secondary";
   const dataDiskPercent = res?.dataDiskTotalMB ? ((res.dataDiskUsedMB / res.dataDiskTotalMB) * 100) : 0;
@@ -650,7 +651,7 @@ function SystemResourcesCard({ t, autoRefreshMs }) {
           unit={` / ${res?.memTotalMB ?? 0} MB`}
           percent={memPercent}
           colorClass={memColor}
-          sub={res?.swapTotalMB > 0 ? `Swap: ${res.swapUsedMB} / ${res.swapTotalMB} MB` : null}
+          sub={memoryDetails}
         />
 
         {/* Root flash */}
@@ -706,6 +707,24 @@ function SystemResourcesCard({ t, autoRefreshMs }) {
       </div>
     </div>
   );
+}
+
+function formatMemoryDetails(res, t) {
+  if (!res) return null;
+  const parts = [];
+  if (Number.isFinite(res.memAvailableMB)) {
+    parts.push(`${t("dashboard.resAvailable")}: ${res.memAvailableMB} MB`);
+  }
+  if (Number.isFinite(res.memCacheMB)) {
+    parts.push(`${t("dashboard.resCache")}: ${res.memCacheMB} MB`);
+  }
+  if (Number.isFinite(res.memKernelUnreclaimableMB)) {
+    parts.push(`${t("dashboard.resKernel")}: ${res.memKernelUnreclaimableMB} MB`);
+  }
+  if (res.swapTotalMB > 0) {
+    parts.push(`Swap: ${res.swapUsedMB} / ${res.swapTotalMB} MB`);
+  }
+  return parts.join(" · ");
 }
 
 function ResourceGauge({ icon, label, value, unit, percent, colorClass, sub }) {

@@ -26,6 +26,13 @@ import (
 	"xiomi-router-driver/internal/runtimehealth"
 )
 
+const interfaceWaitTimeout = 10 * time.Second
+
+var (
+	interfaceAlive               = runtimehealth.InterfaceAlive
+	waitForInterfacePollInterval = 250 * time.Millisecond
+)
+
 type Manager struct {
 	db                 *sql.DB
 	runtimeDir         string
@@ -196,7 +203,7 @@ func (m *Manager) Apply(ctx context.Context, state config.State, enabledRules []
 			return err
 		}
 
-		if err := waitForInterface(instance.Settings.VPNIface, 5*time.Second); err != nil {
+		if err := waitForInterface(instance.Settings.VPNIface, interfaceWaitTimeout); err != nil {
 			_ = m.cleanupLocked(context.Background())
 			return fmt.Errorf("wait for %s interface: %w", plan.desired.Location, err)
 		}
@@ -503,6 +510,10 @@ func (m *Manager) applyRoutingToInstanceLocked(ctx context.Context, instance *ma
 	}
 	defer removeIfExists(plan.domainListPath)
 
+	if err := waitForInterface(plan.settings.VPNIface, interfaceWaitTimeout); err != nil {
+		return fmt.Errorf("wait for %s interface before routing sync: %w", plan.desired.Location, err)
+	}
+
 	if err := m.routing.RunWithOptions(ctx, "sync", routing.RunOptions{
 		Settings:       plan.settings,
 		DomainListPath: plan.domainListPath,
@@ -782,10 +793,10 @@ func tunAddress(index int) string {
 func waitForInterface(name string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if runtimehealth.InterfaceAlive(name) {
+		if interfaceAlive(name) {
 			return nil
 		}
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(waitForInterfacePollInterval)
 	}
 	return fmt.Errorf("interface %s did not appear", name)
 }

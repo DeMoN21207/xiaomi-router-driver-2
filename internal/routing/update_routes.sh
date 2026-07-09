@@ -10,6 +10,7 @@ VPN_MASQUERADE="${VPN_MASQUERADE:-1}"
 # Run `ip a` on your router to see interface names.
 LAN_IFACE="${LAN_IFACE:-br-lan}"      # Your router's LAN interface (e.g. br-lan, br0, eth1)
 VPN_IFACE="${VPN_IFACE:-tun0}"        # Your VPN client's tunnel interface (e.g. tun0)
+DOCKER_IFACE="${DOCKER_IFACE:-br-docker}" # Optional Docker bridge whose containers may need the same routed domains.
 
 # --- Advanced settings ---
 TABLE_NUM="${TABLE_NUM:-101}"
@@ -478,7 +479,41 @@ cleanup_forward_accept_rules() {
         if [ -z "$chain" ]; then continue; fi
         if ! iptables_chain_exists "$chain"; then continue; fi
         while iptables -D "$chain" -i "$LAN_IFACE" -o "$VPN_IFACE" -j ACCEPT >/dev/null 2>&1; do :; done
+        if [ -n "$DOCKER_IFACE" ]; then
+            while iptables -D "$chain" -i "$DOCKER_IFACE" -o "$VPN_IFACE" -j ACCEPT >/dev/null 2>&1; do :; done
+        fi
     done
+}
+
+iface_exists() {
+    iface="$1"
+    [ -n "$iface" ] && ip link show "$iface" >/dev/null 2>&1
+}
+
+ensure_mangle_mark_rules() {
+    if ! iptables -t mangle -C PREROUTING -i "$LAN_IFACE" -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" >/dev/null 2>&1; then
+        iptables -t mangle -I PREROUTING -i "$LAN_IFACE" -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" || return 1
+    fi
+
+    if iface_exists "$DOCKER_IFACE"; then
+        if ! iptables -t mangle -C PREROUTING -i "$DOCKER_IFACE" -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" >/dev/null 2>&1; then
+            iptables -t mangle -I PREROUTING -i "$DOCKER_IFACE" -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" || return 1
+        fi
+    fi
+
+    if ! iptables -t mangle -C OUTPUT -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" >/dev/null 2>&1; then
+        iptables -t mangle -I OUTPUT -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" || return 1
+    fi
+
+    return 0
+}
+
+cleanup_mangle_mark_rules() {
+    while iptables -t mangle -D PREROUTING -i "$LAN_IFACE" -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" >/dev/null 2>&1; do :; done
+    if [ -n "$DOCKER_IFACE" ]; then
+        while iptables -t mangle -D PREROUTING -i "$DOCKER_IFACE" -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" >/dev/null 2>&1; do :; done
+    fi
+    while iptables -t mangle -D OUTPUT -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" >/dev/null 2>&1; do :; done
 }
 
 cleanup_dns_hijack_rules() {
@@ -598,6 +633,17 @@ base_routing_ready() {
     if ! iptables -t mangle -C PREROUTING -i "$LAN_IFACE" -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" >/dev/null 2>&1; then
         return 1
     fi
+    if ! iptables -t mangle -C OUTPUT -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" >/dev/null 2>&1; then
+        return 1
+    fi
+    if iface_exists "$DOCKER_IFACE"; then
+        if ! iptables -t mangle -C PREROUTING -i "$DOCKER_IFACE" -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" >/dev/null 2>&1; then
+            return 1
+        fi
+        if ! iptables -C FORWARD -i "$DOCKER_IFACE" -o "$VPN_IFACE" -j ACCEPT >/dev/null 2>&1; then
+            return 1
+        fi
+    fi
     if ! iptables -C "$forward_chain" -i "$LAN_IFACE" -o "$VPN_IFACE" -j ACCEPT >/dev/null 2>&1; then
         return 1
     fi
@@ -637,7 +683,7 @@ cleanup_domain_stats() {
 
 cleanup_firewall() {
     # Delete all duplicates left by interrupted/partial previous runs.
-    while iptables -t mangle -D PREROUTING -i "$LAN_IFACE" -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" >/dev/null 2>&1; do :; done
+    cleanup_mangle_mark_rules
     while ip rule del fwmark "$FWMARK" table "$TABLE_NUM" >/dev/null 2>&1; do :; done
 
     cleanup_forward_accept_rules
@@ -869,12 +915,10 @@ add_routes() {
     fi
 
     # 5. Create a rule to mark packets destined for our dynamic ipset
-    echo "--> Ensuring iptables mangle rule..."
-    if ! iptables -t mangle -C PREROUTING -i "$LAN_IFACE" -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK" >/dev/null 2>&1; then
-        if ! iptables -t mangle -I PREROUTING -i "$LAN_IFACE" -m set --match-set "$IPSET_NAME" dst -j MARK --set-mark "$FWMARK"; then
-            echo "Error: failed to insert the mangle mark rule." >&2
-            exit 1
-        fi
+    echo "--> Ensuring iptables mangle rules..."
+    if ! ensure_mangle_mark_rules; then
+        echo "Error: failed to insert the mangle mark rules." >&2
+        exit 1
     fi
 
     # 6. Add forwarding and NAT rules to allow traffic into the tunnel
@@ -884,6 +928,14 @@ add_routes() {
         if ! iptables -I "$forward_chain" -i "$LAN_IFACE" -o "$VPN_IFACE" -j ACCEPT; then
             echo "Error: failed to insert the FORWARD rule into chain '$forward_chain'." >&2
             exit 1
+        fi
+    fi
+    if iface_exists "$DOCKER_IFACE"; then
+        if ! iptables -C FORWARD -i "$DOCKER_IFACE" -o "$VPN_IFACE" -j ACCEPT >/dev/null 2>&1; then
+            if ! iptables -I FORWARD -i "$DOCKER_IFACE" -o "$VPN_IFACE" -j ACCEPT; then
+                echo "Error: failed to insert the Docker FORWARD rule." >&2
+                exit 1
+            fi
         fi
     fi
     if [ "$VPN_MASQUERADE" = "1" ]; then

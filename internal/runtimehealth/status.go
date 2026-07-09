@@ -125,6 +125,9 @@ func probeInterface(interfaceName string, host string) (bool, string) {
 	if interfaceName == "" || host == "" {
 		return true, ""
 	}
+	if !InterfaceAlive(interfaceName) {
+		return false, fmt.Sprintf("interface is missing: %s", interfaceName)
+	}
 
 	pingBinary, err := exec.LookPath("ping")
 	if err != nil {

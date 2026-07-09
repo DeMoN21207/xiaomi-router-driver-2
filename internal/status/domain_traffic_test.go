@@ -1,10 +1,14 @@
 package status
 
 import (
+	"context"
+	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"xiomi-router-driver/internal/config"
+	"xiomi-router-driver/internal/domains"
 )
 
 func TestDomainTrafficStoreListAppliesSortAndLimitInQuery(t *testing.T) {
@@ -87,6 +91,152 @@ func TestAggregateLiveDomainTrafficMergesDirectionsAndSorts(t *testing.T) {
 	}
 }
 
+func TestReadIptablesChainCountersUsesWaitAndParsesCounters(t *testing.T) {
+	originalRunner := runIptablesCounterCommand
+	t.Cleanup(func() { runIptablesCounterCommand = originalRunner })
+
+	var gotArgs []string
+	runIptablesCounterCommand = func(ctx context.Context, args ...string) ([]byte, error) {
+		gotArgs = append([]string(nil), args...)
+		return []byte(`Chain VDS_test (2 references)
+ pkts bytes target prot opt in out source destination
+ 7 420 all -- * * 0.0.0.0/0 0.0.0.0/0 match-set vpn_d_test dst /* chatgpt.com|dn */
+`), nil
+	}
+
+	stats, err := readIptablesChainCounters("VDS_test")
+	if err != nil {
+		t.Fatalf("readIptablesChainCounters() error = %v", err)
+	}
+	wantArgs := []string{"-w", "1", "-L", "VDS_test", "-v", "-n", "-x"}
+	if !sameStrings(gotArgs, wantArgs) {
+		t.Fatalf("iptables args = %#v, want %#v", gotArgs, wantArgs)
+	}
+	if len(stats) != 1 || stats[0].Domain != "chatgpt.com|dn" || stats[0].Bytes != 420 || stats[0].Packets != 7 {
+		t.Fatalf("unexpected parsed stats: %+v", stats)
+	}
+}
+
+func TestReadIptablesChainCountersFallsBackWhenWaitFlagUnsupported(t *testing.T) {
+	originalRunner := runIptablesCounterCommand
+	t.Cleanup(func() { runIptablesCounterCommand = originalRunner })
+
+	var calls [][]string
+	runIptablesCounterCommand = func(ctx context.Context, args ...string) ([]byte, error) {
+		copied := append([]string(nil), args...)
+		calls = append(calls, copied)
+		if len(args) > 0 && args[0] == "-w" {
+			return []byte("iptables: unknown option -w"), errors.New("exit status 2")
+		}
+		return []byte(`Chain VDS_test (1 references)
+ pkts bytes target prot opt in out source destination
+ 2 64 all -- * * 0.0.0.0/0 0.0.0.0/0 match-set vpn_d_test dst /* example.com|up */
+`), nil
+	}
+
+	stats, err := readIptablesChainCounters("VDS_test")
+	if err != nil {
+		t.Fatalf("readIptablesChainCounters() error = %v", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 iptables calls, got %#v", calls)
+	}
+	if !sameStrings(calls[1], []string{"-L", "VDS_test", "-v", "-n", "-x"}) {
+		t.Fatalf("fallback args = %#v", calls[1])
+	}
+	if len(stats) != 1 || stats[0].Domain != "example.com|up" || stats[0].Bytes != 64 {
+		t.Fatalf("unexpected parsed stats: %+v", stats)
+	}
+}
+
+func TestLiveDomainTrafficFallsBackToCachedStatsOnXtablesLock(t *testing.T) {
+	originalSampler := sampleDomainTrafficChainsRunner
+	t.Cleanup(func() { sampleDomainTrafficChainsRunner = originalSampler })
+
+	db := openSiteTrafficTestDB(t)
+	tempDir := t.TempDir()
+	stateManager := config.NewManager(db, filepath.Join(tempDir, "vpn-state.json"))
+	state := config.DefaultState()
+	state.Providers = []config.Provider{
+		{ID: "provider-a", Name: "OpenVPN", Type: config.ProviderTypeOpenVPN, Source: "profile.ovpn", Enabled: true},
+	}
+	state.Rules = []config.Rule{
+		{ID: "rule-a", Name: "AI route", ProviderID: "provider-a", Domains: []string{"chatgpt.com"}, Enabled: true},
+	}
+	if _, err := stateManager.Save(state); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	domainsManager := domains.NewManager(db, filepath.Join(tempDir, "domains.list"), filepath.Join(tempDir, "domains.legacy"))
+	if err := domainsManager.ReplaceAll([]string{"chatgpt.com"}); err != nil {
+		t.Fatalf("ReplaceAll() error = %v", err)
+	}
+
+	store := newDomainTrafficStore(db)
+	updatedAt := time.Date(2026, time.July, 8, 10, 30, 0, 0, time.UTC).Format(time.RFC3339)
+	if err := store.Upsert([]DomainTrafficStat{{Domain: "chatgpt.com", Bytes: 2048, Packets: 12}}, updatedAt); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	sampleDomainTrafficChainsRunner = func(chains []string) ([]domainTrafficChainSample, error) {
+		if len(chains) == 0 {
+			t.Fatalf("expected at least one active stats chain")
+		}
+		return nil, errors.New("VDS_vpn_hosts: iptables -w 1 -L VDS_vpn_hosts: Another app is currently holding the xtables lock")
+	}
+
+	service := &Service{
+		state:         stateManager,
+		domains:       domainsManager,
+		domainTraffic: store,
+	}
+	if chains := service.activeDomainStatsChains(); len(chains) == 0 {
+		domainCount, countErr := domainsManager.CountDomains()
+		t.Fatalf("expected at least one active stats chain before fallback test, domainCount=%d countErr=%v", domainCount, countErr)
+	}
+
+	response, err := service.LiveDomainTraffic("bytes", 10)
+	if err != nil {
+		t.Fatalf("LiveDomainTraffic() error = %v", err)
+	}
+	if response.TotalBytes != 2048 || response.UpdatedAt != updatedAt {
+		t.Fatalf("unexpected cached response: %+v", response)
+	}
+	if len(response.Domains) != 1 || response.Domains[0].Domain != "chatgpt.com" || response.Domains[0].Bytes != 2048 {
+		t.Fatalf("unexpected cached domains: %+v", response.Domains)
+	}
+}
+
+func TestDomainTrafficReturnsCachedStatsWithoutSampling(t *testing.T) {
+	originalSampler := sampleDomainTrafficChainsRunner
+	t.Cleanup(func() { sampleDomainTrafficChainsRunner = originalSampler })
+
+	store := newDomainTrafficStore(openSiteTrafficTestDB(t))
+	updatedAt := time.Date(2026, time.July, 8, 11, 0, 0, 0, time.UTC).Format(time.RFC3339)
+	if err := store.Upsert([]DomainTrafficStat{
+		{Domain: "slow.example", Bytes: 512, Packets: 4},
+	}, updatedAt); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+
+	sampleDomainTrafficChainsRunner = func(chains []string) ([]domainTrafficChainSample, error) {
+		t.Fatalf("DomainTraffic should not sample iptables counters on GET")
+		return nil, nil
+	}
+
+	service := &Service{domainTraffic: store}
+	response, err := service.DomainTraffic("bytes", 10)
+	if err != nil {
+		t.Fatalf("DomainTraffic() error = %v", err)
+	}
+	if response.TotalBytes != 512 || response.UpdatedAt != updatedAt {
+		t.Fatalf("unexpected cached response: %+v", response)
+	}
+	if len(response.Domains) != 1 || response.Domains[0].Domain != "slow.example" {
+		t.Fatalf("unexpected cached domains: %+v", response.Domains)
+	}
+}
+
 func TestStateHasActiveOpenVPNDomainRulesIgnoresSubscriptionOnlyRules(t *testing.T) {
 	state := config.State{
 		Providers: []config.Provider{
@@ -106,4 +256,16 @@ func TestStateHasActiveOpenVPNDomainRulesIgnoresSubscriptionOnlyRules(t *testing
 	if !stateHasActiveOpenVPNDomainRules(state) {
 		t.Fatalf("expected active OpenVPN rule to require the base stats chain")
 	}
+}
+
+func sameStrings(a []string, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

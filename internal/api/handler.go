@@ -156,6 +156,7 @@ func NewHandler(deps Dependencies) *Handler {
 	mux.HandleFunc("/api/domains/health/check", handler.handleCheckDomainHealth)
 	mux.HandleFunc("/api/domains", handler.handleDomainsPreview)
 	mux.HandleFunc("/api/system/resources", handler.handleSystemResources)
+	mux.HandleFunc("/api/system/openvpn/cleanup", handler.handleOpenVPNCleanup)
 	mux.HandleFunc("/api/system/reboot", handler.handleReboot)
 	mux.HandleFunc("/api/system/update", handler.handleSystemUpdate)
 	mux.HandleFunc("/api/system/update/settings", handler.handleSystemUpdateSettings)
@@ -206,6 +207,10 @@ func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
+	if limit < 0 {
+		writeError(w, http.StatusBadRequest, errors.New("limit must be non-negative"))
+		return
+	}
 
 	offset := 0
 	if rawOffset := strings.TrimSpace(r.URL.Query().Get("offset")); rawOffset != "" {
@@ -216,18 +221,44 @@ func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		offset = parsed
 	}
+	if offset < 0 {
+		writeError(w, http.StatusBadRequest, errors.New("offset must be non-negative"))
+		return
+	}
 
-	list, total, err := h.events.List(limit, offset)
+	level := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("level")))
+	if level != "" && !isEventLevel(level) {
+		writeError(w, http.StatusBadRequest, errors.New("level must be info, warn, or error"))
+		return
+	}
+
+	list, total, err := h.events.ListByLevel(level, limit, offset)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	levelCounts, err := h.events.CountByLevel()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"events": list,
-		"count":  len(list),
-		"total":  total,
+		"events":      list,
+		"count":       len(list),
+		"total":       total,
+		"level":       level,
+		"levelCounts": levelCounts,
 	})
+}
+
+func isEventLevel(level string) bool {
+	switch level {
+	case "info", "warn", "error":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *Handler) handleFailoverStatus(w http.ResponseWriter, r *http.Request) {
@@ -265,6 +296,41 @@ func (h *Handler) handleSystemResources(w http.ResponseWriter, r *http.Request) 
 
 	resources := status.CollectSystemResources(h.dataDir)
 	writeJSON(w, http.StatusOK, resources)
+}
+
+func (h *Handler) handleOpenVPNCleanup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if h.openvpn == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("openvpn runtime manager is not configured"))
+		return
+	}
+	if h.state == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("state manager is not configured"))
+		return
+	}
+
+	state, err := h.state.Load()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if hasActiveOpenVPNRules(state) {
+		writeError(w, http.StatusConflict, errors.New("active openvpn rules are using the runtime"))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	if err := h.openvpn.Cleanup(ctx); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	h.recordEvent("info", "openvpn.runtime_cleaned", "Unused OpenVPN runtime stopped")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "cleaned"})
 }
 
 func (h *Handler) handleReboot(w http.ResponseWriter, r *http.Request) {
@@ -1663,7 +1729,7 @@ func (h *Handler) applyStateRules(ctx context.Context, state config.State, persi
 				cleanupErrors = append(cleanupErrors, err)
 			}
 		} else {
-			if err := h.routing.Run(ctx, "del", state.Routing); err != nil {
+			if err := h.runRouting(ctx, "del", state.Routing); err != nil {
 				cleanupErrors = append(cleanupErrors, err)
 			}
 		}
@@ -1695,7 +1761,7 @@ func (h *Handler) applyStateRules(ctx context.Context, state config.State, persi
 				return fail(err)
 			}
 		} else {
-			if err := h.routing.Run(ctx, "del", state.Routing); err != nil {
+			if err := h.runRouting(ctx, "del", state.Routing); err != nil {
 				return fail(err)
 			}
 		}
@@ -1743,6 +1809,13 @@ func (h *Handler) applyStateRules(ctx context.Context, state config.State, persi
 		RulesApplied: len(enabledRules),
 		Domains:      domainsToApply,
 	}, nil
+}
+
+func (h *Handler) runRouting(ctx context.Context, action string, settings config.RoutingSettings) error {
+	if h.routing == nil {
+		return errors.New("routing runner is not configured")
+	}
+	return h.routing.Run(ctx, action, settings)
 }
 
 func (h *Handler) handleDomainsPreview(w http.ResponseWriter, r *http.Request) {
@@ -2195,6 +2268,20 @@ func validateRuleEntries(candidate config.Rule, providers []config.Provider, exi
 		seen,
 		&ipRanges,
 	)
+}
+
+func hasActiveOpenVPNRules(state config.State) bool {
+	providersByID := providersIndex(state.Providers)
+	for _, rule := range state.Rules {
+		if !rule.Enabled || len(rule.Domains) == 0 {
+			continue
+		}
+		provider, exists := providersByID[rule.ProviderID]
+		if exists && provider.Enabled && provider.Type == config.ProviderTypeOpenVPN {
+			return true
+		}
+	}
+	return false
 }
 
 func validateProviderActivation(candidate config.Provider, providers []config.Provider, rules []config.Rule) error {
