@@ -323,6 +323,21 @@ func (s *Supervisor) evaluatePriorityPolicyLocked(ctx context.Context, state con
 
 	previous := s.priority.decisions[policy.ID]
 	fingerprint := priorityPolicyFingerprint(policy, state)
+	if previous.ActiveLocation == "" {
+		if running := runningPriorityTarget(snapshot, provider.ID, policy.Targets); running != "" {
+			previous = priorityDecision{
+				PolicyID:          policy.ID,
+				PolicyName:        policy.Name,
+				ProviderID:        provider.ID,
+				ProviderName:      provider.Name,
+				ActiveLocation:    running,
+				PreferredLocation: preferred,
+				Mode:              "provider",
+				Since:             now,
+				Fingerprint:       fingerprint,
+			}
+		}
+	}
 	candidates := priorityCandidateLocations(policy, preferred)
 	failureThreshold := time.Duration(state.Automation.FailoverFailureSeconds) * time.Second
 	if failureThreshold <= 0 {
@@ -566,6 +581,22 @@ func priorityCandidateLocations(policy config.PriorityPolicy, preferred string) 
 		out = append(out, locations[(start+offset)%len(locations)])
 	}
 	return out
+}
+
+func runningPriorityTarget(snapshot status.Snapshot, providerID string, targets []config.PriorityTarget) string {
+	for _, target := range targets {
+		location := strings.TrimSpace(target.Location)
+		if location == "" {
+			continue
+		}
+		key := providerID + "::" + strings.ToLower(location)
+		for _, item := range snapshot.SubscriptionRuntime {
+			if item.Key == key && item.Status == "running" {
+				return location
+			}
+		}
+	}
+	return ""
 }
 
 func locationInPriorityTargets(policy config.PriorityPolicy, location string) bool {

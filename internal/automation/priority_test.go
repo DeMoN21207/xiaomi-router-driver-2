@@ -9,6 +9,7 @@ import (
 
 	"xiomi-router-driver/internal/config"
 	"xiomi-router-driver/internal/status"
+	"xiomi-router-driver/internal/subscription"
 )
 
 func TestApplyPriorityDefaultsUsesScheduleAndDoesNotPersistPolicies(t *testing.T) {
@@ -76,9 +77,38 @@ func TestEvaluatePriorityPolicyKeepsActiveTargetDuringFailureGracePeriod(t *test
 	}
 }
 
+func TestEvaluatePriorityPolicyKeepsRunningTargetDuringStartupFailureGracePeriod(t *testing.T) {
+	fallback := listenTCP(t)
+	defer fallback.Close()
+
+	state := priorityTestState(t, 1, listenerPort(t, fallback))
+	state.Automation.FailoverFailureSeconds = 120
+	supervisor := &Supervisor{dataDir: t.TempDir(), priority: newPriorityRuntime()}
+	policy := state.PriorityPolicies[0]
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.Local)
+	snapshot := status.Snapshot{
+		SubscriptionRuntime: []subscription.RuntimeSnapshot{
+			{
+				Key:      "provider_1::germany",
+				Location: "Germany",
+				Status:   "running",
+			},
+		},
+	}
+
+	decision, ok := supervisor.evaluatePriorityPolicyLocked(t.Context(), state, snapshot, policy, now)
+	if !ok {
+		t.Fatal("evaluatePriorityPolicyLocked() ok = false")
+	}
+	if decision.ActiveLocation != "Germany" {
+		t.Fatalf("expected running startup target to remain Germany during failure grace period, got %+v", decision)
+	}
+}
+
 func TestEvaluatePriorityPolicyFallsBackAfterFailureGracePeriod(t *testing.T) {
 	fallback := listenTCP(t)
 	defer fallback.Close()
+	t.Setenv("VPN_MANAGER_FAILOVER_FAILURE_STREAK", "3")
 
 	state := priorityTestState(t, 1, listenerPort(t, fallback))
 	state.Automation.FailoverFailureSeconds = 120
@@ -95,7 +125,7 @@ func TestEvaluatePriorityPolicyFallsBackAfterFailureGracePeriod(t *testing.T) {
 	supervisor.priority.health[priorityHealthKey(policy.ID, "Germany")] = providerHealthState{
 		Status:              "unhealthy",
 		UnhealthySince:      now.Add(-120 * time.Second),
-		ConsecutiveFailures: 6,
+		ConsecutiveFailures: 2,
 	}
 
 	decision, ok := supervisor.evaluatePriorityPolicyLocked(t.Context(), state, status.Snapshot{}, policy, now)
