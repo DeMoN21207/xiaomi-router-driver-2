@@ -50,6 +50,63 @@ func TestEvaluatePriorityPolicyFallsBackToNextHealthyTarget(t *testing.T) {
 	}
 }
 
+func TestEvaluatePriorityPolicyKeepsActiveTargetDuringFailureGracePeriod(t *testing.T) {
+	fallback := listenTCP(t)
+	defer fallback.Close()
+
+	state := priorityTestState(t, 1, listenerPort(t, fallback))
+	state.Automation.FailoverFailureSeconds = 120
+	supervisor := &Supervisor{dataDir: t.TempDir(), priority: newPriorityRuntime()}
+	policy := state.PriorityPolicies[0]
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.Local)
+	supervisor.priority.decisions[policy.ID] = priorityDecision{
+		PolicyID:       policy.ID,
+		ActiveLocation: "Germany",
+		Mode:           "provider",
+		Fingerprint:    priorityPolicyFingerprint(policy, state),
+		Since:          now.Add(-time.Hour),
+	}
+
+	decision, ok := supervisor.evaluatePriorityPolicyLocked(t.Context(), state, status.Snapshot{}, policy, now)
+	if !ok {
+		t.Fatal("evaluatePriorityPolicyLocked() ok = false")
+	}
+	if decision.ActiveLocation != "Germany" {
+		t.Fatalf("expected active target to remain Germany during failure grace period, got %+v", decision)
+	}
+}
+
+func TestEvaluatePriorityPolicyFallsBackAfterFailureGracePeriod(t *testing.T) {
+	fallback := listenTCP(t)
+	defer fallback.Close()
+
+	state := priorityTestState(t, 1, listenerPort(t, fallback))
+	state.Automation.FailoverFailureSeconds = 120
+	supervisor := &Supervisor{dataDir: t.TempDir(), priority: newPriorityRuntime()}
+	policy := state.PriorityPolicies[0]
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.Local)
+	supervisor.priority.decisions[policy.ID] = priorityDecision{
+		PolicyID:       policy.ID,
+		ActiveLocation: "Germany",
+		Mode:           "provider",
+		Fingerprint:    priorityPolicyFingerprint(policy, state),
+		Since:          now.Add(-time.Hour),
+	}
+	supervisor.priority.health[priorityHealthKey(policy.ID, "Germany")] = providerHealthState{
+		Status:              "unhealthy",
+		UnhealthySince:      now.Add(-120 * time.Second),
+		ConsecutiveFailures: 6,
+	}
+
+	decision, ok := supervisor.evaluatePriorityPolicyLocked(t.Context(), state, status.Snapshot{}, policy, now)
+	if !ok {
+		t.Fatal("evaluatePriorityPolicyLocked() ok = false")
+	}
+	if decision.ActiveLocation != "Netherlands" {
+		t.Fatalf("expected fallback Netherlands after failure grace period, got %+v", decision)
+	}
+}
+
 func TestEvaluatePriorityPolicyWaitsBeforeRestoringPreferred(t *testing.T) {
 	germany := listenTCP(t)
 	defer germany.Close()

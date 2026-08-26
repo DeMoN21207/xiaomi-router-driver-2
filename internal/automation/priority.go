@@ -324,6 +324,10 @@ func (s *Supervisor) evaluatePriorityPolicyLocked(ctx context.Context, state con
 	previous := s.priority.decisions[policy.ID]
 	fingerprint := priorityPolicyFingerprint(policy, state)
 	candidates := priorityCandidateLocations(policy, preferred)
+	failureThreshold := time.Duration(state.Automation.FailoverFailureSeconds) * time.Second
+	if failureThreshold <= 0 {
+		failureThreshold = 2 * time.Minute
+	}
 	selected := ""
 	selectedProbe := providerProbeResult{}
 	reason := ""
@@ -331,6 +335,13 @@ func (s *Supervisor) evaluatePriorityPolicyLocked(ctx context.Context, state con
 		probe := s.priorityTargetProbe(ctx, state, snapshot, provider, location, previous)
 		health := s.updatePriorityTargetHealth(policy, provider, location, probe, now)
 		if !probe.Healthy {
+			if location == previous.ActiveLocation &&
+				(health.UnhealthySince.IsZero() || now.Sub(health.UnhealthySince) < failureThreshold || health.ConsecutiveFailures < failoverFailureStreak()) {
+				selected = location
+				selectedProbe = probe
+				reason = "active target probe failed; waiting before fallback"
+				break
+			}
 			continue
 		}
 		if location == preferred && previous.ActiveLocation != "" && previous.ActiveLocation != preferred {
