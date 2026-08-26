@@ -142,6 +142,7 @@ func TestEvaluatePriorityPolicyWaitsBeforeRestoringPreferred(t *testing.T) {
 	defer germany.Close()
 	netherlands := listenTCP(t)
 	defer netherlands.Close()
+	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.Local)
 
 	state := priorityTestState(t, listenerPort(t, germany), listenerPort(t, netherlands))
 	supervisor := &Supervisor{dataDir: t.TempDir(), priority: newPriorityRuntime()}
@@ -151,10 +152,10 @@ func TestEvaluatePriorityPolicyWaitsBeforeRestoringPreferred(t *testing.T) {
 		ActiveLocation: "Netherlands",
 		Mode:           "provider",
 		Fingerprint:    priorityPolicyFingerprint(policy, state),
-		Since:          time.Now().Add(-time.Minute),
+		Since:          now.Add(-time.Minute),
 	}
 
-	decision, ok := supervisor.evaluatePriorityPolicyLocked(t.Context(), state, status.Snapshot{}, policy, time.Now())
+	decision, ok := supervisor.evaluatePriorityPolicyLocked(t.Context(), state, status.Snapshot{}, policy, now)
 	if !ok {
 		t.Fatal("evaluatePriorityPolicyLocked() ok = false")
 	}
@@ -164,10 +165,10 @@ func TestEvaluatePriorityPolicyWaitsBeforeRestoringPreferred(t *testing.T) {
 
 	supervisor.priority.health[priorityHealthKey(policy.ID, "Germany")] = providerHealthState{
 		Status:               "healthy",
-		HealthySince:         time.Now().Add(-2 * time.Minute),
+		HealthySince:         now.Add(-2 * time.Minute),
 		ConsecutiveSuccesses: failoverRestoreStreak(),
 	}
-	decision, ok = supervisor.evaluatePriorityPolicyLocked(t.Context(), state, status.Snapshot{}, policy, time.Now())
+	decision, ok = supervisor.evaluatePriorityPolicyLocked(t.Context(), state, status.Snapshot{}, policy, now)
 	if !ok {
 		t.Fatal("evaluatePriorityPolicyLocked() ok = false after warm health")
 	}
