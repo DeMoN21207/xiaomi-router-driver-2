@@ -1038,7 +1038,6 @@ func (s *siteTrafficStore) ensureReady() error {
 	if s.initialized {
 		return s.initErr
 	}
-	s.initialized = true
 
 	if s.db == nil {
 		s.initErr = errors.New("site traffic database is not configured")
@@ -1131,6 +1130,8 @@ func (s *siteTrafficStore) ensureReady() error {
 		}
 	}
 
+	s.initErr = nil
+	s.initialized = true
 	return nil
 }
 

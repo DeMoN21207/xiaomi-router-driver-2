@@ -127,31 +127,43 @@ func (s *Supervisor) ApplyPriorityPolicies(ctx context.Context) error {
 	if s.state == nil || s.status == nil {
 		return nil
 	}
+	// Read inputs only after the previous application has published its runtime.
+	// Dashboard snapshots can deliberately remain stale while it is in progress.
+	s.priorityEvalMu.Lock()
+	defer s.priorityEvalMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	state, err := s.state.Load()
 	if err != nil {
 		return err
 	}
-	snapshot, err := s.status.Snapshot(ctx)
+	snapshot, err := s.status.RuntimeSnapshot(ctx)
 	if err != nil {
 		return err
 	}
-	s.maybePriorityPolicies(ctx, state, snapshot)
+	s.maybePriorityPoliciesLocked(ctx, state, snapshot)
 	return nil
 }
 
 func (s *Supervisor) maybePriorityPolicies(ctx context.Context, state config.State, snapshot status.Snapshot) bool {
-	if s.applyState == nil {
-		return false
-	}
-	if snapshot.WAN.State != "up" {
+	// Serialize decisions through application, without blocking status readers
+	// or manual selections on network probes and route updates.
+	s.priorityEvalMu.Lock()
+	defer s.priorityEvalMu.Unlock()
+	return s.maybePriorityPoliciesLocked(ctx, state, snapshot)
+}
+
+func (s *Supervisor) maybePriorityPoliciesLocked(ctx context.Context, state config.State, snapshot status.Snapshot) bool {
+	if s.applyState == nil || snapshot.WAN.State != "up" || ctx.Err() != nil {
 		return false
 	}
 
 	now := time.Now()
 	s.priorityMu.Lock()
-	defer s.priorityMu.Unlock()
 	s.priority.ensure()
 	s.prunePriorityRuntimeLocked(state, now)
+	s.priorityMu.Unlock()
 
 	next := make(map[string]priorityDecision)
 	for _, policy := range state.PriorityPolicies {
@@ -161,11 +173,16 @@ func (s *Supervisor) maybePriorityPolicies(ctx context.Context, state config.Sta
 		}
 	}
 
+	s.priorityMu.RLock()
 	needsApply := !samePriorityDecisionSet(s.priority.decisions, next)
+	s.priorityMu.RUnlock()
 	if !needsApply && !priorityRuntimeMatchesDecisions(snapshot, next) {
 		needsApply = true
 	}
 	if !needsApply {
+		s.priorityMu.Lock()
+		s.priority.decisions = next
+		s.priorityMu.Unlock()
 		return false
 	}
 
@@ -178,8 +195,10 @@ func (s *Supervisor) maybePriorityPolicies(ctx context.Context, state config.Sta
 		return false
 	}
 
+	s.priorityMu.Lock()
 	s.priority.decisions = next
-	s.priority.lastApply = now
+	s.priority.lastApply = time.Now()
+	s.priorityMu.Unlock()
 	s.record("info", "automation.priority_applied", formatPriorityApplyMessage(next))
 	return true
 }
@@ -303,6 +322,8 @@ func (s *Supervisor) prunePriorityRuntimeLocked(state config.State, now time.Tim
 	}
 }
 
+// The caller holds priorityEvalMu, not priorityMu: probes run without blocking
+// status reads or override updates, and shared runtime access uses short locks.
 func (s *Supervisor) evaluatePriorityPolicyLocked(ctx context.Context, state config.State, snapshot status.Snapshot, policy config.PriorityPolicy, now time.Time) (priorityDecision, bool) {
 	if !policy.Enabled || len(policy.Targets) == 0 {
 		return priorityDecision{}, false
@@ -313,7 +334,10 @@ func (s *Supervisor) evaluatePriorityPolicyLocked(ctx context.Context, state con
 	}
 
 	preferred := preferredPriorityLocation(policy, now)
+	s.priorityMu.RLock()
 	override, hasOverride := s.priority.overrides[policy.ID]
+	previous := s.priority.decisions[policy.ID]
+	s.priorityMu.RUnlock()
 	if hasOverride {
 		preferred = override.Location
 	}
@@ -321,7 +345,6 @@ func (s *Supervisor) evaluatePriorityPolicyLocked(ctx context.Context, state con
 		return priorityDecision{}, false
 	}
 
-	previous := s.priority.decisions[policy.ID]
 	fingerprint := priorityPolicyFingerprint(policy, state)
 	if previous.ActiveLocation == "" {
 		if running := runningPriorityTarget(snapshot, provider.ID, policy.Targets); running != "" {
@@ -343,12 +366,47 @@ func (s *Supervisor) evaluatePriorityPolicyLocked(ctx context.Context, state con
 	if failureThreshold <= 0 {
 		failureThreshold = 2 * time.Minute
 	}
+	// Probe the current tunnel and preferred server together so a dead primary
+	// cannot delay observing a failure of the active backup.
+	probes := make(map[string]providerProbeResult)
+	healths := make(map[string]providerHealthState)
+	type targetResult struct {
+		location string
+		probe    providerProbeResult
+	}
+	initial := []string{preferred}
+	if previous.ActiveLocation != "" && previous.ActiveLocation != preferred {
+		initial = append(initial, previous.ActiveLocation)
+	}
+	results := make(chan targetResult, len(initial))
+	for _, location := range initial {
+		go func(location string) {
+			results <- targetResult{location, s.priorityTargetProbe(ctx, state, snapshot, provider, location, previous)}
+		}(location)
+	}
+	for range initial {
+		result := <-results
+		probes[result.location] = result.probe
+		healths[result.location] = s.updatePriorityTargetHealth(policy, provider, result.location, result.probe, now)
+	}
+	activeHealth := healths[previous.ActiveLocation]
+	activeProtected := previous.ActiveLocation != "" && (probes[previous.ActiveLocation].Healthy ||
+		activeHealth.UnhealthySince.IsZero() || now.Sub(activeHealth.UnhealthySince) < failureThreshold || activeHealth.ConsecutiveFailures < failoverFailureStreak())
 	selected := ""
 	selectedProbe := providerProbeResult{}
 	reason := ""
 	for _, location := range candidates {
-		probe := s.priorityTargetProbe(ctx, state, snapshot, provider, location, previous)
-		health := s.updatePriorityTargetHealth(policy, provider, location, probe, now)
+		// Keep a working backup instead of hopping through intermediate targets.
+		// Only the preferred target earns automatic restoration after its grace period.
+		if activeProtected && location != preferred && location != previous.ActiveLocation {
+			continue
+		}
+		probe, checked := probes[location]
+		health := healths[location]
+		if !checked {
+			probe = s.priorityTargetProbe(ctx, state, snapshot, provider, location, previous)
+			health = s.updatePriorityTargetHealth(policy, provider, location, probe, now)
+		}
 		if !probe.Healthy {
 			if location == previous.ActiveLocation &&
 				(health.UnhealthySince.IsZero() || now.Sub(health.UnhealthySince) < failureThreshold || health.ConsecutiveFailures < failoverFailureStreak()) {
@@ -359,7 +417,10 @@ func (s *Supervisor) evaluatePriorityPolicyLocked(ctx context.Context, state con
 			}
 			continue
 		}
-		if location == preferred && previous.ActiveLocation != "" && previous.ActiveLocation != preferred {
+		// Restoration hysteresis protects a working fallback from flapping. It
+		// must not delay an explicit healthy selection or prolong an outage once
+		// the active fallback has exhausted its failure grace period.
+		if location == preferred && activeProtected && !hasOverride && previous.ActiveLocation != "" && previous.ActiveLocation != preferred {
 			threshold := time.Duration(state.Automation.FailoverRestoreSeconds) * time.Second
 			if threshold <= 0 {
 				threshold = 60 * time.Second
@@ -384,7 +445,13 @@ func (s *Supervisor) evaluatePriorityPolicyLocked(ctx context.Context, state con
 	}
 
 	if hasOverride && selected != override.Location {
-		delete(s.priority.overrides, policy.ID)
+		s.priorityMu.Lock()
+		// A manual selection can arrive while the previous target is probed.
+		// Only reject the override that this evaluation actually checked.
+		if current, exists := s.priority.overrides[policy.ID]; exists && current == override {
+			delete(s.priority.overrides, policy.ID)
+		}
+		s.priorityMu.Unlock()
 	}
 
 	return priorityDecision{
@@ -413,6 +480,12 @@ func (s *Supervisor) priorityTargetProbe(ctx context.Context, state config.State
 			if item.Status != "running" {
 				return providerProbeResult{Healthy: false, Detail: firstNonEmpty(item.StatusDetail, fmt.Sprintf("subscription location %s is not running", location)), Location: location}
 			}
+			if strings.TrimSpace(item.InterfaceName) != "" {
+				probe := s.subscriptionTunnelProbe(ctx, item.InterfaceName, item.FWMark)
+				probe.Location = location
+				s.cacheProviderProbe(standbyProbeKey(provider, location), probe)
+				return probe
+			}
 			break
 		}
 		if !foundRuntime {
@@ -420,6 +493,9 @@ func (s *Supervisor) priorityTargetProbe(ctx context.Context, state config.State
 		}
 	}
 
+	if previous.ActiveLocation != location && s.probeStandby != nil {
+		return s.probeStandby(ctx, provider, location)
+	}
 	probe := s.probeProvider(ctx, state, provider, location)
 	if probe.Location == "" {
 		probe.Location = location
@@ -428,6 +504,9 @@ func (s *Supervisor) priorityTargetProbe(ctx context.Context, state config.State
 }
 
 func (s *Supervisor) updatePriorityTargetHealth(policy config.PriorityPolicy, provider config.Provider, location string, probe providerProbeResult, now time.Time) providerHealthState {
+	s.priorityMu.Lock()
+	defer s.priorityMu.Unlock()
+	s.priority.ensure()
 	key := priorityHealthKey(policy.ID, location)
 	previous := s.priority.health[key]
 	next := previous
@@ -711,9 +790,8 @@ func (s *Supervisor) PriorityStatus() PriorityStatus {
 	}
 	providers := providersIndex(state.Providers)
 
-	s.priorityMu.Lock()
-	defer s.priorityMu.Unlock()
-	s.priority.ensure()
+	s.priorityMu.RLock()
+	defer s.priorityMu.RUnlock()
 
 	result := PriorityStatus{
 		LastApplyAt: timeString(s.priority.lastApply),

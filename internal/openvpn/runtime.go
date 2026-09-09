@@ -157,30 +157,19 @@ func (m *Manager) Apply(ctx context.Context, provider config.Provider, domains [
 		return nil
 	}
 
-	profileDir := filepath.Dir(profilePath)
-	args := []string{"--cd", profileDir, "--config", filepath.Base(profilePath), "--route-noexec"}
-	if iface := strings.TrimSpace(settings.VPNIface); iface != "" {
-		args = append(args, "--dev", iface)
-	}
-
-	cmd := exec.CommandContext(ctx, openvpnBinary, args...)
-	cmd.Dir = profileDir
-
-	stdoutPipe, err := cmd.StdoutPipe()
+	cmd, stdoutPipe, stderrPipe, err := startProcess(ctx, openvpnBinary, profilePath, settings.VPNIface)
 	if err != nil {
-		removeIfExists(domainListPath)
-		return fmt.Errorf("prepare openvpn stdout: %w", err)
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		removeIfExists(domainListPath)
-		return fmt.Errorf("prepare openvpn stderr: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
 		removeIfExists(domainListPath)
 		return fmt.Errorf("start openvpn for %s: %w", provider.Name, err)
 	}
+	started := false
+	defer func() {
+		if !started {
+			// Startup must not leak a process even if database-backed cleanup
+			// fails. Once launched, watchInstance remains the sole waiter.
+			_ = cmd.Process.Kill()
+		}
+	}()
 
 	instance := &managedInstance{
 		ProviderID:     provider.ID,
@@ -197,7 +186,9 @@ func (m *Manager) Apply(ctx context.Context, provider config.Provider, domains [
 	if err := m.saveInstanceLocked(instance); err != nil {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
 		}
+		delete(m.current, provider.ID)
 		removeIfExists(domainListPath)
 		return err
 	}
@@ -206,7 +197,7 @@ func (m *Manager) Apply(ctx context.Context, provider config.Provider, domains [
 	go m.streamRuntimeLogs(provider.Name, stderrPipe)
 	go m.watchInstance(provider.ID, cmd)
 
-	if err := waitForInterface(settings.VPNIface, 20*time.Second); err != nil {
+	if err := waitForInterface(ctx, settings.VPNIface, 20*time.Second); err != nil {
 		_ = m.cleanupLocked(context.Background())
 		return fmt.Errorf("wait for openvpn interface %s: %w", settings.VPNIface, err)
 	}
@@ -227,6 +218,7 @@ func (m *Manager) Apply(ctx context.Context, provider config.Provider, domains [
 	}
 
 	m.record("info", "openvpn.runtime_started", fmt.Sprintf("%s started on %s", provider.Name, settings.VPNIface))
+	started = true
 	return nil
 }
 
@@ -243,13 +235,16 @@ func (m *Manager) Cleanup(ctx context.Context) error {
 
 func (m *Manager) Snapshots() ([]RuntimeSnapshot, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	if err := m.ensureReadyLocked(); err != nil {
+		m.mu.Unlock()
 		return nil, err
 	}
 
 	instances, err := m.loadInstancesLocked()
+	// Instances are independent values loaded from the database. Network
+	// probes must not prevent Apply, Cleanup or process-exit handling.
+	m.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
@@ -458,15 +453,24 @@ func writeDomainList(path string, domains []string) error {
 	return fileutil.WriteFileAtomic(path, []byte(content), 0o644)
 }
 
-func waitForInterface(name string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+func waitForInterface(ctx context.Context, name string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("wait for interface %s: %w", name, err)
+		}
 		if runtimehealth.InterfaceAlive(name) {
 			return nil
 		}
-		time.Sleep(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for interface %s: %w", name, ctx.Err())
+		case <-ticker.C:
+		}
 	}
-	return fmt.Errorf("interface %s did not appear", name)
 }
 
 func interfaceExists(name string) bool {

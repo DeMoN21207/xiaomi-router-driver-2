@@ -203,6 +203,7 @@ func (m *Manager) InstallLatest(ctx context.Context) (InstallResult, error) {
 		m.record("error", "update.install_failed", err.Error())
 		return InstallResult{}, err
 	}
+	defer os.RemoveAll(filepath.Dir(archivePath))
 	result, err := m.installArchive(ctx, archivePath)
 	if err != nil {
 		m.record("error", "update.install_failed", err.Error())
@@ -235,6 +236,7 @@ func (m *Manager) InstallUploaded(ctx context.Context, reader io.Reader, filenam
 		m.record("error", "update.upload_failed", err.Error())
 		return InstallResult{}, err
 	}
+	defer os.RemoveAll(filepath.Dir(archivePath))
 	result, err := m.installArchive(ctx, archivePath)
 	if err != nil {
 		m.record("error", "update.upload_failed", err.Error())
@@ -391,6 +393,12 @@ func (m *Manager) writeArchive(reader io.Reader, filename string) (string, error
 	if err != nil {
 		return "", err
 	}
+	complete := false
+	defer func() {
+		if !complete {
+			_ = os.RemoveAll(dir)
+		}
+	}()
 	path := filepath.Join(dir, filepath.Base(filename))
 	output, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -403,11 +411,14 @@ func (m *Manager) writeArchive(reader io.Reader, filename string) (string, error
 	if err := output.Close(); err != nil {
 		return "", fmt.Errorf("close update archive: %w", err)
 	}
+	complete = true
 	return path, nil
 }
 
 func (m *Manager) installArchive(ctx context.Context, archivePath string) (InstallResult, error) {
-	_ = ctx
+	if err := ctx.Err(); err != nil {
+		return InstallResult{}, err
+	}
 
 	extractDir := filepath.Join(filepath.Dir(archivePath), "extracted")
 	if err := ExtractTarGz(archivePath, extractDir); err != nil {
@@ -415,6 +426,9 @@ func (m *Manager) installArchive(ctx context.Context, archivePath string) (Insta
 	}
 	info, err := ValidateBundle(extractDir)
 	if err != nil {
+		return InstallResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return InstallResult{}, err
 	}
 	backupDir, err := installBundle(m.appDir, m.dataDir, info, time.Now().UTC())

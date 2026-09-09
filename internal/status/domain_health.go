@@ -868,7 +868,6 @@ func (s *domainHealthStore) ensureReady() error {
 	if s.initialized {
 		return s.initErr
 	}
-	s.initialized = true
 
 	if s.db == nil {
 		s.initErr = errors.New("domain health database is not configured")
@@ -935,6 +934,8 @@ func (s *domainHealthStore) ensureReady() error {
 		}
 	}
 
+	s.initErr = nil
+	s.initialized = true
 	return nil
 }
 

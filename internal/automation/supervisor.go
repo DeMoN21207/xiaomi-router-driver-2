@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"xiomi-router-driver/internal/config"
@@ -20,19 +21,26 @@ type ApplyFunc func(ctx context.Context) error
 type ApplyStateFunc func(ctx context.Context, state config.State) error
 
 type Supervisor struct {
-	state       *config.Manager
-	status      *status.Service
-	apply       ApplyFunc
-	applyState  ApplyStateFunc
-	dataDir     string
-	recordEvent func(level string, kind string, message string)
-	interval    time.Duration
-	lastWAN     string
-	lastCleanup time.Time
-	failoverMu  sync.RWMutex
-	failover    failoverRuntime
-	priorityMu  sync.RWMutex
-	priority    priorityRuntime
+	state        *config.Manager
+	status       *status.Service
+	apply        ApplyFunc
+	applyState   ApplyStateFunc
+	dataDir      string
+	recordEvent  func(level string, kind string, message string)
+	interval     time.Duration
+	lastWAN      string
+	lastCleanup  time.Time
+	failoverMu   sync.RWMutex
+	failover     failoverRuntime
+	priorityMu   sync.RWMutex
+	priority     priorityRuntime
+	probeTunnel  func(context.Context, string, string) providerProbeResult
+	probeStandby func(context.Context, config.Provider, string) providerProbeResult
+	probeCacheMu sync.Mutex
+	probeCache   map[string]cachedProviderProbe
+
+	priorityEvalMu      sync.Mutex
+	failoverStatusCache atomic.Pointer[failoverStatusSnapshot]
 }
 
 func NewSupervisor(
@@ -50,7 +58,7 @@ func NewSupervisor(
 		}
 	}
 
-	return &Supervisor{
+	s := &Supervisor{
 		state:       state,
 		status:      statusService,
 		apply:       apply,
@@ -61,6 +69,8 @@ func NewSupervisor(
 		failover:    newFailoverRuntime(),
 		priority:    newPriorityRuntime(),
 	}
+	s.probeStandby = s.probeSubscriptionStandby
+	return s
 }
 
 func (s *Supervisor) Run(ctx context.Context) {
@@ -70,7 +80,8 @@ func (s *Supervisor) Run(ctx context.Context) {
 
 	s.startup(ctx)
 
-	ticker := time.NewTicker(s.interval)
+	interval := s.configuredRecoveryInterval()
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -79,12 +90,41 @@ func (s *Supervisor) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.tick(ctx)
+			if next := s.configuredRecoveryInterval(); next != interval {
+				interval = next
+				ticker.Reset(interval)
+			}
 		}
 	}
 }
 
+func (s *Supervisor) configuredRecoveryInterval() time.Duration {
+	state, err := s.state.Load()
+	if err != nil {
+		return s.interval
+	}
+	return s.recoveryInterval(state)
+}
+
+func (s *Supervisor) recoveryInterval(state config.State) time.Duration {
+	interval := s.interval
+	if interval <= 0 {
+		interval = 20 * time.Second
+	}
+	// Sample at least three times within the failure window. Keep the normal
+	// reconciliation cadence when fast failover is not configured.
+	if state.Automation.ProviderFailover || len(state.PriorityPolicies) > 0 {
+		failure := time.Duration(state.Automation.FailoverFailureSeconds) * time.Second
+		if failure > 0 {
+			probeInterval := max(time.Second, failure/3)
+			interval = min(interval, probeInterval)
+		}
+	}
+	return interval
+}
+
 func (s *Supervisor) startup(ctx context.Context) {
-	if snapshot, err := s.status.Snapshot(ctx); err == nil {
+	if snapshot, err := s.status.RuntimeSnapshot(ctx); err == nil {
 		s.lastWAN = snapshot.WAN.State
 	}
 
@@ -99,7 +139,13 @@ func (s *Supervisor) startup(ctx context.Context) {
 	if !hasEnabledRules(state) {
 		return
 	}
-	if err := s.apply(ctx); err != nil {
+	var applyErr error
+	if s.applyState != nil {
+		applyErr = s.applyState(ctx, state)
+	} else {
+		applyErr = s.apply(ctx)
+	}
+	if err := applyErr; err != nil {
 		s.record("error", "automation.reconcile_failed", fmt.Sprintf("startup restore failed: %v", err))
 		log.Printf("automation startup restore failed: %v", err)
 		return
@@ -117,7 +163,7 @@ func (s *Supervisor) tick(ctx context.Context) {
 	// Periodic traffic cleanup (run at most once per hour).
 	s.maybeCleanupTraffic(state)
 
-	snapshot, err := s.status.Snapshot(ctx)
+	snapshot, err := s.status.RuntimeSnapshot(ctx)
 	if err != nil {
 		s.record("error", "automation.reconcile_failed", fmt.Sprintf("load status snapshot: %v", err))
 		return

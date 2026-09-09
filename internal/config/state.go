@@ -107,7 +107,6 @@ type Manager struct {
 	legacyPath  string
 	mu          sync.Mutex
 	initialized bool
-	initErr     error
 }
 
 func NewManager(db *sql.DB, legacyPath string) *Manager {
@@ -204,6 +203,34 @@ func (m *Manager) Save(state State) (State, error) {
 	}
 
 	return state, nil
+}
+
+// RecordApplyResult updates runtime metadata without replacing settings that
+// may have been edited while routes were being applied. An empty appliedAt
+// preserves the timestamp of the last successful application.
+func (m *Manager) RecordApplyResult(appliedAt string, lastError string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.ensureReadyUnlocked(); err != nil {
+		return err
+	}
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if appliedAt != "" {
+		if err := saveMetaTx(tx, "lastAppliedAt", appliedAt); err != nil {
+			return err
+		}
+	}
+	if err := saveMetaTx(tx, "lastError", lastError); err != nil {
+		return err
+	}
+	if err := saveMetaTx(tx, "updatedAt", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (m *Manager) UpdateRule(rule Rule) (Rule, error) {
@@ -306,25 +333,22 @@ func (m *Manager) DeleteRule(id string) error {
 
 func (m *Manager) ensureReadyUnlocked() error {
 	if m.initialized {
-		return m.initErr
+		return nil
 	}
-	m.initialized = true
 
 	if m.db == nil {
-		m.initErr = errors.New("config database is not configured")
-		return m.initErr
+		return errors.New("config database is not configured")
 	}
 
 	if err := ensureStateSchema(m.db); err != nil {
-		m.initErr = err
 		return err
 	}
 
 	if err := m.migrateLegacyUnlocked(); err != nil {
-		m.initErr = err
 		return err
 	}
 
+	m.initialized = true
 	return nil
 }
 
@@ -760,10 +784,13 @@ func (m *Manager) loadUnlocked() (State, error) {
 		return State{}, err
 	}
 
-	for index := range state.Rules {
-		state.Rules[index].Domains, err = loadRuleDomains(m.db, state.Rules[index].ID)
+	if len(state.Rules) > 0 {
+		domainsByRule, err := loadRuleDomains(m.db)
 		if err != nil {
 			return State{}, err
+		}
+		for index := range state.Rules {
+			state.Rules[index].Domains = domainsByRule[state.Rules[index].ID]
 		}
 	}
 
@@ -793,18 +820,24 @@ func (m *Manager) loadUnlocked() (State, error) {
 		return State{}, err
 	}
 
-	for index := range state.PriorityPolicies {
-		state.PriorityPolicies[index].Entries, err = loadPriorityPolicyEntries(m.db, state.PriorityPolicies[index].ID)
+	if len(state.PriorityPolicies) > 0 {
+		entries, err := loadPriorityPolicyEntries(m.db)
 		if err != nil {
 			return State{}, err
 		}
-		state.PriorityPolicies[index].Targets, err = loadPriorityPolicyTargets(m.db, state.PriorityPolicies[index].ID)
+		targets, err := loadPriorityPolicyTargets(m.db)
 		if err != nil {
 			return State{}, err
 		}
-		state.PriorityPolicies[index].Schedule, err = loadPriorityPolicySchedule(m.db, state.PriorityPolicies[index].ID)
+		schedules, err := loadPriorityPolicySchedule(m.db)
 		if err != nil {
 			return State{}, err
+		}
+		for index := range state.PriorityPolicies {
+			policy := &state.PriorityPolicies[index]
+			policy.Entries = entries[policy.ID]
+			policy.Targets = targets[policy.ID]
+			policy.Schedule = schedules[policy.ID]
 		}
 	}
 
@@ -890,25 +923,24 @@ func (m *Manager) loadUnlocked() (State, error) {
 	return normalize(state), nil
 }
 
-func loadRuleDomains(db *sql.DB, ruleID string) ([]string, error) {
+func loadRuleDomains(db *sql.DB) (map[string][]string, error) {
 	rows, err := db.Query(`
-		SELECT domain
+		SELECT rule_id, domain
 		FROM rule_domains
-		WHERE rule_id = ?
-		ORDER BY position ASC, domain ASC
-	`, ruleID)
+		ORDER BY rule_id ASC, position ASC, domain ASC
+	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	domains := make([]string, 0, 8)
+	domains := make(map[string][]string)
 	for rows.Next() {
-		var domain string
-		if err := rows.Scan(&domain); err != nil {
+		var ruleID, domain string
+		if err := rows.Scan(&ruleID, &domain); err != nil {
 			return nil, err
 		}
-		domains = append(domains, domain)
+		domains[ruleID] = append(domains[ruleID], domain)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -917,25 +949,24 @@ func loadRuleDomains(db *sql.DB, ruleID string) ([]string, error) {
 	return domains, nil
 }
 
-func loadPriorityPolicyEntries(db *sql.DB, policyID string) ([]string, error) {
+func loadPriorityPolicyEntries(db *sql.DB) (map[string][]string, error) {
 	rows, err := db.Query(`
-		SELECT entry
+		SELECT policy_id, entry
 		FROM priority_policy_entries
-		WHERE policy_id = ?
-		ORDER BY position ASC, entry ASC
-	`, policyID)
+		ORDER BY policy_id ASC, position ASC, entry ASC
+	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	entries := make([]string, 0, 8)
+	entries := make(map[string][]string)
 	for rows.Next() {
-		var entry string
-		if err := rows.Scan(&entry); err != nil {
+		var policyID, entry string
+		if err := rows.Scan(&policyID, &entry); err != nil {
 			return nil, err
 		}
-		entries = append(entries, entry)
+		entries[policyID] = append(entries[policyID], entry)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -944,25 +975,25 @@ func loadPriorityPolicyEntries(db *sql.DB, policyID string) ([]string, error) {
 	return entries, nil
 }
 
-func loadPriorityPolicyTargets(db *sql.DB, policyID string) ([]PriorityTarget, error) {
+func loadPriorityPolicyTargets(db *sql.DB) (map[string][]PriorityTarget, error) {
 	rows, err := db.Query(`
-		SELECT location
+		SELECT policy_id, location
 		FROM priority_policy_targets
-		WHERE policy_id = ?
-		ORDER BY position ASC, location ASC
-	`, policyID)
+		ORDER BY policy_id ASC, position ASC, location ASC
+	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	targets := make([]PriorityTarget, 0, 4)
+	targets := make(map[string][]PriorityTarget)
 	for rows.Next() {
+		var policyID string
 		var target PriorityTarget
-		if err := rows.Scan(&target.Location); err != nil {
+		if err := rows.Scan(&policyID, &target.Location); err != nil {
 			return nil, err
 		}
-		targets = append(targets, target)
+		targets[policyID] = append(targets[policyID], target)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -971,25 +1002,25 @@ func loadPriorityPolicyTargets(db *sql.DB, policyID string) ([]PriorityTarget, e
 	return targets, nil
 }
 
-func loadPriorityPolicySchedule(db *sql.DB, policyID string) ([]PriorityScheduleWindow, error) {
+func loadPriorityPolicySchedule(db *sql.DB) (map[string][]PriorityScheduleWindow, error) {
 	rows, err := db.Query(`
-		SELECT start_time, end_time, location
+		SELECT policy_id, start_time, end_time, location
 		FROM priority_policy_schedule
-		WHERE policy_id = ?
-		ORDER BY position ASC, rowid ASC
-	`, policyID)
+		ORDER BY policy_id ASC, position ASC, rowid ASC
+	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	schedule := make([]PriorityScheduleWindow, 0, 4)
+	schedule := make(map[string][]PriorityScheduleWindow)
 	for rows.Next() {
+		var policyID string
 		var window PriorityScheduleWindow
-		if err := rows.Scan(&window.Start, &window.End, &window.Location); err != nil {
+		if err := rows.Scan(&policyID, &window.Start, &window.End, &window.Location); err != nil {
 			return nil, err
 		}
-		schedule = append(schedule, window)
+		schedule[policyID] = append(schedule[policyID], window)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1183,8 +1214,8 @@ func normalizeAutomationSettings(settings AutomationSettings) AutomationSettings
 	if settings.FailoverFailureSeconds <= 0 {
 		settings.FailoverFailureSeconds = defaults.FailoverFailureSeconds
 	}
-	if settings.FailoverFailureSeconds < 30 {
-		settings.FailoverFailureSeconds = 30
+	if settings.FailoverFailureSeconds < 15 {
+		settings.FailoverFailureSeconds = 15
 	}
 	if settings.FailoverFailureSeconds > 3600 {
 		settings.FailoverFailureSeconds = 3600

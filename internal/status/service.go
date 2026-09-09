@@ -166,6 +166,27 @@ func NewService(
 	}
 }
 
+// RuntimeSnapshot supplies the recovery supervisor without counting domains,
+// building traffic routes or reading dashboard metadata on every health check.
+func (s *Service) RuntimeSnapshot(ctx context.Context) (Snapshot, error) {
+	result := Snapshot{WAN: s.cachedWANStatus(ctx),
+		OpenVPNRuntime: []openvpn.RuntimeSnapshot{}, SubscriptionRuntime: []subscription.RuntimeSnapshot{}}
+	var err error
+	if s.openvpn != nil {
+		result.OpenVPNRuntime, err = s.openvpn.Snapshots()
+		if err != nil {
+			return Snapshot{}, err
+		}
+	}
+	if s.subscriptions != nil {
+		result.SubscriptionRuntime, err = s.subscriptions.Snapshots()
+		if err != nil {
+			return Snapshot{}, err
+		}
+	}
+	return result, nil
+}
+
 func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 	state, err := s.state.Load()
 	if err != nil {
@@ -184,21 +205,13 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 		OpenVPN: s.hasBinary(s.openvpnBinary),
 		SingBox: s.hasBinary(s.singboxBinary),
 	}
-	wan := s.cachedWANStatus(ctx)
-	openvpnRuntime := []openvpn.RuntimeSnapshot{}
-	if s.openvpn != nil {
-		openvpnRuntime, err = s.openvpn.Snapshots()
-		if err != nil {
-			return Snapshot{}, err
-		}
+	runtimeSnapshot, err := s.RuntimeSnapshot(ctx)
+	if err != nil {
+		return Snapshot{}, err
 	}
-	subscriptionRuntime := []subscription.RuntimeSnapshot{}
-	if s.subscriptions != nil {
-		subscriptionRuntime, err = s.subscriptions.Snapshots()
-		if err != nil {
-			return Snapshot{}, err
-		}
-	}
+	wan := runtimeSnapshot.WAN
+	openvpnRuntime := runtimeSnapshot.OpenVPNRuntime
+	subscriptionRuntime := runtimeSnapshot.SubscriptionRuntime
 	trafficRoutes := buildTrafficRoutes(state, openvpnRuntime, subscriptionRuntime, domainsByProvider)
 	openvpnRuntimeByProvider := indexOpenVPNRuntimeByProvider(openvpnRuntime)
 	subscriptionRuntimeByKey := indexSubscriptionRuntimeByKey(subscriptionRuntime)

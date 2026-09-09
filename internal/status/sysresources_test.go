@@ -2,6 +2,34 @@ package status
 
 import "testing"
 
+func TestCPUStatDoesNotCountIOWaitOrGuestTimeAsExtraWork(t *testing.T) {
+	idle, total := parseCPUStat("cpu  100 20 30 400 50 6 7 8 60 10\ncpu0 1 2 3 4\n")
+	if idle != 450 || total != 621 {
+		t.Fatalf("idle=%d total=%d, want 450 and 621", idle, total)
+	}
+}
+
+func TestCPUUsageRemainsValidWhenCountersReset(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		prev, next cpuSample
+		want       float64
+	}{
+		{"normal", cpuSample{idle: 100, total: 200}, cpuSample{idle: 150, total: 300}, 50},
+		{"first", cpuSample{}, cpuSample{idle: 150, total: 300}, 0},
+		{"unchanged", cpuSample{idle: 100, total: 200}, cpuSample{idle: 100, total: 200}, 0},
+		{"counter reset", cpuSample{idle: 100, total: 200}, cpuSample{idle: 50, total: 80}, 0},
+		{"iowait decreases", cpuSample{idle: 100, total: 200}, cpuSample{idle: 90, total: 300}, 0},
+		{"inconsistent sample", cpuSample{idle: 100, total: 200}, cpuSample{idle: 200, total: 250}, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cpuUsageBetween(tt.prev, tt.next); got != tt.want {
+				t.Fatalf("CPU = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseSystemUptime(t *testing.T) {
 	uptime := parseSystemUptime("90061.23 120.00\n")
 

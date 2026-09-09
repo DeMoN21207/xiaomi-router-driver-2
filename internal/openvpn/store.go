@@ -13,7 +13,6 @@ func (m *Manager) ensureReadyLocked() error {
 	if m.initialized {
 		return m.initErr
 	}
-	m.initialized = true
 
 	if m.db == nil {
 		m.initErr = errors.New("openvpn runtime database is not configured")
@@ -35,6 +34,8 @@ func (m *Manager) ensureReadyLocked() error {
 		return err
 	}
 
+	m.initErr = nil
+	m.initialized = true
 	return nil
 }
 

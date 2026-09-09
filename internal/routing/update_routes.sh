@@ -28,6 +28,8 @@ DNS_PRIME_LOOKUP_TIMEOUT_SECONDS="${DNS_PRIME_LOOKUP_TIMEOUT_SECONDS:-2}"
 DNS_PRIME_SERVERS="${DNS_PRIME_SERVERS:-1.1.1.1,8.8.8.8,9.9.9.9}"
 DOMAIN_STATS_MAX_DOMAINS="${DOMAIN_STATS_MAX_DOMAINS:-128}"
 IPSET_TIMEOUT="${IPSET_TIMEOUT:-1800}"
+IPSET_RESTORE_FILE="${IPSET_RESTORE_FILE:-}"
+FAST_RECOVERY="${FAST_RECOVERY:-0}"
 IPSET_FLUSH_ON_SYNC="${IPSET_FLUSH_ON_SYNC:-0}"
 ROUTING_LOCK_FILE="${ROUTING_LOCK_FILE:-/tmp/vpn-manager-routing.lock}"
 ROUTING_LOCK_WAIT_SECONDS="${ROUTING_LOCK_WAIT_SECONDS:-30}"
@@ -296,6 +298,12 @@ count_active_domains() {
 }
 
 prime_ipsets() {
+    if [ -n "$IPSET_RESTORE_FILE" ]; then
+        if ! ipset restore -exist < "$IPSET_RESTORE_FILE"; then
+            echo "Error: failed to restore known VPN destinations." >&2
+            exit 1
+        fi
+    fi
     if [ "${PRIME_MAX_DOMAINS:-0}" -le 0 ] 2>/dev/null; then
         echo "--> Priming disabled; dnsmasq/ipset will populate entries on demand."
         return 0
@@ -821,6 +829,16 @@ flush_conntrack_if_requested() {
         return 0
     fi
     echo "--> Flushing conntrack entries for routed destinations..."
+
+    if [ "$FAST_RECOVERY" = "1" ]; then
+        # The saved set already contains the destinations that need rerouting;
+        # do not block recovery on another DNS lookup for every domain.
+        for ip in $(ipset save "$IPSET_NAME" | awk '$1 == "add" {print $3}'); do
+            conntrack -D -d "$ip" >/dev/null 2>&1 || true
+            conntrack -D -s "$ip" >/dev/null 2>&1 || true
+        done
+        return 0
+    fi
 
     count=0
     flushed=""

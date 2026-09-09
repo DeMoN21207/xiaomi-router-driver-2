@@ -152,7 +152,6 @@ func (m *Manager) ensureReadyLocked() error {
 	if m.initialized {
 		return m.initErr
 	}
-	m.initialized = true
 
 	if m.db == nil {
 		m.initErr = errors.New("domains database is not configured")
@@ -177,6 +176,8 @@ func (m *Manager) ensureReadyLocked() error {
 		return err
 	}
 
+	m.initErr = nil
+	m.initialized = true
 	return nil
 }
 
@@ -310,19 +311,19 @@ func (m *Manager) syncRuntimeFile(lines []string) error {
 
 func normalizeDomainList(domains []string) ([]string, error) {
 	result := make([]string, 0, len(domains))
-	seen := make(map[string]struct{}, len(domains))
+	seen := make(map[string]EntryKind, len(domains))
 	for _, domain := range domains {
-		normalized, _, err := NormalizeEntry(domain)
+		normalized, kind, err := NormalizeEntry(domain)
 		if err != nil {
 			return nil, err
 		}
 		if _, exists := seen[normalized]; exists {
 			continue
 		}
-		seen[normalized] = struct{}{}
+		seen[normalized] = kind
 		result = append(result, normalized)
 	}
-	return collapseCoveredDomains(result), nil
+	return collapseCoveredDomains(result, seen), nil
 }
 
 func sameDomainList(left []string, right []string) bool {
@@ -339,29 +340,36 @@ func sameDomainList(left []string, right []string) bool {
 
 func NormalizeEntries(domains []string) []string {
 	result := make([]string, 0, len(domains))
-	seen := make(map[string]struct{}, len(domains))
+	seen := make(map[string]EntryKind, len(domains))
 	for _, domain := range domains {
-		normalized, _, err := NormalizeEntry(domain)
+		normalized, kind, err := NormalizeEntry(domain)
 		if err != nil {
 			continue
 		}
 		if _, exists := seen[normalized]; exists {
 			continue
 		}
-		seen[normalized] = struct{}{}
+		seen[normalized] = kind
 		result = append(result, normalized)
 	}
-	return collapseCoveredDomains(result)
+	return collapseCoveredDomains(result, seen)
 }
 
-func collapseCoveredDomains(entries []string) []string {
+func collapseCoveredDomains(entries []string, kinds map[string]EntryKind) []string {
 	if len(entries) < 2 {
 		return entries
 	}
 
 	domainSet := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
-		if IsIPEntry(entry) {
+		// URL path stripping can turn a domain candidate into a canonical IPv4
+		// literal. Classify that narrow case without re-normalizing hostnames.
+		if kinds[entry] != EntryKindIP && entry != "" && entry[0] >= '0' && entry[0] <= '9' {
+			if addr, err := netip.ParseAddr(entry); err == nil && addr.Is4() {
+				kinds[entry] = EntryKindIP
+			}
+		}
+		if kinds[entry] == EntryKindIP {
 			continue
 		}
 		domainSet[entry] = struct{}{}
@@ -369,7 +377,7 @@ func collapseCoveredDomains(entries []string) []string {
 
 	result := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if IsIPEntry(entry) {
+		if kinds[entry] == EntryKindIP {
 			result = append(result, entry)
 			continue
 		}
@@ -467,6 +475,17 @@ func ParseIPPrefix(value string) (netip.Prefix, bool) {
 
 func normalizeIPEntry(raw string) (string, error) {
 	candidate := stripHostPort(raw)
+	// Ordinary hostnames cannot be IP literals. Avoid allocating parser errors
+	// for them on every configuration/status read; still validate all IPv6-like
+	// and numeric IPv4 inputs through the existing strict parsers.
+	if !strings.ContainsAny(candidate, ":[]") {
+		for index := 0; index < len(candidate); index++ {
+			c := candidate[index]
+			if (c < '0' || c > '9') && c != '.' && c != '/' {
+				return "", errNotIPEntry
+			}
+		}
+	}
 
 	if prefix, err := netip.ParsePrefix(candidate); err == nil {
 		if !prefix.Addr().Is4() {
@@ -495,6 +514,9 @@ func looksLikeIPv4Entry(value string) bool {
 }
 
 func stripHostPort(value string) string {
+	if !strings.Contains(value, ":") {
+		return value
+	}
 	if host, port, err := net.SplitHostPort(value); err == nil && port != "" {
 		return host
 	}

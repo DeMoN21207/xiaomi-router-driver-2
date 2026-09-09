@@ -198,7 +198,6 @@ func (s *Store) ensureReadyLocked() error {
 	if s.initialized {
 		return s.initErr
 	}
-	s.initialized = true
 
 	if s.db == nil {
 		s.initErr = errors.New("events database is not configured")
@@ -232,6 +231,8 @@ func (s *Store) ensureReadyLocked() error {
 		return err
 	}
 
+	s.initErr = nil
+	s.initialized = true
 	return nil
 }
 

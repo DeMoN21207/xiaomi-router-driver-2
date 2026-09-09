@@ -441,23 +441,34 @@ func (h *Handler) handleSystemUpdateUpload(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if err := r.ParseMultipartForm(128 << 20); err != nil {
+	reader, err := r.MultipartReader()
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	file, header, err := r.FormFile("archive")
-	if err != nil {
-		writeError(w, http.StatusBadRequest, errors.New("archive file is required"))
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, errors.New("archive file is required"))
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if part.FormName() != "archive" || part.FileName() == "" {
+			continue
+		}
+		// Stream directly to the update work directory. Part.Close would drain
+		// a rejected upload; the HTTP server owns and closes the request body.
+		result, err := h.update.InstallUploaded(r.Context(), part, part.FileName())
+		if err != nil {
+			writeUpdateError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
 		return
 	}
-	defer file.Close()
-
-	result, err := h.update.InstallUploaded(r.Context(), file, header.Filename)
-	if err != nil {
-		writeUpdateError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
 }
 
 func (h *Handler) handleTrafficHistory(w http.ResponseWriter, r *http.Request) {
@@ -1625,6 +1636,7 @@ func (h *Handler) applyCurrentRules(ctx context.Context) (applyResult, error) {
 }
 
 func (h *Handler) ApplyRulesFromState(ctx context.Context, state config.State) error {
+	ctx = subscription.WithCachedEntries(ctx)
 	_, err := h.applyStateRules(ctx, state, false)
 	return err
 }
@@ -1632,7 +1644,6 @@ func (h *Handler) ApplyRulesFromState(ctx context.Context, state config.State) e
 func (h *Handler) applyStateRules(ctx context.Context, state config.State, persistState bool) (applyResult, error) {
 	h.applyMu.Lock()
 	defer h.applyMu.Unlock()
-	savedState := state
 	state = automation.ApplyPriorityDefaults(state, time.Now())
 	var previousDomains []string
 	domainReplaceAttempted := false
@@ -1645,8 +1656,9 @@ func (h *Handler) applyStateRules(ctx context.Context, state config.State, persi
 			}
 		}
 		if persistState {
-			savedState.LastError = finalErr.Error()
-			_, _ = h.state.Save(savedState)
+			if saveErr := h.state.RecordApplyResult("", finalErr.Error()); saveErr != nil {
+				finalErr = fmt.Errorf("%w; save apply error failed: %v", finalErr, saveErr)
+			}
 		}
 		h.recordEvent("error", "rules.apply_failed", finalErr.Error())
 		return applyResult{}, finalErr
@@ -1711,6 +1723,21 @@ func (h *Handler) applyStateRules(ctx context.Context, state config.State, persi
 	previousDomains, err = h.domains.List()
 	if err != nil {
 		return fail(err)
+	}
+	ctx = subscription.WithPreviousDomains(ctx, previousDomains)
+	// An ipset has no domain ownership metadata. Transfer it only for an
+	// unchanged, single-provider rule set; edits must rebuild their destinations.
+	if !persistState && len(activeProviders) == 1 && len(subscriptionRules) > 0 && len(previousDomains) == len(domainsToApply) {
+		unchanged := true
+		for _, entry := range previousDomains {
+			if _, exists := seenDomains[entry]; !exists {
+				unchanged = false
+				break
+			}
+		}
+		if unchanged {
+			ctx = subscription.WithRoutingSnapshot(ctx)
+		}
 	}
 	domainReplaceAttempted = true
 	if err := h.domains.ReplaceAll(domainsToApply); err != nil {
@@ -1794,9 +1821,11 @@ func (h *Handler) applyStateRules(ctx context.Context, state config.State, persi
 	}
 
 	if persistState {
-		savedState.LastAppliedAt = time.Now().UTC().Format(time.RFC3339)
-		savedState.LastError = ""
-		_, _ = h.state.Save(savedState)
+		if err := h.state.RecordApplyResult(time.Now().UTC().Format(time.RFC3339), ""); err != nil {
+			err = fmt.Errorf("routes applied but saving the result failed: %w", err)
+			h.recordEvent("error", "rules.apply_failed", err.Error())
+			return applyResult{}, err
+		}
 	}
 
 	eventMessage := fmt.Sprintf("Applied %d rules for %d routing entries", len(enabledRules), len(domainsToApply))

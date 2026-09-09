@@ -4,6 +4,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -50,6 +51,7 @@ type cpuSample struct {
 const defaultUptimePath = "/proc/uptime"
 
 var prevCPUSample cpuSample
+var cpuSampleMu sync.Mutex
 
 // CollectSystemResources reads system resource information from /proc.
 func CollectSystemResources(dataDir string) SystemResources {
@@ -75,6 +77,10 @@ func CollectSystemResources(dataDir string) SystemResources {
 }
 
 func readCPUUsage() float64 {
+	// Serialize reading and updating the baseline so overlapping dashboard
+	// requests cannot use reordered samples or race on the shared counters.
+	cpuSampleMu.Lock()
+	defer cpuSampleMu.Unlock()
 	idle, total := parseProcStat()
 	if total == 0 {
 		return 0
@@ -83,13 +89,17 @@ func readCPUUsage() float64 {
 	prev := prevCPUSample
 	prevCPUSample = cpuSample{idle: idle, total: total}
 
-	if prev.total == 0 {
+	return cpuUsageBetween(prev, prevCPUSample)
+}
+
+func cpuUsageBetween(prev, current cpuSample) float64 {
+	if prev.total == 0 || current.total <= prev.total || current.idle < prev.idle {
 		return 0
 	}
 
-	deltaIdle := idle - prev.idle
-	deltaTotal := total - prev.total
-	if deltaTotal == 0 {
+	deltaIdle := current.idle - prev.idle
+	deltaTotal := current.total - prev.total
+	if deltaIdle > deltaTotal {
 		return 0
 	}
 
@@ -102,18 +112,30 @@ func parseProcStat() (idle, total uint64) {
 		return 0, 0
 	}
 
-	for _, line := range strings.Split(string(data), "\n") {
+	return parseCPUStat(string(data))
+}
+
+func parseCPUStat(raw string) (idle, total uint64) {
+	for _, line := range strings.Split(raw, "\n") {
 		if strings.HasPrefix(line, "cpu ") {
 			fields := strings.Fields(line)
 			if len(fields) < 5 {
 				return 0, 0
 			}
 			var sum uint64
-			for i := 1; i < len(fields); i++ {
-				v, _ := strconv.ParseUint(fields[i], 10, 64)
+			// guest and guest_nice are already included in user and nice.
+			for i := 1; i < len(fields) && i <= 8; i++ {
+				v, err := strconv.ParseUint(fields[i], 10, 64)
+				if err != nil {
+					return 0, 0
+				}
 				sum += v
 			}
 			idleVal, _ := strconv.ParseUint(fields[4], 10, 64)
+			if len(fields) > 5 {
+				iowait, _ := strconv.ParseUint(fields[5], 10, 64)
+				idleVal += iowait
+			}
 			return idleVal, sum
 		}
 	}

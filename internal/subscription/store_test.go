@@ -116,8 +116,8 @@ func TestManagerMigratesLegacyManifestAndPrunesFiles(t *testing.T) {
 	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
 		t.Fatalf("expected legacy log to be removed, err=%v", err)
 	}
-	if _, err := os.Stat(domainListPath); !os.IsNotExist(err) {
-		t.Fatalf("expected legacy domain list to be removed, err=%v", err)
+	if _, err := os.Stat(domainListPath); err != nil {
+		t.Fatalf("expected active domain list to be retained for rollback, err=%v", err)
 	}
 	if _, err := os.Stat(configPath); err != nil {
 		t.Fatalf("expected active config to remain, err=%v", err)

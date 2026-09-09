@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"xiomi-router-driver/internal/config"
@@ -44,6 +45,7 @@ type Manager struct {
 	current            map[string]*managedInstance
 	initialized        bool
 	initErr            error
+	snapshotCache      atomic.Pointer[instanceSnapshotCache]
 }
 
 type desiredInstance struct {
@@ -55,11 +57,12 @@ type desiredInstance struct {
 }
 
 type applyPlan struct {
-	desired        desiredInstance
-	settings       config.RoutingSettings
-	domainListPath string
-	configPath     string
-	configData     []byte
+	desired          desiredInstance
+	settings         config.RoutingSettings
+	domainListPath   string
+	configPath       string
+	configData       []byte
+	ipsetRestorePath string
 }
 
 type managedInstance struct {
@@ -73,6 +76,7 @@ type managedInstance struct {
 	Settings       config.RoutingSettings
 	PID            int
 	cmd            *exec.Cmd
+	done           <-chan struct{}
 	domainListPath string
 }
 
@@ -134,33 +138,58 @@ func NewManager(appDir string, dataDir string, db *sql.DB, routingRunner *routin
 	}
 }
 
-func (m *Manager) Apply(ctx context.Context, state config.State, enabledRules []config.Rule) error {
+func (m *Manager) Apply(ctx context.Context, state config.State, enabledRules []config.Rule) (applyErr error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if err := m.ensureReadyLocked(); err != nil {
 		return err
 	}
-
-	desired, err := m.buildDesired(state, enabledRules)
+	existingInstances, err := m.loadInstancesLocked()
 	if err != nil {
 		return err
 	}
-	if len(desired) == 0 {
-		if err := m.cleanupLocked(ctx); err != nil {
-			return err
-		}
-		return m.pruneRuntimeFilesLocked()
-	}
+	m.publishInstances(existingInstances, nil)
+	defer m.refreshSnapshotLocked()
 
+	cacheOnly, _ := ctx.Value(cachedEntriesOnlyKey{}).(bool)
+	desired, err := m.buildDesired(state, enabledRules, cacheOnly)
+	if err != nil {
+		return err
+	}
 	plans, err := m.buildApplyPlans(desired, state.Routing)
 	if err != nil {
 		return err
 	}
-
-	existingInstances, err := m.loadInstancesLocked()
+	rollback, err := m.prepareRollback(ctx, existingInstances)
 	if err != nil {
 		return err
+	}
+	defer rollback.close()
+
+	copyRouting, _ := ctx.Value(routingSnapshotKey{}).(bool)
+	existingCount := 0
+	for _, instance := range existingInstances {
+		if instance != nil {
+			existingCount++
+		}
+	}
+	if copyRouting && existingCount == 1 && len(plans) == 1 && len(rollback.plans) == 1 {
+		old := rollback.plans[0]
+		// Share the single captured snapshot with fast failover, without another
+		// ipset subprocess. Never transfer destinations between different providers.
+		if old.desired.Provider.ID == plans[0].desired.Provider.ID && old.ipsetRestorePath != "" {
+			path, captureErr := routing.CopyIPSetSnapshot(old.ipsetRestorePath, old.settings.IPSetName, plans[0].settings.IPSetName)
+			if captureErr != nil {
+				m.record("warn", "subscription.recovery_dns_fallback", "Saved destinations unavailable; rebuilding DNS routing")
+			} else if path != "" {
+				plans[0].ipsetRestorePath = path
+				defer os.Remove(path)
+			}
+		}
 	}
 
 	reusable := make(map[string]*managedInstance, len(plans))
@@ -169,6 +198,13 @@ func (m *Manager) Apply(ctx context.Context, state config.State, enabledRules []
 			reusable[plan.desired.Key] = existing
 		}
 	}
+	touched := make(map[string]bool)
+	startedPlans := make(map[string]applyPlan)
+	defer func() {
+		if applyErr != nil && len(touched) > 0 {
+			applyErr = m.rollbackApply(ctx, applyErr, rollback, touched, startedPlans)
+		}
+	}()
 
 	for _, instance := range existingInstances {
 		if instance == nil {
@@ -177,15 +213,23 @@ func (m *Manager) Apply(ctx context.Context, state config.State, enabledRules []
 		if _, keep := reusable[instance.Key]; keep {
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		touched[instance.Key] = true
 		if err := m.stopInstanceLocked(ctx, instance); err != nil {
 			return err
 		}
 	}
 
 	for _, plan := range plans {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		touched[plan.desired.Key] = true
+		startedPlans[plan.desired.Key] = plan
 		if existing := reusable[plan.desired.Key]; existing != nil {
 			if err := m.applyRoutingToInstanceLocked(ctx, existing, plan); err != nil {
-				_ = m.cleanupLocked(context.Background())
 				return fmt.Errorf("apply routing for %s: %w", plan.desired.Location, err)
 			}
 			continue
@@ -193,33 +237,27 @@ func (m *Manager) Apply(ctx context.Context, state config.State, enabledRules []
 
 		instance, err := m.startPlannedInstance(plan)
 		if err != nil {
-			_ = m.cleanupLocked(context.Background())
 			return err
 		}
 
 		m.current[plan.desired.Key] = instance
 		if err := m.saveInstanceLocked(instance); err != nil {
-			_ = m.cleanupLocked(context.Background())
 			return err
 		}
 
-		if err := waitForInterface(instance.Settings.VPNIface, interfaceWaitTimeout); err != nil {
-			_ = m.cleanupLocked(context.Background())
+		if err := waitForInstanceInterface(ctx, instance); err != nil {
 			return fmt.Errorf("wait for %s interface: %w", plan.desired.Location, err)
 		}
 
 		if err := m.routing.RunWithOptions(ctx, "add", routing.RunOptions{
-			Settings:       instance.Settings,
-			DomainListPath: plan.domainListPath,
+			Settings:         instance.Settings,
+			DomainListPath:   plan.domainListPath,
+			IPSetRestorePath: plan.ipsetRestorePath,
 		}); err != nil {
-			_ = m.cleanupLocked(context.Background())
 			return fmt.Errorf("apply routing for %s: %w", plan.desired.Location, err)
 		}
 
-		removeIfExists(plan.domainListPath)
-		instance.domainListPath = ""
 		if err := m.saveInstanceLocked(instance); err != nil {
-			_ = m.cleanupLocked(context.Background())
 			return err
 		}
 	}
@@ -234,23 +272,31 @@ func (m *Manager) Cleanup(ctx context.Context) error {
 	if err := m.ensureReadyLocked(); err != nil {
 		return err
 	}
+	m.refreshSnapshotLocked()
+	defer m.refreshSnapshotLocked()
 
 	return m.cleanupLocked(ctx)
 }
 
 func (m *Manager) Snapshots() ([]RuntimeSnapshot, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if err := m.ensureReadyLocked(); err != nil {
-		return nil, err
+	// Route application may take seconds. Readers use the last published copy
+	// while the writer owns the runtime lock, then independently assess its PIDs.
+	if m.mu.TryLock() {
+		if err := m.ensureReadyLocked(); err != nil {
+			m.publishInstances(nil, err)
+		} else {
+			m.refreshSnapshotLocked()
+		}
+		m.mu.Unlock()
 	}
-
-	instances, err := m.loadInstancesLocked()
-	if err != nil {
-		return nil, err
+	cached := m.snapshotCache.Load()
+	if cached == nil {
+		return []RuntimeSnapshot{}, nil
 	}
-
+	if cached.err != nil {
+		return nil, cached.err
+	}
+	instances := cached.instances
 	snapshots := make([]RuntimeSnapshot, 0, len(instances))
 	for _, instance := range instances {
 		if instance == nil {
@@ -301,6 +347,7 @@ func (m *Manager) startPlannedInstance(plan applyPlan) (*managedInstance, error)
 		return nil, fmt.Errorf("start sing-box for %s: %w", plan.desired.Location, err)
 	}
 
+	done := make(chan struct{})
 	instance := &managedInstance{
 		Key:            plan.desired.Key,
 		ProviderID:     plan.desired.Provider.ID,
@@ -312,12 +359,13 @@ func (m *Manager) startPlannedInstance(plan applyPlan) (*managedInstance, error)
 		Settings:       plan.settings,
 		PID:            cmd.Process.Pid,
 		cmd:            cmd,
+		done:           done,
 		domainListPath: plan.domainListPath,
 	}
 
 	go m.streamRuntimeLogs(plan.desired.Provider.Name, plan.desired.Location, stdoutPipe)
 	go m.streamRuntimeLogs(plan.desired.Provider.Name, plan.desired.Location, stderrPipe)
-	go m.watchInstance(plan.desired.Key, cmd)
+	go m.watchInstanceWithDone(plan.desired.Key, cmd, done)
 
 	m.record("info", "subscription.runtime_started", fmt.Sprintf("%s: %s started on %s", plan.desired.Provider.Name, plan.desired.Location, plan.settings.VPNIface))
 	return instance, nil
@@ -344,10 +392,18 @@ func (m *Manager) streamRuntimeLogs(providerName string, location string, reader
 }
 
 func (m *Manager) watchInstance(key string, cmd *exec.Cmd) {
+	m.watchInstanceWithDone(key, cmd, nil)
+}
+
+func (m *Manager) watchInstanceWithDone(key string, cmd *exec.Cmd, done chan struct{}) {
 	err := cmd.Wait()
+	if done != nil {
+		close(done)
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	defer m.refreshSnapshotLocked()
 
 	current, exists := m.current[key]
 	if !exists {
@@ -490,11 +546,20 @@ func (m *Manager) canReuseInstance(instance *managedInstance, plan applyPlan) bo
 	if !sameRuntimeConfig(instance, plan) {
 		return false
 	}
-	if !runtimehealth.InterfaceAlive(instance.InterfaceName) {
+	if !interfaceAlive(instance.InterfaceName) {
 		return false
 	}
 	if instance.PID <= 0 {
 		return false
+	}
+	if instance.done != nil {
+		// An owned process cannot have its PID recycled before Wait completes.
+		select {
+		case <-instance.done:
+			return false
+		default:
+			return true
+		}
 	}
 	return runtimehealth.ProcessAlive(instance.PID, m.singBoxBinary, instance.ConfigPath)
 }
@@ -508,19 +573,19 @@ func (m *Manager) applyRoutingToInstanceLocked(ctx context.Context, instance *ma
 	if err := writeDomainList(plan.domainListPath, plan.desired.Domains); err != nil {
 		return fmt.Errorf("write domain list for %s: %w", plan.desired.Location, err)
 	}
-	defer removeIfExists(plan.domainListPath)
-
-	if err := waitForInterface(plan.settings.VPNIface, interfaceWaitTimeout); err != nil {
+	if err := waitForInterfaceContext(ctx, plan.settings.VPNIface, interfaceWaitTimeout); err != nil {
 		return fmt.Errorf("wait for %s interface before routing sync: %w", plan.desired.Location, err)
 	}
 
 	if err := m.routing.RunWithOptions(ctx, "sync", routing.RunOptions{
-		Settings:       plan.settings,
-		DomainListPath: plan.domainListPath,
+		Settings:         plan.settings,
+		DomainListPath:   plan.domainListPath,
+		IPSetRestorePath: plan.ipsetRestorePath,
 	}); err != nil {
 		if err := m.routing.RunWithOptions(ctx, "add", routing.RunOptions{
-			Settings:       plan.settings,
-			DomainListPath: plan.domainListPath,
+			Settings:         plan.settings,
+			DomainListPath:   plan.domainListPath,
+			IPSetRestorePath: plan.ipsetRestorePath,
 		}); err != nil {
 			return err
 		}
@@ -533,7 +598,7 @@ func (m *Manager) applyRoutingToInstanceLocked(ctx context.Context, instance *ma
 	target.DomainCount = len(plan.desired.Domains)
 	target.ConfigPath = plan.configPath
 	target.Settings = plan.settings
-	target.domainListPath = ""
+	target.domainListPath = plan.domainListPath
 	return m.saveInstanceLocked(target)
 }
 
@@ -548,6 +613,13 @@ func (m *Manager) stopInstanceLocked(ctx context.Context, instance *managedInsta
 		removeIfExists(current.domainListPath)
 		if current.cmd != nil && current.cmd.Process != nil {
 			_ = current.cmd.Process.Kill()
+			if current.done != nil {
+				select {
+				case <-current.done:
+				case <-ctx.Done():
+					cleanupErrors = append(cleanupErrors, ctx.Err())
+				}
+			}
 		} else if current.PID > 0 {
 			process, findErr := os.FindProcess(current.PID)
 			if findErr == nil {
@@ -575,7 +647,7 @@ func (m *Manager) stopInstanceLocked(ctx context.Context, instance *managedInsta
 	return errors.Join(cleanupErrors...)
 }
 
-func (m *Manager) buildDesired(state config.State, enabledRules []config.Rule) ([]desiredInstance, error) {
+func (m *Manager) buildDesired(state config.State, enabledRules []config.Rule, cacheOnly bool) ([]desiredInstance, error) {
 	providersByID := make(map[string]config.Provider, len(state.Providers))
 	for _, provider := range state.Providers {
 		providersByID[provider.ID] = provider
@@ -637,7 +709,14 @@ func (m *Manager) buildDesired(state config.State, enabledRules []config.Rule) (
 		if _, loaded := entriesByProvider[group.Provider.ID]; loaded {
 			continue
 		}
-		entries, fetchMode, err := FetchEntriesCached(group.Provider.Source, m.runtimeDir)
+		var entries []Entry
+		var fetchMode entriesFetchMode
+		var err error
+		if cacheOnly {
+			entries, err = LoadCachedEntries(group.Provider.Source, m.runtimeDir)
+		} else {
+			entries, fetchMode, err = FetchEntriesCached(group.Provider.Source, m.runtimeDir)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("load subscription %q: %w", group.Provider.Name, err)
 		}
@@ -791,14 +870,42 @@ func tunAddress(index int) string {
 }
 
 func waitForInterface(name string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	return waitForInterfaceContext(context.Background(), name, timeout)
+}
+
+func waitForInterfaceContext(ctx context.Context, name string, timeout time.Duration) error {
+	return waitForInterfaceReady(ctx, name, timeout, nil)
+}
+
+func waitForInstanceInterface(ctx context.Context, instance *managedInstance) error {
+	return waitForInterfaceReady(ctx, instance.Settings.VPNIface, interfaceWaitTimeout, instance.done)
+}
+
+func waitForInterfaceReady(ctx context.Context, name string, timeout time.Duration, processDone <-chan struct{}) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(waitForInterfacePollInterval)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("interface %s did not appear: %w", name, err)
+		}
+		select {
+		case <-processDone:
+			return fmt.Errorf("VPN process exited before interface %s was ready", name)
+		default:
+		}
 		if interfaceAlive(name) {
 			return nil
 		}
-		time.Sleep(waitForInterfacePollInterval)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("interface %s did not appear: %w", name, ctx.Err())
+		case <-processDone:
+			return fmt.Errorf("VPN process exited before interface %s was ready", name)
+		case <-ticker.C:
+		}
 	}
-	return fmt.Errorf("interface %s did not appear", name)
 }
 
 func findEntry(entries []Entry, location string) (Entry, bool) {

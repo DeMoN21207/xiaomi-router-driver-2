@@ -19,8 +19,9 @@ type Runner struct {
 }
 
 type RunOptions struct {
-	Settings       config.RoutingSettings
-	DomainListPath string
+	Settings         config.RoutingSettings
+	DomainListPath   string
+	IPSetRestorePath string
 }
 
 func NewRunner(scriptPath string) *Runner {
@@ -67,6 +68,7 @@ func (r *Runner) RunWithOptions(ctx context.Context, action string, options RunO
 	}
 
 	cmd := exec.CommandContext(ctx, shell, scriptPath, action)
+	configureRoutingProcess(cmd)
 	cmd.Dir = r.workingDir
 	loadProfile := config.RoutingLoadProfileTuningFor(options.Settings.LoadProfile)
 	envValues := map[string]string{
@@ -96,6 +98,11 @@ func (r *Runner) RunWithOptions(ctx context.Context, action string, options RunO
 	}
 	if r.dnsProxyServer != "" {
 		envValues["DNS_PROXY_SERVER"] = r.dnsProxyServer
+	}
+	if options.IPSetRestorePath != "" {
+		envValues["IPSET_RESTORE_FILE"] = options.IPSetRestorePath
+		envValues["PRIME_MAX_DOMAINS"] = "0"
+		envValues["FAST_RECOVERY"] = "1"
 	}
 	cmd.Env = withEnvMap(os.Environ(), envValues)
 	output, err := cmd.CombinedOutput()

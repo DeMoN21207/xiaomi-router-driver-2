@@ -437,7 +437,6 @@ func (s *domainTrafficStore) ensureReady() error {
 	if s.initialized {
 		return s.initErr
 	}
-	s.initialized = true
 
 	if s.db == nil {
 		s.initErr = errors.New("domain traffic database is not configured")
@@ -463,6 +462,8 @@ func (s *domainTrafficStore) ensureReady() error {
 		}
 	}
 
+	s.initErr = nil
+	s.initialized = true
 	return nil
 }
 

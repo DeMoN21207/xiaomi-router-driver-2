@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { fetchJSON } from "../api.js";
+import { useDashboardResource } from "../useDashboardResource.js";
 import { readDashboardRefreshInterval } from "../dashboardPreferences.js";
 import { useI18n } from "../i18n.jsx";
 import Icon from "../components/Icon.jsx";
@@ -9,71 +10,44 @@ import { accentTextClass, formatBytes, formatDate, formatLatencyMs, levelBadge, 
 
 const TRAFFIC_HISTORY_RANGES = ["1h", "3h", "1d", "3d", "7d", "30d"];
 
+function buildTrafficHistoryUrl(range, from, to) {
+  if (range === "custom" && from && to) {
+    const toISO = (value) => value.includes("T") ? new Date(value).toISOString() : value;
+    return `/api/traffic/history?from=${encodeURIComponent(toISO(from))}&to=${encodeURIComponent(toISO(to))}`;
+  }
+  return `/api/traffic/history?range=${encodeURIComponent(range)}`;
+}
+
 export default function DashboardPage() {
   const { t } = useI18n();
-  const [status, setStatus] = useState(null);
-  const [config, setConfig] = useState(null);
-  const [events, setEvents] = useState([]);
-  const [trafficHistory, setTrafficHistory] = useState(null);
   const [historyRange, setHistoryRange] = useState("7d");
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
   const [autoRefreshMs, setAutoRefreshMs] = useState(() => readDashboardRefreshInterval());
-  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [rebooting, setRebooting] = useState(false);
   const [error, setError] = useState("");
-  const refreshInFlightRef = useRef(false);
+  const historyUrl = buildTrafficHistoryUrl(historyRange, customFrom, customTo);
+  const statusResource = useDashboardResource("/api/status", autoRefreshMs);
+  const configResource = useDashboardResource("/api/config", autoRefreshMs);
+  const eventsResource = useDashboardResource("/api/events?limit=6", autoRefreshMs);
+  const historyResource = useDashboardResource(historyUrl, autoRefreshMs);
+  const systemResource = useDashboardResource("/api/system/resources", autoRefreshMs);
+  const resources = [statusResource, configResource, eventsResource, historyResource, systemResource];
+  const status = statusResource.data;
+  const config = configResource.data;
+  const events = eventsResource.data?.events ?? [];
+  const trafficHistory = historyResource.data;
+  const pageError = [error, ...resources.map((resource) => resource.error)].filter(Boolean).join(" · ");
 
-  const buildTrafficHistoryUrl = useCallback((rangeKey, from, to) => {
-    if (rangeKey === "custom" && from && to) {
-      const toISO = (v) => v.includes("T") ? new Date(v).toISOString() : v;
-      return `/api/traffic/history?from=${encodeURIComponent(toISO(from))}&to=${encodeURIComponent(toISO(to))}`;
-    }
-    return `/api/traffic/history?range=${encodeURIComponent(rangeKey)}`;
-  }, []);
-
-  const refresh = useCallback(async (initial = false, rangeKey = historyRange, from = customFrom, to = customTo, showBusy = false) => {
-    if (!initial && refreshInFlightRef.current) {
-      return;
-    }
-
-    refreshInFlightRef.current = true;
-    if (initial) setLoading(true);
-    else if (showBusy) setBusy(true);
-    const configPromise = fetchJSON("/api/config")
-      .then((nextConfig) => {
-        setConfig(nextConfig);
-        return nextConfig;
-      })
-      .catch((err) => {
-        setError(err.message);
-        return null;
-      });
-
+  async function refresh() {
+    setBusy(true);
     try {
-      const [nextStatus, nextEvents, nextTrafficHistory] = await Promise.all([
-        fetchJSON("/api/status"),
-        fetchJSON("/api/events?limit=6"),
-        fetchJSON(buildTrafficHistoryUrl(rangeKey, from, to)),
-      ]);
-      setStatus(nextStatus);
-      setEvents(nextEvents.events || []);
-      setTrafficHistory(nextTrafficHistory);
-      setError("");
-    } catch (err) {
-      setError(err.message);
+      await Promise.all(resources.map((resource) => resource.refresh()));
     } finally {
-      await configPromise;
-      refreshInFlightRef.current = false;
-      if (initial) setLoading(false);
-      else if (showBusy) setBusy(false);
+      setBusy(false);
     }
-  }, [historyRange, customFrom, customTo, buildTrafficHistoryUrl]);
-
-  useEffect(() => {
-    void refresh(true, historyRange);
-  }, [historyRange, refresh]);
+  }
 
   useEffect(() => {
     const syncPreference = () => setAutoRefreshMs(readDashboardRefreshInterval());
@@ -85,21 +59,6 @@ export default function DashboardPage() {
     };
   }, []);
 
-  useEffect(() => {
-    if (autoRefreshMs <= 0) {
-      return undefined;
-    }
-
-    const timerId = window.setInterval(() => {
-      if (document.visibilityState === "hidden") {
-        return;
-      }
-      void refresh(false, historyRange);
-    }, autoRefreshMs);
-
-    return () => window.clearInterval(timerId);
-  }, [autoRefreshMs, historyRange, refresh]);
-
   const configProviders = (config?.providers ?? []).map((provider) => ({
     ...provider,
     health: "checking",
@@ -108,7 +67,7 @@ export default function DashboardPage() {
   const providers = status?.providers ?? configProviders;
   const configReady = Boolean(config);
   const statusReady = Boolean(status);
-  const initialConfigLoading = loading && !configReady && !statusReady;
+  const initialConfigLoading = (statusResource.loading || configResource.loading) && !configReady && !statusReady;
   const trafficRoutes = status?.trafficRoutes ?? [];
   const wanState = status?.wan?.state || "unknown";
   const activeVpns = providers.filter((provider) => provider.enabled).length;
@@ -134,7 +93,7 @@ export default function DashboardPage() {
           </span>
           <button
             type="button"
-            onClick={() => refresh(false, historyRange, customFrom, customTo, true)}
+            onClick={refresh}
             disabled={busy}
             className="flex items-center gap-2 rounded-xl border border-outline-variant/30 bg-surface-container-high px-5 py-2.5 font-headline text-sm font-medium text-on-surface transition-colors hover:bg-surface-variant disabled:opacity-50"
           >
@@ -164,10 +123,10 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {error ? <InlineNotice tone="error" title={t("error.dashboard")} message={error} /> : null}
+      {pageError ? <InlineNotice tone="error" title={t("error.dashboard")} message={pageError} /> : null}
 
       <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4">
-        <KpiCard label={t("dashboard.wan")} value={t(`common.wanShort.${wanState}`)} icon="wifi" accent={wanState === "up" ? "secondary" : "error"} loading={loading && !statusReady} />
+        <KpiCard label={t("dashboard.wan")} value={t(`common.wanShort.${wanState}`)} icon="wifi" accent={wanState === "up" ? "secondary" : "error"} loading={statusResource.loading} />
         <KpiCard label={t("dashboard.activeVpns")} value={`${activeVpns} / ${providers.length}`} icon="vpn_lock" accent="primary" loading={initialConfigLoading} />
         <KpiCard label={t("dashboard.routingRules")} value={`${enabledRules} ${t("dashboard.active")}`} icon="alt_route" accent="tertiary" loading={initialConfigLoading} />
         <KpiCard
@@ -175,11 +134,11 @@ export default function DashboardPage() {
           value={formatDate(status?.lastAppliedAt) || t("dashboard.notYet")}
           icon="schedule"
           accent="outline"
-          loading={loading && !statusReady}
+          loading={statusResource.loading}
         />
       </div>
 
-      <SystemResourcesCard t={t} autoRefreshMs={autoRefreshMs} />
+      <SystemResourcesCard t={t} res={systemResource.data} loading={systemResource.loading} />
 
       <TrafficHistoryCard
         history={trafficHistory}
@@ -187,11 +146,11 @@ export default function DashboardPage() {
         onRangeChange={(r) => { setHistoryRange(r); }}
         customFrom={customFrom}
         customTo={customTo}
-        onApplyCustomRange={(from, to) => { setCustomFrom(from); setCustomTo(to); setHistoryRange("custom"); refresh(true, "custom", from, to); }}
-        loading={loading}
+        onApplyCustomRange={(from, to) => { setCustomFrom(from); setCustomTo(to); setHistoryRange("custom"); }}
+        loading={historyResource.loading}
         t={t}
       />
-      <TrafficAnalyticsCard routes={trafficRoutes} totalTrafficBytes={totalTrafficBytes} history={trafficHistory} range={historyRange} loading={loading} t={t} />
+      <TrafficAnalyticsCard routes={trafficRoutes} totalTrafficBytes={totalTrafficBytes} history={trafficHistory} range={historyRange} loading={statusResource.loading} historyLoading={historyResource.loading} t={t} />
 
       <div className="grid grid-cols-1 gap-8 lg:grid-cols-12">
         <div className="space-y-4 lg:col-span-7">
@@ -222,7 +181,9 @@ export default function DashboardPage() {
             </span>
           </div>
           <div className="max-h-[500px] space-y-3 overflow-y-auto rounded-xl bg-surface-container-low p-4">
-            {events.length === 0 ? (
+            {eventsResource.loading ? (
+              <p className="py-6 text-center text-sm text-on-surface-variant">{t("common.loading")}</p>
+            ) : events.length === 0 ? (
               <p className="py-6 text-center text-sm text-on-surface-variant">{t("dashboard.noEvents")}</p>
             ) : (
               events.map((event) => {
@@ -325,8 +286,7 @@ function TrafficHistoryCard({ history, range, onRangeChange, customFrom, customT
                 <button
                   key={option}
                   type="button"
-                  onClick={() => { if (!loading && (option !== range || showCustom)) { setShowCustom(false); onRangeChange(option); } }}
-                  disabled={loading}
+                  onClick={() => { if (option !== range || showCustom) { setShowCustom(false); onRangeChange(option); } }}
                   className={`rounded-full border px-3 py-1.5 text-xs font-bold uppercase tracking-wider transition-colors disabled:opacity-40 ${
                     active
                       ? "border-primary/30 bg-primary/10 text-primary"
@@ -340,7 +300,6 @@ function TrafficHistoryCard({ history, range, onRangeChange, customFrom, customT
             <button
               type="button"
               onClick={() => setShowCustom((v) => !v)}
-              disabled={loading}
               className={`rounded-full border px-3 py-1.5 text-xs font-bold uppercase tracking-wider transition-colors disabled:opacity-40 ${
                 showCustom
                   ? "border-primary/30 bg-primary/10 text-primary"
@@ -375,7 +334,7 @@ function TrafficHistoryCard({ history, range, onRangeChange, customFrom, customT
             </div>
             <button
               type="button"
-              disabled={loading || !localFrom || !localTo}
+              disabled={!localFrom || !localTo}
               onClick={() => { onApplyCustomRange(localFrom, localTo); }}
               className="rounded-lg bg-primary/10 px-4 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-40"
             >
@@ -424,7 +383,7 @@ function TrafficHistoryCard({ history, range, onRangeChange, customFrom, customT
   );
 }
 
-function TrafficAnalyticsCard({ routes, totalTrafficBytes, history, range, loading, t }) {
+function TrafficAnalyticsCard({ routes, totalTrafficBytes, history, range, loading, historyLoading, t }) {
   const [expandedRoutes, setExpandedRoutes] = useState(() => new Set());
   const routeSeriesByKey = useMemo(() => {
     const entries = (history?.routeSeries ?? []).map((series) => [routeTrafficKey(series), series]);
@@ -481,7 +440,7 @@ function TrafficAnalyticsCard({ routes, totalTrafficBytes, history, range, loadi
           <div className="flex flex-wrap gap-3">
             <MetricPill label={t("dashboard.trafficTotal")} value={loading ? "..." : formatBytes(totalTrafficBytes)} />
             <MetricPill label={t("dashboard.activeVpns")} value={loading ? "..." : routes.length} />
-            <MetricPill label={t("dashboard.historyRangeTotal")} value={loading ? "..." : formatBytes(history?.totalBytes || 0)} />
+            <MetricPill label={t("dashboard.historyRangeTotal")} value={historyLoading ? "..." : formatBytes(history?.totalBytes || 0)} />
           </div>
         </div>
       </div>
@@ -537,14 +496,18 @@ function TrafficAnalyticsCard({ routes, totalTrafficBytes, history, range, loadi
                   <div className="grid grid-cols-2 gap-3 px-4 pb-4 text-xs text-on-surface-variant xl:grid-cols-5">
                     <TrafficMeta label={t("dashboard.domainsRouted")} value={route.domainCount} />
                     <TrafficMeta label={t("dashboard.liveTotal")} value={formatBytes(route.totalBytes || 0)} />
-                    <TrafficMeta label={t("dashboard.historyRangeTotal")} value={formatBytes(rangeTotal)} />
-                    <TrafficMeta label={t("dashboard.latestBucket")} value={formatBytes(latestBucket.totalBytes || 0)} />
-                    <TrafficMeta label={t("dashboard.historyPeak")} value={formatBytes(peakBucket)} />
+                    <TrafficMeta label={t("dashboard.historyRangeTotal")} value={historyLoading ? "..." : formatBytes(rangeTotal)} />
+                    <TrafficMeta label={t("dashboard.latestBucket")} value={historyLoading ? "..." : formatBytes(latestBucket.totalBytes || 0)} />
+                    <TrafficMeta label={t("dashboard.historyPeak")} value={historyLoading ? "..." : formatBytes(peakBucket)} />
                   </div>
 
                   {isExpanded && (
                     <div className="border-t border-outline-variant/10 px-4 pb-4">
-                      <RouteHistoryChart chart={chart} route={route} range={range} historyShare={historyShare} t={t} />
+                      {historyLoading ? (
+                        <p className="pt-4 text-sm text-on-surface-variant">{t("common.loading")}</p>
+                      ) : (
+                        <RouteHistoryChart chart={chart} route={route} range={range} historyShare={historyShare} t={t} />
+                      )}
                     </div>
                   )}
                 </div>
@@ -578,27 +541,7 @@ function TrafficAnalyticsCard({ routes, totalTrafficBytes, history, range, loadi
   );
 }
 
-function SystemResourcesCard({ t, autoRefreshMs }) {
-  const [res, setRes] = useState(null);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const data = await fetchJSON("/api/system/resources");
-        if (!cancelled) { setRes(data); setLoading(false); }
-      } catch { if (!cancelled) setLoading(false); }
-    };
-    void load();
-
-    const interval = autoRefreshMs > 0 ? autoRefreshMs : 10_000;
-    const id = setInterval(() => {
-      if (document.visibilityState !== "hidden") void load();
-    }, interval);
-    return () => { cancelled = true; clearInterval(id); };
-  }, [autoRefreshMs]);
-
+function SystemResourcesCard({ t, res, loading }) {
   const cpuColor = (res?.cpuUsagePercent ?? 0) > 80 ? "text-error" : (res?.cpuUsagePercent ?? 0) > 50 ? "text-tertiary" : "text-secondary";
   const memPercent = res?.memTotalMB ? (100 - (res.memFreePercent ?? 0)) : 0;
   const memColor = memPercent > 85 ? "text-error" : memPercent > 60 ? "text-tertiary" : "text-secondary";

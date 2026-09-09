@@ -81,7 +81,13 @@ func (s *Supervisor) maybeProviderFailover(ctx context.Context, state config.Sta
 	}
 
 	s.failoverMu.Lock()
-	defer s.failoverMu.Unlock()
+	// Readers retain the last completed runtime while probes and route updates
+	// own failoverMu. Publish again only after success or rollback is complete.
+	s.publishFailoverStatusLocked()
+	defer func() {
+		s.publishFailoverStatusLocked()
+		s.failoverMu.Unlock()
+	}()
 
 	s.failover.ensure()
 	s.pruneFailoverOverrides(state)
@@ -333,14 +339,10 @@ func (s *Supervisor) currentProviderProbe(ctx context.Context, state config.Stat
 		return providerProbeResult{Healthy: true, Detail: firstNonEmpty(interfaceProbe.Detail, "runtime is healthy"), LatencyMs: interfaceProbe.LatencyMs}
 	}
 
-	probe := s.probeProvider(ctx, state, provider, representativeLocation(state, provider.ID))
-	if !probe.Healthy {
-		return providerProbeResult{Healthy: false, Detail: firstNonEmpty(probe.Detail, "provider endpoint probe failed"), Location: probe.Location, LatencyMs: probe.LatencyMs}
-	}
-	if probe.LatencyMs == 0 {
-		probe.LatencyMs = interfaceProbe.LatencyMs
-	}
-	return providerProbeResult{Healthy: true, Detail: firstNonEmpty(probe.Detail, "provider endpoint is reachable"), Location: probe.Location, LatencyMs: probe.LatencyMs}
+	// HTTPS has already traversed this subscription's tunnel. Re-fetching the
+	// subscription or opening another TCP socket adds no health evidence.
+	interfaceProbe.Location = representativeLocation(state, provider.ID)
+	return interfaceProbe
 }
 
 func (s *Supervisor) updateProviderHealth(provider config.Provider, probe providerProbeResult, now time.Time) providerHealthState {
@@ -477,6 +479,19 @@ func runtimeProviderHealthy(state config.State, snapshot status.Snapshot, provid
 }
 
 func (s *Supervisor) probeProviderRuntimeInterfaces(ctx context.Context, snapshot status.Snapshot, provider config.Provider) providerProbeResult {
+	// A proxy can answer TCP while its outbound path is broken; ICMP is not
+	// forwarded by all sing-box outbounds. Verify a real HTTPS response instead.
+	if provider.Type == config.ProviderTypeSubscription {
+		for _, item := range snapshot.SubscriptionRuntime {
+			if item.ProviderID != provider.ID || item.Status != "running" || item.InterfaceName == "" {
+				continue
+			}
+			if result := s.subscriptionTunnelProbe(ctx, item.InterfaceName, item.FWMark); !result.Healthy {
+				return result
+			}
+		}
+		return providerProbeResult{Healthy: true, Detail: "subscription tunnel HTTPS probe succeeded"}
+	}
 	target := failoverProbeTarget()
 	if target == "" || runtime.GOOS == "windows" {
 		return providerProbeResult{Healthy: true, Detail: "runtime interface probe disabled"}
@@ -1132,6 +1147,27 @@ type FailoverProviderStatus struct {
 	RuntimeInterfaces    []string `json:"runtimeInterfaces,omitempty"`
 }
 
+type failoverStatusSnapshot struct {
+	overrides map[string]failoverOverride
+	health    map[string]providerHealthState
+	lastApply time.Time
+}
+
+// The caller holds failoverMu. Published maps and slices are never mutated.
+func (s *Supervisor) publishFailoverStatusLocked() *failoverStatusSnapshot {
+	snapshot := &failoverStatusSnapshot{
+		overrides: cloneOverrides(s.failover.overrides),
+		health:    make(map[string]providerHealthState, len(s.failover.health)),
+		lastApply: s.failover.lastApply,
+	}
+	for providerID, health := range s.failover.health {
+		health.RuntimeInterfaceNames = append([]string(nil), health.RuntimeInterfaceNames...)
+		snapshot.health[providerID] = health
+	}
+	s.failoverStatusCache.Store(snapshot)
+	return snapshot
+}
+
 func (s *Supervisor) FailoverStatus() FailoverStatus {
 	var state config.State
 	if s.state != nil {
@@ -1146,19 +1182,25 @@ func (s *Supervisor) FailoverStatus() FailoverStatus {
 		rulesByID[rule.ID] = rule
 	}
 
-	s.failoverMu.Lock()
-	defer s.failoverMu.Unlock()
-
-	s.failover.ensure()
+	var snapshot *failoverStatusSnapshot
+	if s.failoverMu.TryLock() {
+		snapshot = s.publishFailoverStatusLocked()
+		s.failoverMu.Unlock()
+	} else {
+		snapshot = s.failoverStatusCache.Load()
+	}
+	if snapshot == nil {
+		snapshot = &failoverStatusSnapshot{}
+	}
 	result := FailoverStatus{
 		Enabled:     state.Automation.ProviderFailover,
 		AllDownMode: firstNonEmpty(state.Automation.FailoverAllDownMode, "keep"),
-		LastApplyAt: timeString(s.failover.lastApply),
-		Providers:   make([]FailoverProviderStatus, 0, len(state.Providers)+len(s.failover.health)),
+		LastApplyAt: timeString(snapshot.lastApply),
+		Providers:   make([]FailoverProviderStatus, 0, len(state.Providers)+len(snapshot.health)),
 	}
 
 	for _, provider := range state.Providers {
-		health, ok := s.failover.health[provider.ID]
+		health, ok := snapshot.health[provider.ID]
 		if !ok {
 			result.Providers = append(result.Providers, FailoverProviderStatus{
 				ProviderID:   provider.ID,
@@ -1171,15 +1213,15 @@ func (s *Supervisor) FailoverStatus() FailoverStatus {
 		result.Providers = append(result.Providers, failoverProviderStatusFromHealth(health))
 	}
 
-	for providerID, health := range s.failover.health {
+	for providerID, health := range snapshot.health {
 		if _, exists := providersByID[providerID]; exists {
 			continue
 		}
 		result.Providers = append(result.Providers, failoverProviderStatusFromHealth(health))
 	}
 
-	result.ActiveOverrides = make([]FailoverOverrideStatus, 0, len(s.failover.overrides))
-	for ruleID, override := range s.failover.overrides {
+	result.ActiveOverrides = make([]FailoverOverrideStatus, 0, len(snapshot.overrides))
+	for ruleID, override := range snapshot.overrides {
 		rule := rulesByID[ruleID]
 		originalProvider := providersByID[override.OriginalProviderID]
 		activeProvider := providersByID[override.ActiveProviderID]

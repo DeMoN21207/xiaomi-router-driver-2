@@ -1,6 +1,7 @@
 package subscription
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,21 @@ import (
 )
 
 const defaultSubscriptionEntriesCacheTTL = time.Minute
+
+type cachedEntriesOnlyKey struct{}
+type routingSnapshotKey struct{}
+
+// WithRoutingSnapshot is used only after the caller has verified that the
+// provider's routed entries have not changed.
+func WithRoutingSnapshot(ctx context.Context) context.Context {
+	return context.WithValue(ctx, routingSnapshotKey{}, true)
+}
+
+// WithCachedEntries keeps an automatic recovery apply independent of the
+// subscription service; explicit refreshes still update the saved endpoints.
+func WithCachedEntries(ctx context.Context) context.Context {
+	return context.WithValue(ctx, cachedEntriesOnlyKey{}, true)
+}
 
 type entriesFetchMode string
 
@@ -39,6 +55,22 @@ type subscriptionFetchProfile struct {
 	UserAgent     string
 	Accept        string
 	DeviceHeaders bool
+}
+
+// LoadCachedEntries never contacts the subscription service. Recovery must be
+// able to use the last saved endpoints even while that service is unreachable.
+func LoadCachedEntries(source string, runtimeDir string) ([]Entry, error) {
+	normalized, err := normalizeSubscriptionSource(source)
+	if err != nil {
+		return nil, err
+	}
+	if normalized.Inline != "" {
+		return ParseEntries(normalized.Inline)
+	}
+	if snapshot, ok := loadEntriesCache(entriesCachePath(runtimeDir, normalized.CacheKey), normalized.CacheKey); ok {
+		return ParseEntries(snapshot.Raw)
+	}
+	return nil, errors.New("subscription endpoints are not cached; refresh the subscription")
 }
 
 func FetchEntriesCached(source string, runtimeDir string) ([]Entry, entriesFetchMode, error) {

@@ -668,7 +668,6 @@ func (s *trafficHistoryStore) ensureReadyLocked() error {
 	if s.initialized {
 		return s.initErr
 	}
-	s.initialized = true
 
 	if s.db == nil {
 		s.initErr = errors.New("traffic history database is not configured")
@@ -706,6 +705,8 @@ func (s *trafficHistoryStore) ensureReadyLocked() error {
 		return err
 	}
 
+	s.initErr = nil
+	s.initialized = true
 	return nil
 }
 

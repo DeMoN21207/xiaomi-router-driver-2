@@ -14,7 +14,6 @@ func (m *Manager) ensureReadyLocked() error {
 	if m.initialized {
 		return m.initErr
 	}
-	m.initialized = true
 
 	if m.db == nil {
 		m.initErr = errors.New("subscription runtime database is not configured")
@@ -41,6 +40,8 @@ func (m *Manager) ensureReadyLocked() error {
 		return err
 	}
 
+	m.initErr = nil
+	m.initialized = true
 	return nil
 }
 
@@ -89,11 +90,16 @@ func (m *Manager) migrateLegacyManifestLocked() error {
 		return fmt.Errorf("decode legacy subscription runtime manifest: %w", err)
 	}
 
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for _, instance := range saved.Instances {
 		if instance == nil || strings.TrimSpace(instance.Key) == "" {
 			continue
 		}
-		if err := m.saveInstanceLocked(&managedInstance{
+		if err := saveRuntimeInstance(tx, &managedInstance{
 			Key:           instance.Key,
 			ProviderID:    instance.ProviderID,
 			ProviderName:  instance.ProviderName,
@@ -108,7 +114,7 @@ func (m *Manager) migrateLegacyManifestLocked() error {
 		}
 	}
 
-	return nil
+	return tx.Commit()
 }
 
 func (m *Manager) loadInstancesLocked() ([]*managedInstance, error) {
@@ -158,11 +164,18 @@ func scanRuntimeInstance(scanner interface{ Scan(dest ...any) error }) (*managed
 	if err := json.Unmarshal([]byte(settingsJSON), &instance.Settings); err != nil {
 		return nil, fmt.Errorf("decode runtime settings: %w", err)
 	}
+	instance.domainListPath = runtimeDomainListPath(instance.ConfigPath)
 
 	return &instance, nil
 }
 
 func (m *Manager) saveInstanceLocked(instance *managedInstance) error {
+	return saveRuntimeInstance(m.db, instance)
+}
+
+func saveRuntimeInstance(writer interface {
+	Exec(string, ...any) (sql.Result, error)
+}, instance *managedInstance) error {
 	if instance == nil {
 		return nil
 	}
@@ -172,7 +185,7 @@ func (m *Manager) saveInstanceLocked(instance *managedInstance) error {
 		return fmt.Errorf("encode runtime settings: %w", err)
 	}
 
-	_, err = m.db.Exec(`
+	_, err = writer.Exec(`
 		INSERT INTO subscription_runtime_instances (
 			key, provider_id, provider_name, location, interface_name, domain_count, config_path, settings_json, pid
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -215,6 +228,7 @@ func (m *Manager) pruneRuntimeFilesLocked() error {
 			continue
 		}
 		keepConfigs[filepath.Clean(configPath)] = struct{}{}
+		keepConfigs[filepath.Clean(runtimeDomainListPath(configPath))] = struct{}{}
 	}
 
 	patterns := []string{"*.domains.list", "*.log", "runtime.json"}
@@ -224,6 +238,9 @@ func (m *Manager) pruneRuntimeFilesLocked() error {
 			return err
 		}
 		for _, match := range matches {
+			if _, keep := keepConfigs[filepath.Clean(match)]; keep {
+				continue
+			}
 			removeIfExists(match)
 		}
 	}
@@ -233,6 +250,10 @@ func (m *Manager) pruneRuntimeFilesLocked() error {
 		return err
 	}
 	for _, match := range configMatches {
+		// Subscription snapshots are recovery data, not orphaned process configs.
+		if strings.HasPrefix(filepath.Base(match), "source-cache-") {
+			continue
+		}
 		if _, keep := keepConfigs[filepath.Clean(match)]; keep {
 			continue
 		}
