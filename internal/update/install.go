@@ -24,6 +24,10 @@ func installBundle(appDir string, dataDir string, bundle BundleInfo, now time.Ti
 		return "", fmt.Errorf("%w: bundle root is empty", ErrInvalidBundle)
 	}
 
+	if err := RecoverInterruptedUpdate(appDir); err != nil {
+		return "", err
+	}
+
 	backupDir, err := createBackup(appDir, now)
 	if err != nil {
 		return "", err
@@ -33,24 +37,30 @@ func installBundle(appDir string, dataDir string, bundle BundleInfo, now time.Ti
 		return "", err
 	}
 
-	for _, stale := range []string{"openvpn", "sing-box"} {
-		if err := os.RemoveAll(filepath.Join(appDir, stale)); err != nil {
-			return "", fmt.Errorf("remove stale runtime file %s: %w", stale, err)
-		}
+	tx, err := beginRuntimeTransaction(appDir, bundle.Root, backupDir)
+	if err != nil {
+		return "", err
 	}
-
-	if err := replaceRuntime(appDir, bundle.Root); err != nil {
+	if err := tx.apply(); err != nil {
 		return "", err
 	}
 
 	if strings.TrimSpace(dataDir) != "" {
 		if err := os.MkdirAll(dataDir, 0o755); err != nil {
-			return "", fmt.Errorf("ensure data directory: %w", err)
+			return "", tx.fail(fmt.Errorf("ensure data directory: %w", err))
 		}
 	}
 
 	for _, name := range executableBundlePaths {
 		_ = os.Chmod(filepath.Join(appDir, name), 0o755)
+	}
+	if err := tx.commit(); err != nil {
+		return "", err
+	}
+	for _, stale := range []string{"openvpn", "sing-box"} {
+		if err := os.RemoveAll(filepath.Join(appDir, stale)); err != nil {
+			return "", fmt.Errorf("remove stale runtime file %s: %w", stale, err)
+		}
 	}
 
 	return backupDir, nil
@@ -123,10 +133,10 @@ func replaceRuntime(appDir string, bundleRoot string) error {
 
 func shouldSkipRuntimeEntry(name string) bool {
 	switch name {
-	case "data", "backups":
+	case "data", "backups", updateJournalName, updatePreviousName:
 		return true
 	default:
-		return false
+		return strings.HasPrefix(name, ".update-staging-") || strings.HasPrefix(name, ".update-journal-")
 	}
 }
 
@@ -180,6 +190,10 @@ func copyFile(source string, target string, mode os.FileMode) error {
 		return err
 	}
 	if _, err := io.Copy(output, input); err != nil {
+		_ = output.Close()
+		return err
+	}
+	if err := output.Sync(); err != nil {
 		_ = output.Close()
 		return err
 	}
