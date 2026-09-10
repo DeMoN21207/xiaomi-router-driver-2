@@ -218,6 +218,18 @@ func TestResolveOpensDoHCircuitAfterRepeatedFailures(t *testing.T) {
 	if health.State != "fallback" || health.Failures != dohFailureThreshold || health.FallbackSuccesses != dohFailureThreshold+1 {
 		t.Fatalf("Health() = %+v", health)
 	}
+	server.dohMu.Lock()
+	server.dohOpenUntil = time.Now().Add(-time.Second)
+	server.dohMu.Unlock()
+	server.client.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return dnsHTTPResponse(testDNSQuery()), nil
+	})
+	if _, err := server.resolve(context.Background(), testDNSQuery()); err != nil {
+		t.Fatalf("DoH did not recover after cooldown: %v", err)
+	}
+	if health = server.Health(); health.State != "healthy" || health.Failures != 0 {
+		t.Fatalf("health after recovery = %+v", health)
+	}
 }
 
 func TestHandleTCPConnRefreshesDeadlinesBetweenQueries(t *testing.T) {

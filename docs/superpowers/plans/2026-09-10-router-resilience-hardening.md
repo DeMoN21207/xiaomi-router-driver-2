@@ -1,6 +1,6 @@
 # Router Resilience Hardening Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Make VPN Manager survive interrupted updates and process failures, keep failover responsive, protect dangerous API operations, and reduce database, DNS, and polling failure modes.
 
@@ -31,14 +31,14 @@
 - Test: `internal/update/recovery_test.go`
 
 **Interfaces:**
-- Produces: `RecoverInterruptedUpdate(appDir string) error`, durable `update-journal.json`, and staged same-filesystem atomic replacement.
+- Produces: `RecoverInterruptedUpdate(appDir string) error`, durable `.update-journal.json`, and staged same-filesystem atomic replacement.
 - Consumes: existing `ValidateBundle`, `backupRuntime`, and `copyPath` helpers.
 
-- [ ] Write tests that interrupt staging, interrupt replacement, and verify startup recovery restores executable runtime files while preserving `data/`.
-- [ ] Run `go test ./internal/update -run 'Atomic|Interrupted|Recover' -count=1` and confirm failures identify missing transaction behavior.
-- [ ] Implement staging copies with file and directory sync, phase journal writes through temp-file rename, atomic target swaps, and backup restoration.
-- [ ] Re-run the focused tests and `go test ./internal/update -count=1`.
-- [ ] Commit update transaction and recovery behavior.
+- [x] Write tests that interrupt staging, interrupt replacement, and verify startup recovery restores executable runtime files while preserving `data/`.
+- [x] Run `go test ./internal/update -run 'Atomic|Interrupted|Recover' -count=1` and confirm failures identify missing transaction behavior.
+- [x] Implement staging copies with file and directory sync, phase journal writes through temp-file rename, atomic target swaps, and backup restoration.
+- [x] Re-run the focused tests and `go test ./internal/update -count=1`.
+- [x] Commit update transaction and recovery behavior.
 
 ### Task 2: Coordinated shutdown and restart
 
@@ -52,11 +52,11 @@
 - Produces: `Coordinator.Run(ctx, server, shutdown, restart) error` and an update restart request carrying backup recovery metadata.
 - Consumes: updater restart callback and all worker `Run(context.Context)` methods.
 
-- [ ] Write tests proving SIGTERM-style cancellation calls HTTP shutdown, worker cancellation, SQLite checkpoint/close, and restart only after cleanup.
-- [ ] Verify the lifecycle tests fail before implementation.
-- [ ] Implement `signal.NotifyContext`, a shared root context, graceful HTTP shutdown, ordered cleanup, and Linux `syscall.Exec` restart with backup restoration on failure.
-- [ ] Run lifecycle tests and `go test ./cmd/vpn-manager ./internal/lifecycle ./internal/update -count=1`.
-- [ ] Commit coordinated lifecycle behavior.
+- [x] Write tests proving SIGTERM-style cancellation calls HTTP shutdown, worker cancellation, SQLite checkpoint/close, and restart only after cleanup.
+- [x] Verify the lifecycle tests fail before implementation.
+- [x] Implement `signal.NotifyContext`, a shared root context, graceful HTTP shutdown, ordered cleanup, and Linux `syscall.Exec` restart with backup restoration on failure.
+- [x] Run lifecycle tests and `go test ./cmd/vpn-manager ./internal/lifecycle ./internal/update -count=1`.
+- [x] Commit coordinated lifecycle behavior.
 
 ### Task 3: Single-owner watchdog
 
@@ -70,10 +70,10 @@
 - Produces: generated watchdog script using PID plus `/proc/<pid>/exe`, update journal awareness, and unlimited procd respawn.
 - Consumes: update journal phase and existing `/tmp/vpn-manager.pid` convention.
 
-- [ ] Add failing render tests for stale PID, mismatched executable, active update journal, and `respawn 3600 5 0`.
-- [ ] Implement the generated shell checks and deployment lock handling.
-- [ ] Run automation tests and `sh -n packaging/router/start.sh deploy_router.sh`.
-- [ ] Commit watchdog ownership changes.
+- [x] Add failing render tests for stale PID, mismatched executable, active update journal, and `respawn 3600 5 0`.
+- [x] Implement the generated shell checks and deployment lock handling.
+- [x] Run automation tests and `sh -n packaging/router/start.sh deploy_router.sh`.
+- [x] Commit watchdog ownership changes.
 
 ### Task 4: WAN evidence and ungated local recovery
 
@@ -88,11 +88,11 @@
 - Produces: `WANProbeResult` using detected/overridden interface and multiple targets.
 - Consumes: runtime snapshot and existing provider probe functions.
 
-- [ ] Add failing tests for one failed target, missing default route, interface binding, and recovery of a missing runtime while WAN is down.
-- [ ] Implement interface/default-route detection and multi-target probing with environment overrides.
-- [ ] Separate local runtime reconciliation from provider switching WAN gates.
-- [ ] Run status and automation test packages.
-- [ ] Commit WAN and recovery changes.
+- [x] Add failing tests for one failed target, missing default route, interface binding, and recovery of a missing runtime while WAN is down.
+- [x] Implement interface/default-route detection and multi-target probing with environment overrides.
+- [x] Separate local runtime reconciliation from provider switching WAN gates.
+- [x] Run status and automation test packages.
+- [x] Commit WAN and recovery changes.
 
 ### Task 5: SQLite maintenance and recovery
 
@@ -106,10 +106,10 @@
 - Produces: `OpenWithRecovery(path)`, `Checkpoint(mode)`, `Backup(path)`, and a cancellable periodic maintenance worker.
 - Consumes: existing single-connection SQLite configuration.
 
-- [ ] Add failing tests for quick-check rejection, corrupt-file preservation, backup restore, atomic backup, and checkpoint execution.
-- [ ] Implement a 15-second busy timeout, quick-check startup, `VACUUM INTO` backup, passive periodic checkpoint, truncate shutdown checkpoint, and last-good restoration.
-- [ ] Run SQLite tests including forced corruption and the full config/events/status packages.
-- [ ] Commit SQLite resilience.
+- [x] Add failing tests for quick-check rejection, corrupt-file preservation, backup restore, atomic backup, and checkpoint execution.
+- [x] Implement a 15-second busy timeout, quick-check startup, `VACUUM INTO` backup, passive periodic checkpoint, truncate shutdown checkpoint, and last-good restoration.
+- [x] Run SQLite tests including forced corruption and the full config/events/status packages.
+- [x] Commit SQLite resilience.
 
 ### Task 6: Async apply and precise rollback
 
@@ -124,14 +124,14 @@
 - Modify: `frontend/src/pages/ConnectionsPage.jsx`
 
 **Interfaces:**
-- Produces: `POST /api/rules/apply -> 202 {operationId}`, `GET /api/operations/{id}`, configuration `generation`, and conditional per-entity restore methods.
+- Produces: `POST /api/rules/apply -> 202 {operation}`, `GET /api/rules/apply/{id}`, and conditional per-entity restore methods.
 - Consumes: `applyMu`, `UpdateRule`, `DeleteRule`, and current apply status UI.
 
-- [ ] Add failing tests for operation transitions and a concurrent edit surviving failed apply rollback.
-- [ ] Implement the operation registry and generation-aware targeted restore without `Save(previousState)`.
-- [ ] Add frontend polling with a five-minute operation deadline and progress messaging.
-- [ ] Run API/config tests, frontend tests, and build.
-- [ ] Commit async apply and precise rollback.
+- [x] Add failing tests for operation transitions and a concurrent edit surviving failed apply rollback.
+- [x] Implement the operation registry and optimistic targeted restore without `Save(previousState)`.
+- [x] Add frontend polling with a five-minute operation deadline and progress messaging.
+- [x] Run API/config tests, frontend tests, and build.
+- [x] Commit async apply and precise rollback.
 
 ### Task 7: HTTP limits and dangerous-route authorization
 
@@ -141,18 +141,17 @@
 - Modify: `internal/api/handler.go`
 - Modify: `cmd/vpn-manager/main.go`
 - Modify: `frontend/src/api.js`
-- Modify: `frontend/src/App.jsx`
-- Create: `frontend/src/components/AdminTokenDialog.jsx`
+- - Modify: `frontend/src/api.js`
 
 **Interfaces:**
 - Produces: optional bearer-token middleware, 128 MiB upload cap, five-minute body deadline, and a frontend 401 token flow using `sessionStorage`.
-- Consumes: `VPN_MANAGER_ADMIN_TOKEN` and `data/admin-token`.
+- Consumes: `VPN_MANAGER_API_TOKEN` and `data/api-token`.
 
-- [ ] Add failing API tests for read-only access, rejected dangerous mutation, accepted bearer token, and oversized upload.
-- [ ] Implement token loading, route classification, constant-time comparison, upload limit, and server deadlines.
-- [ ] Implement one-time token prompt and automatic retry of the rejected request.
-- [ ] Run API and frontend tests/build.
-- [ ] Commit API protection and limits.
+- [x] Add failing API tests for read-only access, rejected dangerous mutation, accepted bearer token, and oversized upload.
+- [x] Implement token loading, route classification, constant-time comparison, upload limit, and server deadlines.
+- [x] Implement one-time token prompt and automatic retry of the rejected request.
+- [x] Run API and frontend tests/build.
+- [x] Commit API protection and limits.
 
 ### Task 8: Bounded DNS proxy with health
 
@@ -166,11 +165,11 @@
 - Produces: bounded concurrent resolver, direct Do53 fallbacks, circuit state, and `DNSProxyHealth` in status.
 - Consumes: existing DoH resolver and DNS proxy configuration environment variables.
 
-- [ ] Add failing tests for concurrency rejection, DoH fallback, loop prevention, recovery, and health counters.
-- [ ] Implement a semaphore, configurable Do53 endpoints, failure threshold/cooldown, and health snapshot.
-- [ ] Expose health through `/api/status`.
-- [ ] Run DNS and status tests.
-- [ ] Commit DNS resilience.
+- [x] Add failing tests for concurrency rejection, DoH fallback, loop prevention, recovery, and health counters.
+- [x] Implement a semaphore, configurable Do53 endpoints, failure threshold/cooldown, and health snapshot.
+- [x] Expose health through `/api/status`.
+- [x] Run DNS and status tests.
+- [x] Commit DNS resilience.
 
 ### Task 9: Polling, conntrack, defaults, logging, and doctor
 
@@ -187,14 +186,14 @@
 - Test: `internal/doctor/doctor_test.go`
 
 **Interfaces:**
-- Produces: polling floor of five seconds, endpoint-specific deadlines, changed-destination conntrack cleanup, router-first-install automation defaults, selective request logging, and expanded diagnostics.
+- Produces: polling floor of five seconds, endpoint-specific deadlines, destination-scoped conntrack cleanup without a global table flush, router-first-install automation defaults, selective request logging, and expanded diagnostics.
 - Consumes: current load profiles, generated watchdog, status and runtime databases.
 
-- [ ] Add failing frontend tests for invalid sub-five-second preferences and longer history deadlines.
-- [ ] Add failing Go/shell tests for changed destination cleanup, first-install defaults, log filtering, and new doctor checks.
-- [ ] Implement the minimal production changes and scheduled failure-only doctor reporting.
-- [ ] Run focused frontend, routing, automation, and doctor tests.
-- [ ] Commit operational hardening.
+- [x] Add failing frontend tests for invalid sub-five-second preferences and longer history deadlines.
+- [x] Add failing Go/shell tests for destination-scoped cleanup, first-install defaults, log filtering, and new doctor checks.
+- [x] Implement the minimal production changes and expanded read-only doctor reporting.
+- [x] Run focused frontend, routing, automation, and doctor tests.
+- [x] Commit operational hardening.
 
 ### Task 10: Full verification, package, deploy, and publish
 
