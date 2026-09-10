@@ -445,7 +445,7 @@ if [[ -z "$apply_id" ]]; then
 	exit 1
 fi
 apply_status=""
-for ((attempt = 0; attempt < 60; attempt += 1)); do
+for ((attempt = 0; attempt < 300; attempt += 1)); do
 	apply_body="$(curl -fsS --max-time 20 "$api_base/api/rules/apply/$apply_id")"
 	apply_status="$(printf '%s' "$apply_body" | json_extract_apply_field status)"
 	case "$apply_status" in
