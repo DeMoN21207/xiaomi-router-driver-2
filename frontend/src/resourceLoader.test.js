@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createResourceLoader } from "./resourceLoader.js";
+import { createResourceLoader, DEFAULT_RESOURCE_TIMEOUT_MS } from "./resourceLoader.js";
+
+test("resource loaders allow slow USB history reads", () => {
+  assert.equal(DEFAULT_RESOURCE_TIMEOUT_MS, 30_000);
+});
 
 function deferred() {
   let resolve;

@@ -131,12 +131,10 @@ func (m *Manager) SaveSettings(ctx context.Context, settings config.UpdateSettin
 		return StatusResponse{}, errors.New("state manager is not configured")
 	}
 
-	state, err := m.state.Load()
-	if err != nil {
-		return StatusResponse{}, err
-	}
-	state.Update = settings
-	if _, err := m.state.Save(state); err != nil {
+	if _, err := m.state.Mutate(func(state *config.State) error {
+		state.Update = settings
+		return nil
+	}); err != nil {
 		return StatusResponse{}, err
 	}
 	return m.Status(ctx)

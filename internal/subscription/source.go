@@ -1,6 +1,7 @@
 package subscription
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -22,11 +23,15 @@ type Entry struct {
 }
 
 func FetchEntries(source string) ([]Entry, error) {
+	return FetchEntriesContext(context.Background(), source)
+}
+
+func FetchEntriesContext(ctx context.Context, source string) ([]Entry, error) {
 	normalizedSource, err := normalizeSubscriptionSource(source)
 	if err != nil {
 		return nil, err
 	}
-	entries, _, err := fetchEntriesLive(normalizedSource, true)
+	entries, _, err := fetchEntriesLive(ctx, normalizedSource, true)
 	return entries, err
 }
 

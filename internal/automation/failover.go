@@ -645,6 +645,40 @@ func (s *Supervisor) applyAllDownPolicy(ctx context.Context, baseState config.St
 	if s.failover.allDownFailures[failedProvider.ID] == reason {
 		return true
 	}
+	if baseState.Automation.FailoverAllDownMode == "direct" {
+		if s.applyState == nil {
+			return false
+		}
+		previous := cloneOverrides(s.failover.overrides)
+		now := time.Now()
+		for _, rule := range affectedRules {
+			originalProviderID := rule.ProviderID
+			originalLocation := rule.SelectedLocation
+			if existing, exists := previous[rule.ID]; exists {
+				originalProviderID = existing.OriginalProviderID
+				originalLocation = existing.OriginalLocation
+			}
+			s.failover.overrides[rule.ID] = failoverOverride{
+				OriginalProviderID: originalProviderID,
+				OriginalLocation:   originalLocation,
+				Mode:               "direct",
+				Reason:             reason,
+				Since:              now,
+			}
+		}
+		applyCtx, cancel := context.WithTimeout(ctx, providerFailoverApplyTimeout)
+		err := s.applyState(applyCtx, s.failoverAppliedStateLocked(baseState))
+		cancel()
+		if err != nil {
+			s.failover.overrides = previous
+			s.record("error", "automation.provider_failover_failed", fmt.Sprintf("release %s routes to direct internet failed: %v", failedProvider.Name, err))
+			return false
+		}
+		s.failover.lastApply = now
+		s.failover.allDownFailures[failedProvider.ID] = reason
+		s.record("warn", "automation.provider_failed_over", fmt.Sprintf("%s is unhealthy (%s), no healthy fallback provider was found; affected routes released to direct internet", failedProvider.Name, reason))
+		return true
+	}
 	s.failover.allDownFailures[failedProvider.ID] = reason
 	s.record("error", "automation.provider_failover_failed", fmt.Sprintf("%s is unhealthy (%s), no healthy fallback provider was found; direct internet release is disabled", failedProvider.Name, reason))
 	return true
@@ -663,7 +697,7 @@ func (s *Supervisor) findFailoverCandidate(ctx context.Context, baseState config
 		preferredLocation := ""
 		candidateOK := true
 		for _, rule := range affectedRules {
-			location, ok := s.resolveRuleLocationForProvider(provider, rule)
+			location, ok := s.resolveRuleLocationForProvider(ctx, provider, rule)
 			if !ok {
 				candidateOK = false
 				break
@@ -706,7 +740,7 @@ func orderedCandidateProviders(providers []config.Provider, failedProviderID str
 	return out
 }
 
-func (s *Supervisor) resolveRuleLocationForProvider(provider config.Provider, rule config.Rule) (string, bool) {
+func (s *Supervisor) resolveRuleLocationForProvider(ctx context.Context, provider config.Provider, rule config.Rule) (string, bool) {
 	if provider.Type == config.ProviderTypeOpenVPN {
 		return "", true
 	}
@@ -714,7 +748,7 @@ func (s *Supervisor) resolveRuleLocationForProvider(provider config.Provider, ru
 		return "", false
 	}
 
-	entries, _, err := subscription.FetchEntriesCached(provider.Source, s.subscriptionRuntimeDir())
+	entries, _, err := subscription.FetchEntriesCachedContext(ctx, provider.Source, s.subscriptionRuntimeDir())
 	if err != nil || len(entries) == 0 {
 		return "", false
 	}
@@ -735,7 +769,7 @@ func (s *Supervisor) probeProvider(ctx context.Context, state config.State, prov
 
 	switch provider.Type {
 	case config.ProviderTypeSubscription:
-		entries, _, err := subscription.FetchEntriesCached(provider.Source, s.subscriptionRuntimeDir())
+		entries, _, err := subscription.FetchEntriesCachedContext(ctx, provider.Source, s.subscriptionRuntimeDir())
 		if err != nil {
 			return providerProbeResult{Healthy: false, Detail: err.Error()}
 		}

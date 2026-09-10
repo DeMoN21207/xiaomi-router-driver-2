@@ -286,10 +286,7 @@ func (m *Manager) cleanupLocked(ctx context.Context) error {
 				_ = current.cmd.Process.Kill()
 			}
 		} else if instance.PID > 0 {
-			process, findErr := os.FindProcess(instance.PID)
-			if findErr == nil {
-				_ = process.Kill()
-			}
+			_, _ = runtimehealth.KillIfMatches(instance.PID, m.openvpnBinary, instance.ProfilePath, instance.InterfaceName)
 		}
 
 		if err := m.routing.RunWithOptions(ctx, "del", routing.RunOptions{
@@ -351,9 +348,8 @@ func (m *Manager) watchInstance(providerID string, cmd *exec.Cmd) {
 	delete(m.current, providerID)
 	_ = m.deleteInstanceLocked(providerID)
 	removeIfExists(current.domainListPath)
-	_ = m.routing.RunWithOptions(context.Background(), "del", routing.RunOptions{
-		Settings: current.Settings,
-	})
+	// Keep the policy route fail-closed until the supervisor replaces the dead
+	// runtime. Explicit Apply/Cleanup paths own routing teardown and are serialized.
 	_ = m.pruneRuntimeFilesLocked()
 
 	if err != nil {

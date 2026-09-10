@@ -1,8 +1,10 @@
 import { fetchJSON } from "./api.js";
 
+export const DEFAULT_RESOURCE_TIMEOUT_MS = 30_000;
+
 // Each resource has its own request, deadline and refresh lock. A slow history
 // request must not hold up status, events or the next status poll.
-export function createResourceLoader(url, { onData, onError, onSettled }, { fetcher = fetchJSON, timeoutMs = 8000 } = {}) {
+export function createResourceLoader(url, { onData, onError, onSettled }, { fetcher = fetchJSON, timeoutMs = DEFAULT_RESOURCE_TIMEOUT_MS } = {}) {
   let disposed = false;
   let pending = null;
 

@@ -87,6 +87,8 @@ func TestRenderCronBootstrapScript(t *testing.T) {
 		`RUNNING_EXE="$(readlink -f "/proc/$PID/exe" 2>/dev/null)"`,
 		`RUNNING_EXE="${RUNNING_EXE% (deleted)}"`,
 		`[ "$RUNNING_EXE" = "$EXPECTED_EXE" ] && exit 0`,
+		`for PROC_EXE in /proc/[0-9]*/exe; do`,
+		`echo "$PID" >"$PID_FILE"`,
 		`[ -e "$UPDATE_JOURNAL" ] && exit 0`,
 		`[ -e "$UPDATE_LOCK" ] && exit 0`,
 		`export VPN_MANAGER_ROOT="$ROOT_DIR"`,

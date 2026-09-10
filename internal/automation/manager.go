@@ -270,6 +270,7 @@ WATCHDOG_LOCK="/tmp/vpn-manager-watchdog.lock"
 PATH="$ROOT_DIR/bin:$ROOT_DIR/.vpn-manager/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 [ -x "$PROG" ] || exit 0
+EXPECTED_EXE="$(readlink -f "$PROG" 2>/dev/null)"
 if [ -r "$PID_FILE" ]; then
 	PID="$(cat "$PID_FILE" 2>/dev/null)"
 	case "$PID" in
@@ -278,10 +279,20 @@ if [ -r "$PID_FILE" ]; then
 	if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
 		RUNNING_EXE="$(readlink -f "/proc/$PID/exe" 2>/dev/null)"
 		RUNNING_EXE="${RUNNING_EXE%% (deleted)}"
-		EXPECTED_EXE="$(readlink -f "$PROG" 2>/dev/null)"
 		[ "$RUNNING_EXE" = "$EXPECTED_EXE" ] && exit 0
 	fi
 fi
+for PROC_EXE in /proc/[0-9]*/exe; do
+	[ -e "$PROC_EXE" ] || continue
+	RUNNING_EXE="$(readlink -f "$PROC_EXE" 2>/dev/null)"
+	RUNNING_EXE="${RUNNING_EXE%% (deleted)}"
+	if [ "$RUNNING_EXE" = "$EXPECTED_EXE" ]; then
+		PID="${PROC_EXE#/proc/}"
+		PID="${PID%%/*}"
+		echo "$PID" >"$PID_FILE"
+		exit 0
+	fi
+done
 [ -e "$UPDATE_JOURNAL" ] && exit 0
 [ -e "$UPDATE_LOCK" ] && exit 0
 mkdir "$WATCHDOG_LOCK" 2>/dev/null || exit 0

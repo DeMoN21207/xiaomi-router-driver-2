@@ -117,10 +117,10 @@ func TestDefaultStateIncludesUpdateSettings(t *testing.T) {
 	}
 }
 
-func TestNormalizeAutomationSettingsDoesNotAllowDirectAllDownMode(t *testing.T) {
+func TestNormalizeAutomationSettingsAllowsDirectAllDownMode(t *testing.T) {
 	state := normalize(State{Automation: AutomationSettings{FailoverAllDownMode: "direct"}})
-	if got := state.Automation.FailoverAllDownMode; got != "keep" {
-		t.Fatalf("expected direct all-down mode to normalize to keep, got %q", got)
+	if got := state.Automation.FailoverAllDownMode; got != "direct" {
+		t.Fatalf("expected direct all-down mode to remain direct, got %q", got)
 	}
 }
 
@@ -142,6 +142,60 @@ func TestManagerPersistsRoutingLoadProfile(t *testing.T) {
 
 	if loaded.Routing.LoadProfile != RoutingLoadProfileDetailed {
 		t.Fatalf("expected load profile %q, got %q", RoutingLoadProfileDetailed, loaded.Routing.LoadProfile)
+	}
+}
+
+func TestManagerMutateSerializesConcurrentChanges(t *testing.T) {
+	db := openTestDB(t)
+	manager := NewManager(db, "")
+	if _, err := manager.Save(DefaultState()); err != nil {
+		t.Fatal(err)
+	}
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Mutate(func(state *State) error {
+			close(firstStarted)
+			<-releaseFirst
+			state.Providers = append(state.Providers, Provider{ID: "provider", Name: "VPN", Type: ProviderTypeSubscription, Enabled: true})
+			return nil
+		})
+		firstDone <- err
+	}()
+	<-firstStarted
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Mutate(func(state *State) error {
+			state.Automation.AutoRecover = false
+			return nil
+		})
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second mutation completed before the first released its transaction: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := manager.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Providers) != 1 || state.Providers[0].ID != "provider" {
+		t.Fatalf("provider mutation was lost: %+v", state.Providers)
+	}
+	if state.Automation.AutoRecover {
+		t.Fatal("automation mutation was lost")
 	}
 }
 

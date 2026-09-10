@@ -810,14 +810,10 @@ func (h *Handler) handleRoutingConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		state, err := h.state.Load()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-
-		state.Routing = settings
-		saved, err := h.state.Save(state)
+		saved, err := h.state.Mutate(func(state *config.State) error {
+			state.Routing = settings
+			return nil
+		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -856,15 +852,12 @@ func (h *Handler) handleAutomationConfig(w http.ResponseWriter, r *http.Request)
 			return
 		}
 
-		state, err := h.state.Load()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		previous := state
-		state.Automation = settings
-
-		saved, err := h.state.Save(state)
+		var previous config.AutomationSettings
+		saved, err := h.state.Mutate(func(state *config.State) error {
+			previous = state.Automation
+			state.Automation = settings
+			return nil
+		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -872,8 +865,21 @@ func (h *Handler) handleAutomationConfig(w http.ResponseWriter, r *http.Request)
 
 		if h.automation != nil {
 			if err := h.automation.Sync(saved.Automation); err != nil {
-				_, _ = h.state.Save(previous)
-				_ = h.automation.Sync(previous.Automation)
+				restored := false
+				_, rollbackErr := h.state.Mutate(func(state *config.State) error {
+					if state.Automation != saved.Automation {
+						return nil
+					}
+					state.Automation = previous
+					restored = true
+					return nil
+				})
+				if restored {
+					_ = h.automation.Sync(previous)
+				}
+				if rollbackErr != nil {
+					err = fmt.Errorf("%w; automation rollback failed: %v", err, rollbackErr)
+				}
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
@@ -934,24 +940,32 @@ func (h *Handler) handlePriorityPolicies(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		policy, err := h.buildPriorityPolicy("", req, state)
+		policy, err := h.buildPriorityPolicy(r.Context(), "", req, state)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		nextState := state
-		nextState.PriorityPolicies = append(append([]config.PriorityPolicy(nil), state.PriorityPolicies...), policy)
-		if err := validatePriorityPolicyState(nextState); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		if err := validateActiveRuleEntries(nextState); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		saved, err := h.state.Save(nextState)
+		validatedProvider, _ := findProviderByID(state.Providers, policy.ProviderID)
+		mutationStatus := http.StatusInternalServerError
+		saved, err := h.state.Mutate(func(current *config.State) error {
+			provider, exists := findProviderByID(current.Providers, policy.ProviderID)
+			if !exists || provider != validatedProvider {
+				mutationStatus = http.StatusConflict
+				return errors.New("provider changed while priority policy was being validated; retry")
+			}
+			current.PriorityPolicies = append(current.PriorityPolicies, policy)
+			if err := validatePriorityPolicyState(*current); err != nil {
+				mutationStatus = http.StatusBadRequest
+				return err
+			}
+			if err := validateActiveRuleEntries(*current); err != nil {
+				mutationStatus = http.StatusBadRequest
+				return err
+			}
+			return nil
+		})
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeError(w, mutationStatus, err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]any{"policy": policy, "count": len(saved.PriorityPolicies)})
@@ -1000,44 +1014,62 @@ func (h *Handler) handlePriorityPolicy(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, fmt.Errorf("priority policy %s not found", id))
 			return
 		}
-		policy, err := h.buildPriorityPolicy(id, req, state)
+		policy, err := h.buildPriorityPolicy(r.Context(), id, req, state)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		nextState := state
-		nextState.PriorityPolicies = append([]config.PriorityPolicy(nil), state.PriorityPolicies...)
-		nextState.PriorityPolicies[index] = policy
-		if err := validatePriorityPolicyState(nextState); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		if err := validateActiveRuleEntries(nextState); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		saved, err := h.state.Save(nextState)
+		validatedProvider, _ := findProviderByID(state.Providers, policy.ProviderID)
+		mutationStatus := http.StatusInternalServerError
+		savedIndex := -1
+		saved, err := h.state.Mutate(func(current *config.State) error {
+			currentIndex := findPriorityPolicyIndex(current.PriorityPolicies, id)
+			if currentIndex < 0 {
+				mutationStatus = http.StatusNotFound
+				return sql.ErrNoRows
+			}
+			provider, exists := findProviderByID(current.Providers, policy.ProviderID)
+			if !exists || provider != validatedProvider {
+				mutationStatus = http.StatusConflict
+				return errors.New("provider changed while priority policy was being validated; retry")
+			}
+			current.PriorityPolicies[currentIndex] = policy
+			if err := validatePriorityPolicyState(*current); err != nil {
+				mutationStatus = http.StatusBadRequest
+				return err
+			}
+			if err := validateActiveRuleEntries(*current); err != nil {
+				mutationStatus = http.StatusBadRequest
+				return err
+			}
+			savedIndex = currentIndex
+			return nil
+		})
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			if mutationStatus == http.StatusNotFound {
+				err = fmt.Errorf("priority policy %s not found", id)
+			}
+			writeError(w, mutationStatus, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"policy": saved.PriorityPolicies[index]})
+		writeJSON(w, http.StatusOK, map[string]any{"policy": saved.PriorityPolicies[savedIndex]})
 		h.recordEvent("info", "priority_policy.updated", fmt.Sprintf("Priority policy %q updated", policy.Name))
 	case http.MethodDelete:
-		state, err := h.state.Load()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		index := findPriorityPolicyIndex(state.PriorityPolicies, id)
-		if index < 0 {
+		found := false
+		_, err := h.state.Mutate(func(state *config.State) error {
+			index := findPriorityPolicyIndex(state.PriorityPolicies, id)
+			if index < 0 {
+				return sql.ErrNoRows
+			}
+			found = true
+			state.PriorityPolicies = append(state.PriorityPolicies[:index:index], state.PriorityPolicies[index+1:]...)
+			return nil
+		})
+		if !found {
 			writeError(w, http.StatusNotFound, fmt.Errorf("priority policy %s not found", id))
 			return
 		}
-		nextState := state
-		nextState.PriorityPolicies = append([]config.PriorityPolicy(nil), state.PriorityPolicies[:index]...)
-		nextState.PriorityPolicies = append(nextState.PriorityPolicies, state.PriorityPolicies[index+1:]...)
-		if _, err := h.state.Save(nextState); err != nil {
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -1131,14 +1163,10 @@ func (h *Handler) handleProviders(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		state, err := h.state.Load()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-
-		state.Providers = append(state.Providers, provider)
-		saved, err := h.state.Save(state)
+		saved, err := h.state.Mutate(func(state *config.State) error {
+			state.Providers = append(state.Providers, provider)
+			return nil
+		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -1221,7 +1249,7 @@ func (h *Handler) handleProbeProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, probe.ProbeSource(req.Type, req.Source, h.dataDir))
+	writeJSON(w, http.StatusOK, probe.ProbeSourceContext(r.Context(), req.Type, req.Source, h.dataDir))
 }
 
 func (h *Handler) handleProviderLatency(w http.ResponseWriter, r *http.Request) {
@@ -1273,30 +1301,35 @@ func (h *Handler) handleProvider(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		state, err := h.state.Load()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-
-		index := findProviderIndex(state.Providers, id)
-		if index < 0 {
+		notFound := false
+		var validationErr error
+		_, err = h.state.Mutate(func(state *config.State) error {
+			index := findProviderIndex(state.Providers, id)
+			if index < 0 {
+				notFound = true
+				return sql.ErrNoRows
+			}
+			previous := state.Providers[index]
+			if !previous.Enabled && provider.Enabled {
+				nextState := *state
+				nextState.Providers = append([]config.Provider(nil), state.Providers...)
+				nextState.Providers[index] = provider
+				if validationErr = validateActiveRuleEntries(nextState); validationErr != nil {
+					return validationErr
+				}
+			}
+			state.Providers[index] = provider
+			return nil
+		})
+		if notFound {
 			writeError(w, http.StatusNotFound, fmt.Errorf("provider %s not found", id))
 			return
 		}
-		previous := state.Providers[index]
-		if !previous.Enabled && provider.Enabled {
-			nextState := state
-			nextState.Providers = append([]config.Provider(nil), state.Providers...)
-			nextState.Providers[index] = provider
-			if err := validateActiveRuleEntries(nextState); err != nil {
-				writeError(w, http.StatusBadRequest, err)
-				return
-			}
+		if validationErr != nil {
+			writeError(w, http.StatusBadRequest, validationErr)
+			return
 		}
-
-		state.Providers[index] = provider
-		if _, err := h.state.Save(state); err != nil {
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -1304,45 +1337,41 @@ func (h *Handler) handleProvider(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"provider": provider})
 		h.recordEvent("info", "provider.updated", fmt.Sprintf("Provider %q updated", provider.Name))
 	case http.MethodDelete:
-		state, err := h.state.Load()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-
-		nextProviders := make([]config.Provider, 0, len(state.Providers))
 		found := false
-		for _, provider := range state.Providers {
-			if provider.ID == id {
-				found = true
-				continue
+		_, err := h.state.Mutate(func(state *config.State) error {
+			nextProviders := make([]config.Provider, 0, len(state.Providers))
+			for _, provider := range state.Providers {
+				if provider.ID == id {
+					found = true
+					continue
+				}
+				nextProviders = append(nextProviders, provider)
 			}
-			nextProviders = append(nextProviders, provider)
-		}
+			if !found {
+				return sql.ErrNoRows
+			}
+			nextRules := make([]config.Rule, 0, len(state.Rules))
+			for _, rule := range state.Rules {
+				if rule.ProviderID != id {
+					nextRules = append(nextRules, rule)
+				}
+			}
+			nextPolicies := make([]config.PriorityPolicy, 0, len(state.PriorityPolicies))
+			for _, policy := range state.PriorityPolicies {
+				if policy.ProviderID != id {
+					nextPolicies = append(nextPolicies, policy)
+				}
+			}
+			state.Providers = nextProviders
+			state.Rules = nextRules
+			state.PriorityPolicies = nextPolicies
+			return nil
+		})
 		if !found {
 			writeError(w, http.StatusNotFound, fmt.Errorf("provider %s not found", id))
 			return
 		}
-
-		nextRules := make([]config.Rule, 0, len(state.Rules))
-		for _, rule := range state.Rules {
-			if rule.ProviderID == id {
-				continue
-			}
-			nextRules = append(nextRules, rule)
-		}
-		nextPolicies := make([]config.PriorityPolicy, 0, len(state.PriorityPolicies))
-		for _, policy := range state.PriorityPolicies {
-			if policy.ProviderID == id {
-				continue
-			}
-			nextPolicies = append(nextPolicies, policy)
-		}
-
-		state.Providers = nextProviders
-		state.Rules = nextRules
-		state.PriorityPolicies = nextPolicies
-		if _, err := h.state.Save(state); err != nil {
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -1378,7 +1407,7 @@ func (h *Handler) handleProviderRefresh(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	entries, err := subscription.RefreshEntriesCached(provider.Source, h.subscriptionRuntimeDir())
+	entries, err := subscription.RefreshEntriesCachedContext(r.Context(), provider.Source, h.subscriptionRuntimeDir())
 	if err != nil {
 		writeError(w, http.StatusBadGateway, fmt.Errorf("refresh subscription %q: %w", provider.Name, err))
 		return
@@ -1433,12 +1462,24 @@ func (h *Handler) handleRules(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		state.Rules = append(state.Rules, rule)
-		if err := validateActiveRuleEntries(state); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		var validationErr error
+		saved, err := h.state.Mutate(func(state *config.State) error {
+			currentRule, buildErr := buildRule(rule.ID, req, state.Providers)
+			if buildErr != nil {
+				validationErr = buildErr
+				return buildErr
+			}
+			rule = currentRule
+			state.Rules = append(state.Rules, rule)
+			if validationErr = validateActiveRuleEntries(*state); validationErr != nil {
+				return validationErr
+			}
+			return nil
+		})
+		if validationErr != nil {
+			writeError(w, http.StatusBadRequest, validationErr)
 			return
 		}
-		saved, err := h.state.Save(state)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -2054,7 +2095,7 @@ func buildRule(id string, req ruleRequest, providers []config.Provider) (config.
 	}, nil
 }
 
-func (h *Handler) buildPriorityPolicy(id string, req priorityPolicyRequest, state config.State) (config.PriorityPolicy, error) {
+func (h *Handler) buildPriorityPolicy(ctx context.Context, id string, req priorityPolicyRequest, state config.State) (config.PriorityPolicy, error) {
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		return config.PriorityPolicy{}, errors.New("priority policy name is required")
@@ -2079,7 +2120,7 @@ func (h *Handler) buildPriorityPolicy(id string, req priorityPolicyRequest, stat
 	if err != nil {
 		return config.PriorityPolicy{}, err
 	}
-	if err := validatePriorityLocations(provider, targets, h.subscriptionRuntimeDir()); err != nil {
+	if err := validatePriorityLocations(ctx, provider, targets, h.subscriptionRuntimeDir()); err != nil {
 		return config.PriorityPolicy{}, err
 	}
 	if err := validatePrioritySchedule(schedule); err != nil {
@@ -2147,8 +2188,8 @@ func normalizePriorityRequestSchedule(schedule []config.PriorityScheduleWindow, 
 	return out, nil
 }
 
-func validatePriorityLocations(provider config.Provider, targets []config.PriorityTarget, runtimeDir string) error {
-	entries, _, err := subscription.FetchEntriesCached(provider.Source, runtimeDir)
+func validatePriorityLocations(ctx context.Context, provider config.Provider, targets []config.PriorityTarget, runtimeDir string) error {
+	entries, _, err := subscription.FetchEntriesCachedContext(ctx, provider.Source, runtimeDir)
 	if err != nil {
 		return fmt.Errorf("load subscription locations for %q: %w", provider.Name, err)
 	}

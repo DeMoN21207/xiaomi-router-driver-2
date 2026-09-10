@@ -49,3 +49,32 @@ func TestApplyAllDownPolicyDoesNotRepeatSameFailureEvent(t *testing.T) {
 		t.Fatalf("events after recovery failure = %d, want 2: %#v", len(events), events)
 	}
 }
+
+func TestApplyAllDownPolicyReleasesAffectedRulesInDirectMode(t *testing.T) {
+	var applied config.State
+	supervisor := &Supervisor{
+		failover: newFailoverRuntime(),
+		applyState: func(_ context.Context, state config.State) error {
+			applied = state
+			return nil
+		},
+	}
+	provider := config.Provider{ID: "provider_1", Name: "FizzVPN", Enabled: true}
+	rule := config.Rule{ID: "rule_1", ProviderID: provider.ID, Enabled: true, Domains: []string{"example.com"}}
+	state := config.State{
+		Providers:  []config.Provider{provider},
+		Rules:      []config.Rule{rule},
+		Automation: config.AutomationSettings{FailoverAllDownMode: "direct"},
+	}
+
+	if !supervisor.applyAllDownPolicy(context.Background(), state, provider, []config.Rule{rule}, "all probes failed") {
+		t.Fatal("applyAllDownPolicy() = false")
+	}
+	if len(applied.Rules) != 1 || applied.Rules[0].Enabled {
+		t.Fatalf("direct all-down state did not disable affected rule: %+v", applied.Rules)
+	}
+	override, ok := supervisor.failover.overrides[rule.ID]
+	if !ok || override.Mode != "direct" {
+		t.Fatalf("direct failover override was not recorded: %+v", supervisor.failover.overrides)
+	}
+}

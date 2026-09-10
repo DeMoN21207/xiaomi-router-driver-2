@@ -2,6 +2,7 @@ package probe
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,6 +32,10 @@ type Result struct {
 // providerType is "openvpn" or "subscription".
 // baseDir is used to resolve relative provider-local files like uploaded .ovpn profiles.
 func ProbeSource(providerType, source, baseDir string) Result {
+	return ProbeSourceContext(context.Background(), providerType, source, baseDir)
+}
+
+func ProbeSourceContext(ctx context.Context, providerType, source, baseDir string) Result {
 	source = strings.TrimSpace(source)
 	if source == "" {
 		return Result{Error: "source is required"}
@@ -40,7 +45,7 @@ func ProbeSource(providerType, source, baseDir string) Result {
 	case "openvpn":
 		return probeOpenVPN(source, baseDir)
 	case "subscription":
-		return probeSubscription(source, baseDir)
+		return probeSubscription(ctx, source, baseDir)
 	default:
 		return Result{Error: fmt.Sprintf("unsupported provider type: %s", providerType)}
 	}
@@ -93,14 +98,14 @@ func probeOpenVPN(source, baseDir string) Result {
 	return Result{Locations: remotes, RawCount: len(remotes)}
 }
 
-func probeSubscription(source string, baseDir string) Result {
+func probeSubscription(ctx context.Context, source string, baseDir string) Result {
 	runtimeDir := ""
 	if strings.TrimSpace(baseDir) != "" {
 		runtimeDir = filepath.Join(baseDir, ".vpn-manager", "subscriptions")
 	}
-	entries, _, err := subscription.FetchEntriesCached(source, runtimeDir)
+	entries, _, err := subscription.FetchEntriesCachedContext(ctx, source, runtimeDir)
 	if err != nil {
-		entries, err = subscription.FetchEntries(source)
+		entries, err = subscription.FetchEntriesContext(ctx, source)
 	}
 	if err != nil {
 		return Result{Error: err.Error()}

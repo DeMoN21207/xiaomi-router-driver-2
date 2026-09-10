@@ -156,7 +156,7 @@ func (m *Manager) Apply(ctx context.Context, state config.State, enabledRules []
 	defer m.refreshSnapshotLocked()
 
 	cacheOnly, _ := ctx.Value(cachedEntriesOnlyKey{}).(bool)
-	desired, err := m.buildDesired(state, enabledRules, cacheOnly)
+	desired, err := m.buildDesired(ctx, state, enabledRules, cacheOnly)
 	if err != nil {
 		return err
 	}
@@ -417,7 +417,8 @@ func (m *Manager) watchInstanceWithDone(key string, cmd *exec.Cmd, done chan str
 	_ = m.deleteInstanceLocked(key)
 	removeIfExists(current.domainListPath)
 	removeIfExists(current.ConfigPath)
-	_ = runSubscriptionRoutingTeardown(m.routing, context.Background(), current.Settings)
+	// Keep the policy route fail-closed until the supervisor replaces the dead
+	// runtime. Explicit Apply/Cleanup paths own routing teardown and are serialized.
 	_ = m.pruneRuntimeFilesLocked()
 
 	if err != nil {
@@ -447,10 +448,7 @@ func (m *Manager) cleanupLocked(ctx context.Context) error {
 				_ = current.cmd.Process.Kill()
 			}
 		} else if instance.PID > 0 {
-			process, findErr := os.FindProcess(instance.PID)
-			if findErr == nil {
-				_ = process.Kill()
-			}
+			_, _ = runtimehealth.KillIfMatches(instance.PID, m.singBoxBinary, instance.ConfigPath)
 		}
 
 		if err := m.routing.RunWithOptions(ctx, "del", routing.RunOptions{
@@ -621,16 +619,10 @@ func (m *Manager) stopInstanceLocked(ctx context.Context, instance *managedInsta
 				}
 			}
 		} else if current.PID > 0 {
-			process, findErr := os.FindProcess(current.PID)
-			if findErr == nil {
-				_ = process.Kill()
-			}
+			_, _ = runtimehealth.KillIfMatches(current.PID, m.singBoxBinary, current.ConfigPath)
 		}
 	} else if instance.PID > 0 {
-		process, findErr := os.FindProcess(instance.PID)
-		if findErr == nil {
-			_ = process.Kill()
-		}
+		_, _ = runtimehealth.KillIfMatches(instance.PID, m.singBoxBinary, instance.ConfigPath)
 	}
 
 	if err := m.routing.RunWithOptions(ctx, "del", routing.RunOptions{
@@ -647,7 +639,7 @@ func (m *Manager) stopInstanceLocked(ctx context.Context, instance *managedInsta
 	return errors.Join(cleanupErrors...)
 }
 
-func (m *Manager) buildDesired(state config.State, enabledRules []config.Rule, cacheOnly bool) ([]desiredInstance, error) {
+func (m *Manager) buildDesired(ctx context.Context, state config.State, enabledRules []config.Rule, cacheOnly bool) ([]desiredInstance, error) {
 	providersByID := make(map[string]config.Provider, len(state.Providers))
 	for _, provider := range state.Providers {
 		providersByID[provider.ID] = provider
@@ -715,7 +707,7 @@ func (m *Manager) buildDesired(state config.State, enabledRules []config.Rule, c
 		if cacheOnly {
 			entries, err = LoadCachedEntries(group.Provider.Source, m.runtimeDir)
 		} else {
-			entries, fetchMode, err = FetchEntriesCached(group.Provider.Source, m.runtimeDir)
+			entries, fetchMode, err = FetchEntriesCachedContext(ctx, group.Provider.Source, m.runtimeDir)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("load subscription %q: %w", group.Provider.Name, err)

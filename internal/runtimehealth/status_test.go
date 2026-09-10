@@ -3,8 +3,11 @@ package runtimehealth
 import (
 	"net"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStatusStopsWithoutInterface(t *testing.T) {
@@ -49,5 +52,42 @@ func TestProbeInterfaceReportsMissingInterface(t *testing.T) {
 	}
 	if !strings.Contains(detail, "interface is missing") {
 		t.Fatalf("detail = %q, want missing interface detail", detail)
+	}
+}
+
+func TestKillIfMatchesChecksProcessIdentity(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("process identity is read from Linux procfs")
+	}
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	killed, err := KillIfMatches(cmd.Process.Pid, "definitely-not-this-process")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if killed {
+		t.Fatal("mismatched process was killed")
+	}
+	if !ProcessAlive(cmd.Process.Pid) {
+		t.Fatal("mismatched process did not survive identity check")
+	}
+
+	killed, err = KillIfMatches(cmd.Process.Pid, "sleep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !killed {
+		t.Fatal("matching process was not killed")
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("killed process was not reaped")
 	}
 }

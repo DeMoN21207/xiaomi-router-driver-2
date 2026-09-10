@@ -184,7 +184,30 @@ func (m *Manager) Save(state State) (State, error) {
 	if err := m.ensureReadyUnlocked(); err != nil {
 		return State{}, err
 	}
+	return m.saveUnlocked(state)
+}
 
+// Mutate loads and saves state while holding one manager lock, so concurrent
+// endpoint updates cannot overwrite fields changed by another request.
+func (m *Manager) Mutate(mutate func(*State) error) (State, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.ensureReadyUnlocked(); err != nil {
+		return State{}, err
+	}
+	state, err := m.loadUnlocked()
+	if err != nil {
+		return State{}, err
+	}
+	if mutate != nil {
+		if err := mutate(&state); err != nil {
+			return State{}, err
+		}
+	}
+	return m.saveUnlocked(state)
+}
+
+func (m *Manager) saveUnlocked(state State) (State, error) {
 	state = normalize(state)
 	state.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 
@@ -1340,7 +1363,7 @@ func normalizeAutomationSettings(settings AutomationSettings) AutomationSettings
 
 	settings.FailoverAllDownMode = strings.ToLower(strings.TrimSpace(settings.FailoverAllDownMode))
 	switch settings.FailoverAllDownMode {
-	case "keep":
+	case "keep", "direct":
 	default:
 		settings.FailoverAllDownMode = defaults.FailoverAllDownMode
 	}

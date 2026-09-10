@@ -22,7 +22,7 @@ func TestStandbyProbeReapsProcessWhenListenerNeverStarts(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "pid")
 	binary := filepath.Join(dir, "sing-box")
-	if err := os.WriteFile(binary, []byte(fmt.Sprintf("#!/bin/sh\necho $$ > '%s'\nexec sleep 60\n", marker)), 0o700); err != nil {
+	if err := os.WriteFile(binary, []byte(fmt.Sprintf("#!/bin/sh\necho $$ > '%s.tmp'\nmv '%s.tmp' '%s'\nexec sleep 60\n", marker, marker, marker)), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	// Process startup can be delayed when all Go packages run concurrently on a

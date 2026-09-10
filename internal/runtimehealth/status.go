@@ -119,6 +119,35 @@ func ProcessAlive(pid int, markers ...string) bool {
 	return true
 }
 
+// KillIfMatches stops a persisted process only while its current command line
+// still contains every expected marker. A missing or recycled PID is left alone.
+func KillIfMatches(pid int, markers ...string) (bool, error) {
+	if pid <= 0 {
+		return false, nil
+	}
+	hasMarker := false
+	for _, marker := range markers {
+		if normalizeMarker(marker) != "" {
+			hasMarker = true
+			break
+		}
+	}
+	if !hasMarker {
+		return false, errors.New("refusing to kill process without an identity marker")
+	}
+	if !ProcessAlive(pid, markers...) {
+		return false, nil
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false, err
+	}
+	if err := process.Kill(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func probeInterface(interfaceName string, host string) (bool, string) {
 	interfaceName = strings.TrimSpace(interfaceName)
 	host = strings.TrimSpace(host)

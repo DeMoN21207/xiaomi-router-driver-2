@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"mime/multipart"
@@ -442,7 +443,7 @@ func TestBuildPriorityPolicyRejectsScheduleOverlap(t *testing.T) {
 	}
 	state.Providers[0].Source = testSubscriptionSource()
 
-	_, err := handler.buildPriorityPolicy("", priorityPolicyRequest{
+	_, err := handler.buildPriorityPolicy(context.Background(), "", priorityPolicyRequest{
 		Name:       "Main",
 		ProviderID: "provider-a",
 		Enabled:    true,
@@ -508,7 +509,7 @@ func TestBuildPriorityPolicyAllowsEmptyEntries(t *testing.T) {
 	}
 	state.Providers[0].Source = testSubscriptionSource()
 
-	policy, err := handler.buildPriorityPolicy("", priorityPolicyRequest{
+	policy, err := handler.buildPriorityPolicy(context.Background(), "", priorityPolicyRequest{
 		Name:       "Main",
 		ProviderID: "provider-a",
 		Enabled:    true,

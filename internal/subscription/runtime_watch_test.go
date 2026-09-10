@@ -11,7 +11,7 @@ import (
 	"xiomi-router-driver/internal/routing"
 )
 
-func TestWatchInstanceTeardownRoutingOnUnexpectedExit(t *testing.T) {
+func TestWatchInstancePreservesRoutingOnUnexpectedExit(t *testing.T) {
 	if os.Getenv("GO_WANT_SUBSCRIPTION_WATCH_HELPER") == "1" {
 		os.Exit(3)
 	}
@@ -40,7 +40,7 @@ func TestWatchInstanceTeardownRoutingOnUnexpectedExit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Executable() error = %v", err)
 	}
-	cmd := exec.Command(helperBinary, "-test.run=TestWatchInstanceTeardownRoutingOnUnexpectedExit")
+	cmd := exec.Command(helperBinary, "-test.run=TestWatchInstancePreservesRoutingOnUnexpectedExit")
 	cmd.Env = append(os.Environ(), "GO_WANT_SUBSCRIPTION_WATCH_HELPER=1")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -75,23 +75,16 @@ func TestWatchInstanceTeardownRoutingOnUnexpectedExit(t *testing.T) {
 		runSubscriptionRoutingTeardown = original
 	})
 
-	var (
-		called      bool
-		gotSettings config.RoutingSettings
-	)
+	called := false
 	runSubscriptionRoutingTeardown = func(_ *routing.Runner, _ context.Context, settings config.RoutingSettings) error {
 		called = true
-		gotSettings = settings
 		return nil
 	}
 
 	manager.watchInstance(instance.Key, cmd)
 
-	if !called {
-		t.Fatalf("expected routing teardown to be called")
-	}
-	if gotSettings != settings {
-		t.Fatalf("routing teardown settings = %+v, want %+v", gotSettings, settings)
+	if called {
+		t.Fatal("unexpected process exit tore down routing before supervisor recovery")
 	}
 	if _, exists := manager.current[instance.Key]; exists {
 		t.Fatalf("expected runtime to be removed from current map")

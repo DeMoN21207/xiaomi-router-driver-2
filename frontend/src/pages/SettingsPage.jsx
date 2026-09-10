@@ -798,9 +798,14 @@ export default function SettingsPage() {
               <div className="rounded-lg border border-outline-variant/10 bg-surface-container p-3">
                 <span className="block text-sm text-on-surface">{t("settings.failoverAllDownMode")}</span>
                 <span className="mt-1 block text-xs text-on-surface-variant">{t("hint.failoverAllDownMode")}</span>
-                <span className="mt-3 inline-flex rounded-full bg-primary/10 px-3 py-1 text-xs font-bold uppercase tracking-wide text-primary">
-                  {t("settings.failoverAllDownKeep")}
-                </span>
+                <select
+                  value={automation.failoverAllDownMode || "keep"}
+                  onChange={(event) => updateAutomationField("failoverAllDownMode", event.target.value)}
+                  className="mt-3 cursor-pointer rounded-lg border-none bg-surface-container-high px-3 py-1.5 font-headline text-sm font-bold text-primary focus:ring-1 focus:ring-primary"
+                >
+                  <option value="keep">{t("settings.failoverAllDownKeep")}</option>
+                  <option value="direct">{t("settings.failoverAllDownDirect")}</option>
+                </select>
               </div>
 
               <div className="flex items-center justify-between gap-4 rounded-lg bg-surface-container p-3">

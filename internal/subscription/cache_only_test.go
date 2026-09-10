@@ -1,6 +1,7 @@
 package subscription
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -35,7 +36,7 @@ func TestLoadCachedEntriesUsesStaleEndpointsWithoutNetwork(t *testing.T) {
 	state := config.DefaultState()
 	state.Providers = []config.Provider{{ID: "p", Name: "VPN", Type: config.ProviderTypeSubscription, Source: server.URL, Enabled: true}}
 	rules := []config.Rule{{ID: "r", ProviderID: "p", SelectedLocation: "Backup", Domains: []string{"example.com"}, Enabled: true}}
-	desired, err := manager.buildDesired(state, rules, true)
+	desired, err := manager.buildDesired(context.Background(), state, rules, true)
 	if err != nil || len(desired) != 1 {
 		t.Fatalf("recovery build desired=%+v err=%v", desired, err)
 	}

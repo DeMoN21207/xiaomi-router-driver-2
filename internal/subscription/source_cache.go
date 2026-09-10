@@ -74,6 +74,10 @@ func LoadCachedEntries(source string, runtimeDir string) ([]Entry, error) {
 }
 
 func FetchEntriesCached(source string, runtimeDir string) ([]Entry, entriesFetchMode, error) {
+	return FetchEntriesCachedContext(context.Background(), source, runtimeDir)
+}
+
+func FetchEntriesCachedContext(ctx context.Context, source string, runtimeDir string) ([]Entry, entriesFetchMode, error) {
 	normalizedSource, err := normalizeSubscriptionSource(source)
 	if err != nil {
 		return nil, entriesFetchLive, err
@@ -92,12 +96,15 @@ func FetchEntriesCached(source string, runtimeDir string) ([]Entry, entriesFetch
 		}
 	}
 
-	entries, raw, err := fetchEntriesLive(normalizedSource, false)
+	entries, raw, err := fetchEntriesLive(ctx, normalizedSource, false)
 	if err == nil {
 		if cachePath != "" {
 			_ = saveEntriesCache(cachePath, source, raw, time.Now().UTC())
 		}
 		return entries, entriesFetchLive, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, entriesFetchLive, ctxErr
 	}
 
 	if snapshot, ok := loadEntriesCache(cachePath, source); ok {
@@ -111,12 +118,16 @@ func FetchEntriesCached(source string, runtimeDir string) ([]Entry, entriesFetch
 }
 
 func RefreshEntriesCached(source string, runtimeDir string) ([]Entry, error) {
+	return RefreshEntriesCachedContext(context.Background(), source, runtimeDir)
+}
+
+func RefreshEntriesCachedContext(ctx context.Context, source string, runtimeDir string) ([]Entry, error) {
 	normalizedSource, err := normalizeSubscriptionSource(source)
 	if err != nil {
 		return nil, err
 	}
 
-	entries, raw, err := fetchEntriesLive(normalizedSource, true)
+	entries, raw, err := fetchEntriesLive(ctx, normalizedSource, true)
 	if err != nil {
 		return nil, err
 	}
@@ -212,6 +223,10 @@ func (s entriesCacheSnapshot) isFresh(ttl time.Duration) bool {
 }
 
 func fetchEntriesRaw(source string) (string, error) {
+	return fetchEntriesRawContext(context.Background(), source)
+}
+
+func fetchEntriesRawContext(ctx context.Context, source string) (string, error) {
 	normalized, err := normalizeSubscriptionSource(source)
 	if err != nil {
 		return "", err
@@ -220,10 +235,10 @@ func fetchEntriesRaw(source string) (string, error) {
 		return normalized.Inline, nil
 	}
 
-	return fetchEntriesRawWithProfile(normalized.FetchURL, subscriptionFetchProfile{})
+	return fetchEntriesRawWithProfile(ctx, normalized.FetchURL, subscriptionFetchProfile{})
 }
 
-func fetchEntriesLive(source subscriptionSource, retryFetchErrors bool) ([]Entry, string, error) {
+func fetchEntriesLive(ctx context.Context, source subscriptionSource, retryFetchErrors bool) ([]Entry, string, error) {
 	if source.Inline != "" {
 		entries, err := ParseEntries(source.Inline)
 		if err != nil {
@@ -235,7 +250,10 @@ func fetchEntriesLive(source subscriptionSource, retryFetchErrors bool) ([]Entry
 	profiles := subscriptionFetchProfiles()
 	var lastErr error
 	for _, profile := range profiles {
-		raw, err := fetchEntriesRawWithProfile(source.FetchURL, profile)
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
+		raw, err := fetchEntriesRawWithProfile(ctx, source.FetchURL, profile)
 		if err != nil {
 			lastErr = err
 			if !retryFetchErrors {
@@ -259,9 +277,9 @@ func fetchEntriesLive(source subscriptionSource, retryFetchErrors bool) ([]Entry
 	return nil, "", lastErr
 }
 
-func fetchEntriesRawWithProfile(source string, profile subscriptionFetchProfile) (string, error) {
+func fetchEntriesRawWithProfile(ctx context.Context, source string, profile subscriptionFetchProfile) (string, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, source, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
 	if err != nil {
 		return "", fmt.Errorf("prepare subscription request: %w", err)
 	}

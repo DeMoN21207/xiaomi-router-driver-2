@@ -1,8 +1,10 @@
 package subscription
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -230,6 +232,45 @@ func TestFetchEntriesCachedUsesFreshCacheWithoutNetwork(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Name != "Japan" {
 		t.Fatalf("unexpected cached entries: %+v", entries)
+	}
+}
+
+func TestFetchEntriesCachedContextCancelsActiveRequest(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		close(canceled)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cacheDir := t.TempDir()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := FetchEntriesCachedContext(ctx, server.URL, cacheDir)
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("subscription request did not start")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("fetch error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscription fetch ignored cancellation")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP request context was not canceled")
 	}
 }
 
