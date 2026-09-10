@@ -305,7 +305,19 @@ set -e
 remote_dir=$remote_dir_q
 service=$remote_service_q
 tmp="\${remote_dir}.data-preserve"
+backup_root="\${remote_dir}.backups"
+backup_dir="\$backup_root/predeploy-\$(date -u +%Y%m%d-%H%M%S)"
 : > /tmp/vpn-manager.updating
+if [ -d "\$remote_dir" ]; then
+  mkdir -p "\$backup_dir/bin"
+  for name in vpn-manager start.sh README.md bundle-info.txt; do
+    [ -f "\$remote_dir/\$name" ] && cp -p "\$remote_dir/\$name" "\$backup_dir/\$name"
+  done
+  for name in openvpn sing-box; do
+    [ -f "\$remote_dir/bin/\$name" ] && cp -p "\$remote_dir/bin/\$name" "\$backup_dir/bin/\$name"
+  done
+  echo "pre-deploy backup: \$backup_dir"
+fi
 rm -rf "\$tmp"
 if [ -x "/etc/init.d/\$service" ]; then
   "/etc/init.d/\$service" stop >/dev/null 2>&1 || true
