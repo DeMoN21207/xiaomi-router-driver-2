@@ -124,6 +124,98 @@ func TestResolveUsesSingleTimeoutBudget(t *testing.T) {
 	}
 }
 
+func TestResolveFallsBackToPlainDNSWhenDoHFails(t *testing.T) {
+	query := testDNSQuery()
+	fallbackCalls := 0
+	server := &Server{
+		upstreams:  []string{"https://broken/dns-query"},
+		fallbacks:  []string{"1.1.1.1:53"},
+		timeout:    100 * time.Millisecond,
+		maxMessage: defaultMaxMessage,
+		querySlots: make(chan struct{}, 2),
+		plainResolve: func(_ context.Context, server string, got []byte) ([]byte, error) {
+			fallbackCalls++
+			if server != "1.1.1.1:53" || !bytes.Equal(got, query) {
+				t.Fatalf("fallback request = %s / %x", server, got)
+			}
+			return got, nil
+		},
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("doh unavailable")
+		})},
+	}
+
+	response, err := server.resolve(context.Background(), query)
+	if err != nil {
+		t.Fatalf("resolve() error = %v", err)
+	}
+	if fallbackCalls != 1 || !bytes.Equal(response, query) {
+		t.Fatalf("fallback response = %x, calls=%d", response, fallbackCalls)
+	}
+}
+
+func TestResolveLimitsConcurrentQueries(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := &Server{
+		upstreams:  []string{"https://slow/dns-query"},
+		timeout:    time.Second,
+		maxMessage: defaultMaxMessage,
+		querySlots: make(chan struct{}, 1),
+		client: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			select {
+			case <-release:
+				return dnsHTTPResponse(testDNSQuery()), nil
+			case <-request.Context().Done():
+				return nil, request.Context().Err()
+			}
+		})},
+	}
+	firstDone := make(chan error, 1)
+	go func() { _, err := server.resolve(context.Background(), testDNSQuery()); firstDone <- err }()
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := server.resolve(ctx, testDNSQuery()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second resolve error = %v, want deadline exceeded", err)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResolveOpensDoHCircuitAfterRepeatedFailures(t *testing.T) {
+	dohCalls := 0
+	server := &Server{
+		upstreams:  []string{"https://broken/dns-query"},
+		fallbacks:  []string{"1.1.1.1:53"},
+		timeout:    100 * time.Millisecond,
+		maxMessage: defaultMaxMessage,
+		querySlots: make(chan struct{}, 2),
+		plainResolve: func(_ context.Context, _ string, query []byte) ([]byte, error) {
+			return query, nil
+		},
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			dohCalls++
+			return nil, errors.New("doh unavailable")
+		})},
+	}
+	for index := 0; index < dohFailureThreshold+1; index++ {
+		if _, err := server.resolve(context.Background(), testDNSQuery()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if dohCalls != dohFailureThreshold {
+		t.Fatalf("DoH calls = %d, want circuit to open after %d", dohCalls, dohFailureThreshold)
+	}
+}
+
 func TestHandleTCPConnRefreshesDeadlinesBetweenQueries(t *testing.T) {
 	query := testDNSQuery()
 	serverConn, clientConn := net.Pipe()

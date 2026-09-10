@@ -22,6 +22,9 @@ const (
 	defaultTimeout             = 8 * time.Second
 	defaultMaxMessage          = 65535
 	defaultMaxIdleConnsPerHost = 8
+	defaultMaxConcurrent       = 64
+	dohFailureThreshold        = 3
+	dohCircuitCooldown         = 30 * time.Second
 )
 
 var defaultUpstreams = []string{
@@ -29,23 +32,34 @@ var defaultUpstreams = []string{
 	"https://dns.google/dns-query",
 }
 
+var defaultFallbacks = []string{"1.1.1.1:53", "8.8.8.8:53"}
+
 type Config struct {
-	Addr       string
-	Upstreams  []string
-	Timeout    time.Duration
-	MaxMessage int
+	Addr          string
+	Upstreams     []string
+	Timeout       time.Duration
+	MaxMessage    int
+	MaxConcurrent int
+	Fallbacks     []string
 }
 
 type Server struct {
-	addr       string
-	upstreams  []string
-	timeout    time.Duration
-	maxMessage int
-	client     *http.Client
-	udpConn    net.PacketConn
-	tcpLn      net.Listener
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	addr         string
+	upstreams    []string
+	timeout      time.Duration
+	maxMessage   int
+	client       *http.Client
+	fallbacks    []string
+	querySlots   chan struct{}
+	slotOnce     sync.Once
+	plainResolve func(context.Context, string, []byte) ([]byte, error)
+	dohMu        sync.Mutex
+	dohFailures  int
+	dohOpenUntil time.Time
+	udpConn      net.PacketConn
+	tcpLn        net.Listener
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
 }
 
 type resolveResult struct {
@@ -91,12 +105,18 @@ func ConfigFromEnv() Config {
 			timeout = time.Duration(seconds) * time.Second
 		}
 	}
+	fallbacks := splitList(os.Getenv("VPN_MANAGER_DNS_PROXY_FALLBACKS"))
+	if len(fallbacks) == 0 {
+		fallbacks = append([]string(nil), defaultFallbacks...)
+	}
 
 	return Config{
-		Addr:       addr,
-		Upstreams:  upstreams,
-		Timeout:    timeout,
-		MaxMessage: defaultMaxMessage,
+		Addr:          addr,
+		Upstreams:     upstreams,
+		Timeout:       timeout,
+		MaxMessage:    defaultMaxMessage,
+		MaxConcurrent: resolvePositiveIntEnv("VPN_MANAGER_DNS_PROXY_MAX_CONCURRENT", defaultMaxConcurrent),
+		Fallbacks:     fallbacks,
 	}
 }
 
@@ -115,6 +135,9 @@ func New(config Config) (*Server, error) {
 			Timeout:   config.Timeout,
 			Transport: transport,
 		},
+		fallbacks:    append([]string(nil), config.Fallbacks...),
+		querySlots:   make(chan struct{}, config.MaxConcurrent),
+		plainResolve: resolvePlainDNS,
 	}, nil
 }
 
@@ -206,10 +229,17 @@ func (s *Server) serveUDP(ctx context.Context) {
 		}
 
 		query := append([]byte(nil), buffer[:n]...)
+		if !s.tryAcquireQuerySlot() {
+			if response := servFailResponse(query); len(response) > 0 {
+				_, _ = s.udpConn.WriteTo(response, remoteAddr)
+			}
+			continue
+		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			response := s.resolveOrServFail(ctx, query)
+			defer s.releaseQuerySlot()
+			response := s.resolveOrServFailWithinSlot(ctx, query)
 			if len(response) == 0 {
 				return
 			}
@@ -298,9 +328,31 @@ func (s *Server) resolveOrServFail(ctx context.Context, query []byte) []byte {
 	return servFailResponse(query)
 }
 
+func (s *Server) resolveOrServFailWithinSlot(ctx context.Context, query []byte) []byte {
+	response, err := s.resolveWithinSlot(ctx, query)
+	if err == nil {
+		return response
+	}
+	if ctx.Err() == nil {
+		log.Printf("dns proxy query failed: %v", err)
+	}
+	return servFailResponse(query)
+}
+
 func (s *Server) resolve(ctx context.Context, query []byte) ([]byte, error) {
+	if err := s.acquireQuerySlot(ctx); err != nil {
+		return nil, err
+	}
+	defer s.releaseQuerySlot()
+	return s.resolveWithinSlot(ctx, query)
+}
+
+func (s *Server) resolveWithinSlot(ctx context.Context, query []byte) ([]byte, error) {
+	if s.dohCircuitOpen(time.Now()) {
+		return s.resolveFallback(ctx, query, errors.New("DNS-over-HTTPS circuit is open"))
+	}
 	if len(s.upstreams) == 0 {
-		return nil, errors.New("no DNS-over-HTTPS upstreams configured")
+		return s.resolveFallback(ctx, query, errors.New("no DNS-over-HTTPS upstreams configured"))
 	}
 
 	queryCtx, cancel := s.withQueryTimeout(ctx)
@@ -323,9 +375,11 @@ func (s *Server) resolve(ctx context.Context, query []byte) ([]byte, error) {
 		select {
 		case <-queryCtx.Done():
 			errs = append(errs, queryCtx.Err())
+			s.recordDoHFailure(time.Now())
 			return nil, errors.Join(errs...)
 		case result := <-results:
 			if result.err == nil {
+				s.recordDoHSuccess()
 				raceCancel()
 				return result.response, nil
 			}
@@ -333,7 +387,114 @@ func (s *Server) resolve(ctx context.Context, query []byte) ([]byte, error) {
 		}
 	}
 
+	s.recordDoHFailure(time.Now())
+	return s.resolveFallback(queryCtx, query, errors.Join(errs...))
+}
+
+func (s *Server) dohCircuitOpen(now time.Time) bool {
+	s.dohMu.Lock()
+	defer s.dohMu.Unlock()
+	if s.dohOpenUntil.IsZero() {
+		return false
+	}
+	if now.Before(s.dohOpenUntil) {
+		return true
+	}
+	s.dohOpenUntil = time.Time{}
+	s.dohFailures = 0
+	return false
+}
+
+func (s *Server) recordDoHSuccess() {
+	s.dohMu.Lock()
+	s.dohFailures = 0
+	s.dohOpenUntil = time.Time{}
+	s.dohMu.Unlock()
+}
+
+func (s *Server) recordDoHFailure(now time.Time) {
+	s.dohMu.Lock()
+	defer s.dohMu.Unlock()
+	s.dohFailures++
+	if s.dohFailures >= dohFailureThreshold {
+		s.dohOpenUntil = now.Add(dohCircuitCooldown)
+	}
+}
+
+func (s *Server) resolveFallback(ctx context.Context, query []byte, dohErr error) ([]byte, error) {
+	resolver := s.plainResolve
+	if resolver == nil {
+		resolver = resolvePlainDNS
+	}
+	errs := []error{dohErr}
+	for _, fallback := range s.fallbacks {
+		response, err := resolver(ctx, fallback, query)
+		if err == nil {
+			return response, nil
+		}
+		errs = append(errs, fmt.Errorf("fallback %s: %w", fallback, err))
+	}
 	return nil, errors.Join(errs...)
+}
+
+func (s *Server) acquireQuerySlot(ctx context.Context) error {
+	s.ensureQuerySlots()
+	select {
+	case s.querySlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) tryAcquireQuerySlot() bool {
+	s.ensureQuerySlots()
+	select {
+	case s.querySlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) releaseQuerySlot() {
+	<-s.querySlots
+}
+
+func (s *Server) ensureQuerySlots() {
+	s.slotOnce.Do(func() {
+		if s.querySlots == nil {
+			s.querySlots = make(chan struct{}, defaultMaxConcurrent)
+		}
+	})
+}
+
+func resolvePlainDNS(ctx context.Context, server string, query []byte) ([]byte, error) {
+	if _, _, err := net.SplitHostPort(server); err != nil {
+		server = net.JoinHostPort(server, "53")
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "udp", server)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	deadline := time.Now().Add(defaultTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+	if _, err := conn.Write(query); err != nil {
+		return nil, err
+	}
+	response := make([]byte, defaultMaxMessage)
+	n, err := conn.Read(response)
+	if err != nil {
+		return nil, err
+	}
+	if n < 12 || len(query) < 2 || response[0] != query[0] || response[1] != query[1] {
+		return nil, errors.New("invalid plain DNS response")
+	}
+	return append([]byte(nil), response[:n]...), nil
 }
 
 func (s *Server) resolveOnce(ctx context.Context, upstream string, query []byte) ([]byte, error) {
@@ -431,8 +592,46 @@ func normalizeConfig(config Config) Config {
 	if config.MaxMessage <= 0 || config.MaxMessage > defaultMaxMessage {
 		config.MaxMessage = defaultMaxMessage
 	}
+	if config.MaxConcurrent <= 0 {
+		config.MaxConcurrent = defaultMaxConcurrent
+	}
+	if config.MaxConcurrent > 1024 {
+		config.MaxConcurrent = 1024
+	}
+	config.Fallbacks = normalizeFallbacks(config.Fallbacks)
+	if len(config.Fallbacks) == 0 {
+		config.Fallbacks = append([]string(nil), defaultFallbacks...)
+	}
 
 	return config
+}
+
+func normalizeFallbacks(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(value); err != nil {
+			value = net.JoinHostPort(strings.Trim(value, "[]"), "53")
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func resolvePositiveIntEnv(name string, fallback int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
 }
 
 func normalizeUpstreams(upstreams []string) []string {
