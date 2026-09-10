@@ -205,8 +205,8 @@
 - Produces: tested ARM64 router bundle and documented rollback point.
 - Consumes: all previous tasks.
 
-- [ ] Run `go test -race ./...`, `go vet ./...`, frontend tests/build, shell syntax checks, and `git diff --check`.
-- [ ] Build with `package_router.sh` and verify bundle metadata and executable architecture.
-- [ ] Create a router backup and deploy with `deploy_router.sh`.
-- [ ] Verify process uniqueness, database check, WAN state, DNS health, apply operation, protected endpoints, traffic UI, and automatic recovery on the live router.
-- [ ] Merge the feature branch into `main`, regenerate the committed bundle from the clean source commit, push `origin/main`, and verify local/remote/router commit identities.
+- [x] Run `go test -race ./...`, `go vet ./...`, frontend tests/build, shell syntax checks, and `git diff --check`.
+- [x] Build with `package_router.sh` and verify bundle metadata and executable architecture.
+- [x] Create a router backup and deploy with `deploy_router.sh`.
+- [x] Verify process uniqueness, database check, WAN state, DNS health, apply operation, protected endpoints, traffic UI, and automatic recovery on the live router.
+- [x] Merge the feature branch into `main`, regenerate the committed bundle from the clean source commit, push `origin/main`, and verify local/remote/router commit identities.

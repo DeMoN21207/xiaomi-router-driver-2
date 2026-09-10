@@ -13,3 +13,11 @@ SQLite использует `synchronous=FULL`, 15-секундный busy timeo
 Изменяющие API-запросы можно защитить Bearer-токеном через `VPN_MANAGER_API_TOKEN` или файл `data/api-token`. Тело запроса ограничено 128 МиБ. DNS-прокси ограничивает параллелизм, использует прямой Do53 fallback и circuit breaker; его состояние видно в `/api/status`.
 
 Для новой установки включены сервис и автовосстановление. Минимальный период обновления панели — пять секунд, обычные быстрые GET не пишутся в лог, а `doctor` проверяет целостность базы, backup, место, watchdog, update journal и PID владельца процесса.
+
+## Проверка
+
+- `go test -race ./...`, `go vet ./...`, frontend tests/build и shell syntax прошли 10 сентября 2026 года.
+- На роутер установлен ARM64 bundle исходного commit `818121b`; внешний backup: `/mnt/usb-4d3e56cb/vpn-manager.backups/predeploy-20260910-124656`.
+- Live `doctor` подтвердил SQLite `quick_check` и backup; WAN — `up` через `pppoe-wan`, DNS proxy — `healthy`.
+- Фоновое применение 159 доменов завершилось успешно за 92 секунды.
+- После `SIGTERM` watchdog заменил PID `9182` на `4225`; остался один процесс с ожидаемым executable.
