@@ -78,7 +78,7 @@ func RoutingLoadProfileTuningFor(profile string) RoutingLoadProfileTuning {
 			IPSetTimeout:                86400,
 			ConntrackFlushOnApply:       true,
 			DomainTrafficSampleInterval: 120 * time.Second,
-			SiteTrafficSampleInterval:   0,
+			SiteTrafficSampleInterval:   120 * time.Second,
 			DomainHealthInitialSample:   false,
 			DomainHealthSampleInterval:  24 * time.Hour,
 		}

@@ -320,6 +320,17 @@ func TestSiteTrafficStoreListDevicesSupportsSearchPaginationAndOptions(t *testin
 		t.Fatalf("expected 2 device options, got %d", len(result.Options))
 	}
 
+	withoutSites, err := store.ListDevices("all", "bytes", "", "", "", 1, 1, 0)
+	if err != nil {
+		t.Fatalf("ListDevices() without sites error = %v", err)
+	}
+	if len(withoutSites.Devices) != 1 {
+		t.Fatalf("expected one paged device without sites, got %d", len(withoutSites.Devices))
+	}
+	if len(withoutSites.Devices[0].Sites) != 0 {
+		t.Fatalf("expected siteLimit 0 to omit nested sites, got %d", len(withoutSites.Devices[0].Sites))
+	}
+
 	filtered, err := store.ListDevices("tunneled", "name", "", "", "chatgpt", 1, 10, 10)
 	if err != nil {
 		t.Fatalf("ListDevices() with search error = %v", err)

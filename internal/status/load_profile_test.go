@@ -74,7 +74,7 @@ func TestServiceEffectiveIntervalsFollowRoutingLoadProfile(t *testing.T) {
 		t.Fatalf("Save() error = %v", err)
 	}
 
-	if got := service.effectiveSiteTrafficSampleInterval(); got != 0 {
-		t.Fatalf("expected normal profile to keep site observer disabled, got %v", got)
+	if got := service.effectiveSiteTrafficSampleInterval(); got != 120*time.Second {
+		t.Fatalf("expected normal profile site observer interval 120s, got %v", got)
 	}
 }

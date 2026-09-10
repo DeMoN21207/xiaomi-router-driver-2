@@ -1143,6 +1143,7 @@ Object.assign(translations.en, {
 
 Object.assign(translations.ru, {
   "trafficStats.updated": "Обновлено",
+  "trafficStats.refreshSuccess": "Данные о трафике обновлены",
   "trafficStats.addToProxyTitle": "Добавить в проксирование",
   "trafficStats.addToProxyHint": "Выберите маршрут, в который добавить запись. Она появится в списке доменов и сразу применится.",
   "trafficStats.addToProxyTarget": "Что добавляем",
@@ -1159,6 +1160,7 @@ Object.assign(translations.ru, {
 
 Object.assign(translations.en, {
   "trafficStats.updated": "Last seen",
+  "trafficStats.refreshSuccess": "Traffic data refreshed",
   "trafficStats.addToProxyTitle": "Add to proxy",
   "trafficStats.addToProxyHint": "Pick a route to attach this entry to. It will appear in the route's domain list and apply immediately.",
   "trafficStats.addToProxyTarget": "What to add",

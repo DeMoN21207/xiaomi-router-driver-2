@@ -27,7 +27,7 @@ func TestRoutingLoadProfileTuningFor(t *testing.T) {
 	}
 
 	normal := RoutingLoadProfileTuningFor(RoutingLoadProfileNormal)
-	if normal.DomainStatsMode != "auto" || normal.DomainTrafficSampleInterval != 120*time.Second || normal.SiteTrafficSampleInterval != 0 {
+	if normal.DomainStatsMode != "auto" || normal.DomainTrafficSampleInterval != 120*time.Second || normal.SiteTrafficSampleInterval != 120*time.Second {
 		t.Fatalf("unexpected normal tuning: %+v", normal)
 	}
 	if normal.PrimeMaxDomains != 512 || normal.IPSetTimeout != 86400 || !normal.ConntrackFlushOnApply {

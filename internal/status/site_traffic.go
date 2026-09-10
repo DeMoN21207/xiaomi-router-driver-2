@@ -1555,6 +1555,11 @@ func (s *siteTrafficStore) ListDevices(scope string, sortBy string, order string
 	}
 
 	for i := range devices {
+		if siteLimit <= 0 {
+			devices[i].Sites = []DeviceTrafficSiteStat{}
+			continue
+		}
+
 		sitesQuery := `SELECT domain, bytes, packets, updated_at, last_ip, via_tunnel, route_label FROM device_site_traffic WHERE source_ip = ?`
 		switch strings.TrimSpace(scope) {
 		case "tunneled":

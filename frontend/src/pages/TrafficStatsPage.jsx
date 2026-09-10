@@ -33,6 +33,7 @@ export default function TrafficStatsPage() {
   const [deviceHistoryTo, setDeviceHistoryTo] = useState("");
   const [resetting, setResetting] = useState(false);
   const [collecting, setCollecting] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [autoRefreshMs, setAutoRefreshMs] = useState(() => readDashboardRefreshInterval());
   const [routesConfig, setRoutesConfig] = useState(null);
   const [addToProxy, setAddToProxy] = useState(null);
@@ -156,14 +157,30 @@ export default function TrafficStatsPage() {
       setSelectedDeviceData(selectedDeviceResult);
       setDeviceHistoryData(deviceHistoryResult);
       setError("");
+      return { ok: true };
     } catch (err) {
       setError(err.message);
+      return { ok: false, error: err };
     } finally {
       if (initial) {
         setLoading(false);
       }
     }
   }, [buildDeviceHistoryURL, buildDevicesURL, buildSelectedDeviceURL, buildSitesURL, selectedDeviceIp]);
+
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const result = await refresh(false);
+      if (result.ok) {
+        showToast(t("trafficStats.refreshSuccess"));
+      } else {
+        showToast(result.error.message, true);
+      }
+    } finally {
+      setRefreshing(false);
+    }
+  }, [refresh, showToast, t]);
 
   useEffect(() => {
     const initial = initialLoadRef.current;
@@ -417,12 +434,12 @@ export default function TrafficStatsPage() {
           </span>
           <button
             type="button"
-            onClick={() => refresh(false)}
-            disabled={loading || collecting}
+            onClick={handleRefresh}
+            disabled={loading || collecting || refreshing}
             className="flex items-center gap-2 rounded-xl border border-outline-variant/30 bg-surface-container-high px-5 py-2.5 font-headline text-sm font-medium text-on-surface transition-colors hover:bg-surface-variant disabled:opacity-50"
           >
-            <Icon name="refresh" className="h-4 w-4 text-primary" />
-            {t("dashboard.refresh")}
+            <Icon name="refresh" className={`h-4 w-4 text-primary${refreshing ? " animate-spin" : ""}`} />
+            {refreshing ? t("dashboard.refreshing") : t("dashboard.refresh")}
           </button>
           <button
             type="button"
