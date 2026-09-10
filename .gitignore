@@ -1,5 +1,6 @@
 .claude/
 .tools/
+.worktrees/
 .DS_Store
 deploy_router.bat
 deploy_router.local.cmd
