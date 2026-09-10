@@ -9,6 +9,7 @@ import (
 	"xiomi-router-driver/internal/config"
 	"xiomi-router-driver/internal/sqlitedb"
 	"xiomi-router-driver/internal/status"
+	"xiomi-router-driver/internal/subscription"
 )
 
 type recoveryStatusFixture struct {
@@ -57,5 +58,46 @@ func TestTickRecoversMissingVPNRuntimeWhileWANProbeIsDown(t *testing.T) {
 
 	if applied != 1 {
 		t.Fatalf("runtime recovery apply count = %d, want 1", applied)
+	}
+}
+
+func TestTickAcceptsRunningPriorityDefaultRuntime(t *testing.T) {
+	db, err := sqlitedb.Open(filepath.Join(t.TempDir(), "vpn-manager.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	manager := config.NewManager(db, "")
+	state := config.DefaultState()
+	state.Automation.AutoRecover = true
+	state.Automation.ProviderFailover = false
+	state.Providers = []config.Provider{{ID: "vpn", Name: "VPN", Type: config.ProviderTypeSubscription, Enabled: true}}
+	state.Rules = []config.Rule{{ID: "rule", Name: "Rule", ProviderID: "vpn", SelectedLocation: "Netherlands", Domains: []string{"example.com"}, Enabled: true}}
+	state.PriorityPolicies = []config.PriorityPolicy{{
+		ID: "priority", ProviderID: "vpn", Name: "Priority", Enabled: true,
+		Targets: []config.PriorityTarget{{Location: "Germany"}, {Location: "Netherlands"}},
+	}}
+	if _, err := manager.Save(state); err != nil {
+		t.Fatal(err)
+	}
+
+	applied := 0
+	supervisor := NewSupervisor(manager, recoveryStatusFixture{
+		snapshot: status.Snapshot{
+			WAN: status.WANStatus{State: "down"},
+			SubscriptionRuntime: []subscription.RuntimeSnapshot{{
+				Key: "vpn::germany", Location: "Germany", Status: "running",
+			}},
+		},
+	}, func(context.Context) error { applied++; return nil }, func(context.Context, config.State) error {
+		applied++
+		return nil
+	}, nil, t.TempDir())
+	supervisor.lastWAN = "down"
+
+	supervisor.tick(context.Background())
+
+	if applied != 0 {
+		t.Fatalf("priority default runtime triggered %d recovery applies, want 0", applied)
 	}
 }

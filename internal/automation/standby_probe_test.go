@@ -25,7 +25,9 @@ func TestStandbyProbeReapsProcessWhenListenerNeverStarts(t *testing.T) {
 	if err := os.WriteFile(binary, []byte(fmt.Sprintf("#!/bin/sh\necho $$ > '%s'\nexec sleep 60\n", marker)), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	// Process startup can be delayed when all Go packages run concurrently on a
+	// busy builder. Keep the test bounded while allowing the helper shell to run.
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 	go func() {
 		ticker := time.NewTicker(5 * time.Millisecond)
@@ -48,7 +50,7 @@ func TestStandbyProbeReapsProcessWhenListenerNeverStarts(t *testing.T) {
 	}
 	raw, err := os.ReadFile(marker)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read standby process marker after %q: %v", result.Detail, err)
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
 	if err != nil {

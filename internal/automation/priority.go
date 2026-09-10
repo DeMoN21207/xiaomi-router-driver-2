@@ -206,6 +206,9 @@ func (s *Supervisor) maybePriorityPoliciesLocked(ctx context.Context, state conf
 func (s *Supervisor) priorityAppliedState(state config.State) config.State {
 	s.priorityMu.RLock()
 	defer s.priorityMu.RUnlock()
+	if len(s.priority.decisions) == 0 {
+		return ApplyPriorityDefaults(state, time.Now())
+	}
 	return buildPriorityAppliedStateFromDecisions(state, s.priority.decisions)
 }
 
