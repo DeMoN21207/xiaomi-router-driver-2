@@ -47,7 +47,7 @@ func TestUpdateStatusEndpoint(t *testing.T) {
 		AppDir:  tempDir,
 		DataDir: tempDir + "/data",
 		State:   stateManager,
-		Restart: func() {},
+		Restart: func(update.InstallResult) {},
 	})
 	handler := NewHandler(Dependencies{
 		State:   stateManager,
@@ -76,7 +76,7 @@ func TestUpdateUploadRejectsNonLinux(t *testing.T) {
 		DataDir:   tempDir + "/data",
 		State:     stateManager,
 		RuntimeOS: "darwin",
-		Restart:   func() {},
+		Restart:   func(update.InstallResult) {},
 	})
 	handler := NewHandler(Dependencies{
 		State:   stateManager,

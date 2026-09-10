@@ -66,6 +66,46 @@ func RecoverInterruptedUpdate(appDir string) error {
 	return tx.rollback()
 }
 
+// RestoreRuntimeBackup atomically replaces the active runtime with a backup
+// after the newly installed executable could not be started.
+func RestoreRuntimeBackup(appDir string, backupDir string) error {
+	appDir = filepath.Clean(strings.TrimSpace(appDir))
+	backupDir = filepath.Clean(strings.TrimSpace(backupDir))
+	if appDir == "." || backupDir == "." {
+		return errors.New("restore runtime backup: application and backup directories are required")
+	}
+	if err := RecoverInterruptedUpdate(appDir); err != nil {
+		return err
+	}
+	if err := validateRuntimeSource(backupDir); err != nil {
+		return fmt.Errorf("restore runtime backup: %w", err)
+	}
+	tx, err := beginRuntimeTransaction(appDir, backupDir, "")
+	if err != nil {
+		return err
+	}
+	if err := tx.apply(); err != nil {
+		return err
+	}
+	for _, name := range executableBundlePaths {
+		_ = os.Chmod(filepath.Join(appDir, name), 0o755)
+	}
+	return tx.commit()
+}
+
+func validateRuntimeSource(root string) error {
+	for _, name := range executableBundlePaths {
+		info, err := os.Stat(filepath.Join(root, name))
+		if err != nil {
+			return fmt.Errorf("required runtime path %s: %w", name, err)
+		}
+		if name == "vpn-manager" && !info.Mode().IsRegular() {
+			return fmt.Errorf("runtime binary %s is not a regular file", name)
+		}
+	}
+	return nil
+}
+
 func beginRuntimeTransaction(appDir string, bundleRoot string, backupDir string) (*runtimeTransaction, error) {
 	if err := RecoverInterruptedUpdate(appDir); err != nil {
 		return nil, err

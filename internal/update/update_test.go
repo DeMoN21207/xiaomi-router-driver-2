@@ -10,6 +10,25 @@ import (
 	"time"
 )
 
+func TestScheduleRestartDeliversInstallResult(t *testing.T) {
+	restarts := make(chan InstallResult, 1)
+	manager := NewManager(Options{Restart: func(result InstallResult) {
+		restarts <- result
+	}})
+	want := InstallResult{Status: "installed", BackupDir: "/backup"}
+
+	manager.scheduleRestart(want)
+
+	select {
+	case got := <-restarts:
+		if got.Status != want.Status || got.BackupDir != want.BackupDir {
+			t.Fatalf("restart result = %+v, want %+v", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("restart callback was not invoked")
+	}
+}
+
 func TestSelectAssetMatchesPattern(t *testing.T) {
 	release := GitHubRelease{
 		TagName: "v1.2.3",
@@ -103,7 +122,7 @@ func TestManagerRejectsConcurrentOperation(t *testing.T) {
 	manager := NewManager(Options{
 		AppDir:  t.TempDir(),
 		DataDir: t.TempDir(),
-		Restart: func() {},
+		Restart: func(InstallResult) {},
 	})
 
 	finish, err := manager.beginOperation("install")

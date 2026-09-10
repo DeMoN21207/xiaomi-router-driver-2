@@ -26,7 +26,7 @@ type Options struct {
 	State       *config.Manager
 	HTTPClient  *http.Client
 	RecordEvent func(level string, kind string, message string)
-	Restart     func()
+	Restart     func(InstallResult)
 	RuntimeOS   string
 }
 
@@ -45,7 +45,7 @@ type Manager struct {
 	state       *config.Manager
 	recordEvent func(level string, kind string, message string)
 	httpClient  *http.Client
-	restart     func()
+	restart     func(InstallResult)
 	runtimeOS   string
 
 	mu        sync.Mutex
@@ -84,7 +84,7 @@ func NewManager(options Options) *Manager {
 	}
 	restart := options.Restart
 	if restart == nil {
-		restart = func() {}
+		restart = func(InstallResult) {}
 	}
 	runtimeOS := strings.TrimSpace(options.RuntimeOS)
 	if runtimeOS == "" {
@@ -210,7 +210,7 @@ func (m *Manager) InstallLatest(ctx context.Context) (InstallResult, error) {
 		return InstallResult{}, err
 	}
 	m.record("info", "update.installed", fmt.Sprintf("Update installed from %s", candidate.AssetName))
-	m.scheduleRestart()
+	m.scheduleRestart(result)
 	return result, nil
 }
 
@@ -243,7 +243,7 @@ func (m *Manager) InstallUploaded(ctx context.Context, reader io.Reader, filenam
 		return InstallResult{}, err
 	}
 	m.record("info", "update.upload_installed", fmt.Sprintf("Update installed from uploaded archive %s", filepath.Base(filename)))
-	m.scheduleRestart()
+	m.scheduleRestart(result)
 	return result, nil
 }
 
@@ -456,10 +456,10 @@ func (m *Manager) newUpdateWorkDir() (string, error) {
 	return dir, nil
 }
 
-func (m *Manager) scheduleRestart() {
+func (m *Manager) scheduleRestart(result InstallResult) {
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		m.restart()
+		m.restart(result)
 	}()
 }
 

@@ -6,9 +6,11 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"xiomi-router-driver/internal/api"
@@ -19,6 +21,7 @@ import (
 	"xiomi-router-driver/internal/doctor"
 	"xiomi-router-driver/internal/domains"
 	"xiomi-router-driver/internal/events"
+	"xiomi-router-driver/internal/lifecycle"
 	"xiomi-router-driver/internal/openvpn"
 	"xiomi-router-driver/internal/routing"
 	"xiomi-router-driver/internal/sqlitedb"
@@ -48,12 +51,16 @@ func main() {
 	if err := appdir.EnsureDataLayout(paths); err != nil {
 		log.Fatalf("prepare data directory layout: %v", err)
 	}
+	if err := update.RecoverInterruptedUpdate(paths.AppDir); err != nil {
+		log.Fatalf("recover interrupted update: %v", err)
+	}
+	rootCtx, cancelWorkers := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancelWorkers()
 	dbPath := filepath.Join(paths.DataDir, "vpn-manager.db")
 	db, err := sqlitedb.Open(dbPath)
 	if err != nil {
 		log.Fatalf("open sqlite database: %v", err)
 	}
-	defer db.Close()
 
 	port := os.Getenv("VPN_MANAGER_PORT")
 	if port == "" {
@@ -66,12 +73,13 @@ func main() {
 	}
 
 	dnsProxyServer := ""
+	var dnsProxy *dnsproxy.Server
 	if dnsproxy.EnabledFromEnv() {
-		proxy, err := dnsproxy.Start(context.Background(), dnsproxy.ConfigFromEnv())
+		proxy, err := dnsproxy.Start(rootCtx, dnsproxy.ConfigFromEnv())
 		if err != nil {
 			log.Printf("dns proxy disabled: %v", err)
 		} else {
-			defer proxy.Close()
+			dnsProxy = proxy
 			dnsProxyServer = proxy.DnsmasqServer()
 			log.Printf("dns proxy listening on %s for routed domains", dnsProxyServer)
 		}
@@ -88,13 +96,17 @@ func main() {
 	automationManager := automation.NewManager(paths.AppDir, executablePath, port)
 	openvpnManager := openvpn.NewManager(paths.AppDir, paths.DataDir, db, routingRunner, recordEvent)
 	subscriptionManager := subscription.NewManager(paths.AppDir, paths.DataDir, db, routingRunner, recordEvent)
+	restartRequests := make(chan update.InstallResult, 1)
 	updateManager := update.NewManager(update.Options{
 		AppDir:      paths.AppDir,
 		DataDir:     paths.DataDir,
 		State:       stateManager,
 		RecordEvent: recordEvent,
-		Restart: func() {
-			restartSelf(paths.AppDir, filepath.Base(executablePath), port)
+		Restart: func(result update.InstallResult) {
+			select {
+			case restartRequests <- result:
+			default:
+			}
 		},
 	})
 	statusService := status.NewService(
@@ -140,11 +152,19 @@ func main() {
 	supervisor := automation.NewSupervisor(stateManager, statusService, apiHandler.ApplyCurrentRules, apiHandler.ApplyRulesFromState, recordEvent, paths.DataDir)
 	apiHandler.SetFailoverStatusProvider(supervisor.FailoverStatus)
 	apiHandler.SetPriorityRuntime(supervisor.PriorityStatus, supervisor.SetPriorityOverride, supervisor.ClearPriorityOverride, supervisor.ApplyPriorityPolicies)
-	go supervisor.Run(context.Background())
-	go statusService.RunTrafficSampler(context.Background())
-	go statusService.RunDomainTrafficSampler(context.Background())
-	go statusService.RunDomainHealthSampler(context.Background())
-	go statusService.RunSiteTrafficSampler(context.Background())
+	var workers sync.WaitGroup
+	startWorker := func(run func(context.Context)) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			run(rootCtx)
+		}()
+	}
+	startWorker(supervisor.Run)
+	startWorker(statusService.RunTrafficSampler)
+	startWorker(statusService.RunDomainTrafficSampler)
+	startWorker(statusService.RunDomainHealthSampler)
+	startWorker(statusService.RunSiteTrafficSampler)
 
 	staticFS, err := fs.Sub(ui.Files, "static")
 	if err != nil {
@@ -181,8 +201,57 @@ func main() {
 	}
 
 	log.Printf("vpn-manager listening on http://0.0.0.0:%s", port)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+	serverErrors := make(chan error, 1)
+	go func() {
+		err := server.ListenAndServe()
+		if err == http.ErrServerClosed {
+			err = nil
+		}
+		serverErrors <- err
+	}()
+
+	var restartResult *update.InstallResult
+	var serveErr error
+	select {
+	case <-rootCtx.Done():
+	case result := <-restartRequests:
+		restartResult = &result
+	case serveErr = <-serverErrors:
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer shutdownCancel()
+	if err := lifecycle.Shutdown(shutdownCtx, lifecycle.ShutdownHooks{
+		CancelWorkers: cancelWorkers,
+		ShutdownHTTP:  server.Shutdown,
+		CloseDNS: func() error {
+			if dnsProxy == nil {
+				return nil
+			}
+			return dnsProxy.Close()
+		},
+		WaitWorkers: workers.Wait,
+		CheckpointDB: func() error {
+			_, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+			return err
+		},
+		CloseDB: db.Close,
+	}); err != nil {
+		log.Printf("graceful shutdown: %v", err)
+	}
+	if serveErr != nil {
+		log.Fatalf("HTTP server stopped: %v", serveErr)
+	}
+	if restartResult != nil {
+		env := setEnvironment(os.Environ(), "VPN_MANAGER_ROOT", paths.AppDir)
+		env = setEnvironment(env, "VPN_MANAGER_PORT", port)
+		binaryPath := filepath.Join(paths.AppDir, filepath.Base(executablePath))
+		if err := lifecycle.ExecWithRollback(lifecycle.RestartHooks{
+			Exec:    syscall.Exec,
+			Restore: update.RestoreRuntimeBackup,
+		}, paths.AppDir, restartResult.BackupDir, binaryPath, os.Args, env); err != nil {
+			log.Fatalf("restart after update: %v", err)
+		}
 	}
 }
 
@@ -194,28 +263,13 @@ func requestLogger(next http.Handler) http.Handler {
 	})
 }
 
-func restartSelf(appDir string, binaryName string, port string) {
-	script := `
-app_dir=$1
-binary=$2
-port=$3
-sleep 1
-cd "$app_dir" || exit 1
-export VPN_MANAGER_ROOT="$app_dir"
-export VPN_MANAGER_PORT="$port"
-export PATH="$app_dir:$app_dir/bin:$app_dir/.vpn-manager/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-if [ -x /sbin/start-stop-daemon ]; then
-  /sbin/start-stop-daemon -K -q -p "/tmp/$binary.pid" 2>/dev/null || true
-  rm -f "/tmp/$binary.pid"
-  /sbin/start-stop-daemon -S -q -b -m -p "/tmp/$binary.pid" -x "./$binary"
-else
-  "./$binary" >"/tmp/$binary.log" 2>&1 </dev/null &
-fi
-`
-	cmd := exec.Command("/bin/sh", "-c", script, "vpn-manager-restart", appDir, binaryName, port)
-	if err := cmd.Start(); err != nil {
-		log.Printf("schedule restart failed: %v", err)
-		return
+func setEnvironment(environ []string, key string, value string) []string {
+	prefix := key + "="
+	for index, entry := range environ {
+		if strings.HasPrefix(entry, prefix) {
+			environ[index] = prefix + value
+			return environ
+		}
 	}
-	os.Exit(0)
+	return append(environ, prefix+value)
 }

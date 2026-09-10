@@ -1,6 +1,7 @@
 package update
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -51,6 +52,31 @@ func TestRecoverCompletedUpdateKeepsInstalledRuntime(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(appDir, ".update-journal.json")); !os.IsNotExist(err) {
 		t.Fatalf("journal remains after completed update: %v", err)
+	}
+}
+
+func TestRestoreRuntimeBackupReinstallsPreviousRuntime(t *testing.T) {
+	appDir := t.TempDir()
+	backupDir := filepath.Join(appDir, "backups", "update-test")
+	writeFullRuntimeFixture(t, appDir, "broken")
+	writeFullRuntimeFixture(t, backupDir, "stable")
+
+	if err := RestoreRuntimeBackup(appDir, backupDir); err != nil {
+		t.Fatalf("RestoreRuntimeBackup() error = %v", err)
+	}
+
+	if got := readFile(t, filepath.Join(appDir, "vpn-manager")); got != "stable vpn-manager" {
+		t.Fatalf("runtime was not restored, got %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(appDir, updateJournalName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("journal must be removed after restore, stat err=%v", err)
+	}
+}
+
+func writeFullRuntimeFixture(t *testing.T, root string, prefix string) {
+	t.Helper()
+	for _, path := range executableBundlePaths {
+		writeRuntimeFixture(t, filepath.Join(root, path), prefix+" "+filepath.Base(path))
 	}
 }
 
