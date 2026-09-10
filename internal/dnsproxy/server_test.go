@@ -214,6 +214,10 @@ func TestResolveOpensDoHCircuitAfterRepeatedFailures(t *testing.T) {
 	if dohCalls != dohFailureThreshold {
 		t.Fatalf("DoH calls = %d, want circuit to open after %d", dohCalls, dohFailureThreshold)
 	}
+	health := server.Health()
+	if health.State != "fallback" || health.Failures != dohFailureThreshold || health.FallbackSuccesses != dohFailureThreshold+1 {
+		t.Fatalf("Health() = %+v", health)
+	}
 }
 
 func TestHandleTCPConnRefreshesDeadlinesBetweenQueries(t *testing.T) {

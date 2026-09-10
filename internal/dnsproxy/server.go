@@ -44,27 +44,42 @@ type Config struct {
 }
 
 type Server struct {
-	addr         string
-	upstreams    []string
-	timeout      time.Duration
-	maxMessage   int
-	client       *http.Client
-	fallbacks    []string
-	querySlots   chan struct{}
-	slotOnce     sync.Once
-	plainResolve func(context.Context, string, []byte) ([]byte, error)
-	dohMu        sync.Mutex
-	dohFailures  int
-	dohOpenUntil time.Time
-	udpConn      net.PacketConn
-	tcpLn        net.Listener
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
+	addr              string
+	upstreams         []string
+	timeout           time.Duration
+	maxMessage        int
+	client            *http.Client
+	fallbacks         []string
+	querySlots        chan struct{}
+	slotOnce          sync.Once
+	plainResolve      func(context.Context, string, []byte) ([]byte, error)
+	dohMu             sync.Mutex
+	dohFailures       int
+	dohOpenUntil      time.Time
+	fallbackSuccesses uint64
+	lastFallbackAt    time.Time
+	lastError         string
+	udpConn           net.PacketConn
+	tcpLn             net.Listener
+	cancel            context.CancelFunc
+	wg                sync.WaitGroup
 }
 
 type resolveResult struct {
 	response []byte
 	err      error
+}
+
+type Health struct {
+	State             string   `json:"state"`
+	Failures          int      `json:"failures"`
+	OpenUntil         string   `json:"openUntil,omitempty"`
+	InFlight          int      `json:"inFlight"`
+	MaxConcurrent     int      `json:"maxConcurrent"`
+	Fallbacks         []string `json:"fallbacks"`
+	FallbackSuccesses uint64   `json:"fallbackSuccesses"`
+	LastFallbackAt    string   `json:"lastFallbackAt,omitempty"`
+	LastError         string   `json:"lastError,omitempty"`
 }
 
 func EnabledFromEnv() bool {
@@ -212,6 +227,32 @@ func (s *Server) DnsmasqServer() string {
 		host = "127.0.0.1"
 	}
 	return host + "#" + port
+}
+
+func (s *Server) Health() Health {
+	if s == nil {
+		return Health{State: "disabled"}
+	}
+	s.ensureQuerySlots()
+	s.dohMu.Lock()
+	defer s.dohMu.Unlock()
+	state := "healthy"
+	if !s.dohOpenUntil.IsZero() && time.Now().Before(s.dohOpenUntil) {
+		state = "fallback"
+	} else if s.dohFailures > 0 {
+		state = "degraded"
+	}
+	health := Health{
+		State: state, Failures: s.dohFailures, InFlight: len(s.querySlots), MaxConcurrent: cap(s.querySlots),
+		Fallbacks: append([]string(nil), s.fallbacks...), FallbackSuccesses: s.fallbackSuccesses, LastError: s.lastError,
+	}
+	if !s.dohOpenUntil.IsZero() {
+		health.OpenUntil = s.dohOpenUntil.UTC().Format(time.RFC3339)
+	}
+	if !s.lastFallbackAt.IsZero() {
+		health.LastFallbackAt = s.lastFallbackAt.UTC().Format(time.RFC3339)
+	}
+	return health
 }
 
 func (s *Server) serveUDP(ctx context.Context) {
@@ -409,6 +450,7 @@ func (s *Server) recordDoHSuccess() {
 	s.dohMu.Lock()
 	s.dohFailures = 0
 	s.dohOpenUntil = time.Time{}
+	s.lastError = ""
 	s.dohMu.Unlock()
 }
 
@@ -416,6 +458,7 @@ func (s *Server) recordDoHFailure(now time.Time) {
 	s.dohMu.Lock()
 	defer s.dohMu.Unlock()
 	s.dohFailures++
+	s.lastError = "all DNS-over-HTTPS upstreams failed"
 	if s.dohFailures >= dohFailureThreshold {
 		s.dohOpenUntil = now.Add(dohCircuitCooldown)
 	}
@@ -430,6 +473,10 @@ func (s *Server) resolveFallback(ctx context.Context, query []byte, dohErr error
 	for _, fallback := range s.fallbacks {
 		response, err := resolver(ctx, fallback, query)
 		if err == nil {
+			s.dohMu.Lock()
+			s.fallbackSuccesses++
+			s.lastFallbackAt = time.Now()
+			s.dohMu.Unlock()
 			return response, nil
 		}
 		errs = append(errs, fmt.Errorf("fallback %s: %w", fallback, err))

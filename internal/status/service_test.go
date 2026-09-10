@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"xiomi-router-driver/internal/config"
+	"xiomi-router-driver/internal/dnsproxy"
 	"xiomi-router-driver/internal/domains"
 	"xiomi-router-driver/internal/sqlitedb"
 )
@@ -82,6 +83,7 @@ func TestServiceSnapshotIncludesBundleInfo(t *testing.T) {
 	domainsManager := domains.NewManager(db, filepath.Join(dataDir, "domains.list"), filepath.Join(dataDir, "domains.legacy"))
 	service := NewService(stateManager, domainsManager, nil, nil, filepath.Join(dataDir, ".vpn-manager", "update_routes.sh"), tempDir, dataDir, db, filepath.Join(dataDir, "traffic-history.json"))
 	service.uptimePath = uptimePath
+	service.SetDNSProxyHealth(func() dnsproxy.Health { return dnsproxy.Health{State: "fallback", Failures: 3} })
 
 	snapshot, err := service.Snapshot(context.Background())
 	if err != nil {
@@ -107,5 +109,8 @@ func TestServiceSnapshotIncludesBundleInfo(t *testing.T) {
 	}
 	if snapshot.Bundle.DefaultPort != "18080" {
 		t.Fatalf("Bundle.DefaultPort = %q, want 18080", snapshot.Bundle.DefaultPort)
+	}
+	if snapshot.DNSProxy.State != "fallback" || snapshot.DNSProxy.Failures != 3 {
+		t.Fatalf("Snapshot().DNSProxy = %+v", snapshot.DNSProxy)
 	}
 }

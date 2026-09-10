@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"xiomi-router-driver/internal/config"
+	"xiomi-router-driver/internal/dnsproxy"
 	"xiomi-router-driver/internal/domains"
 	"xiomi-router-driver/internal/openvpn"
 	"xiomi-router-driver/internal/runtimebin"
@@ -94,6 +95,7 @@ type Snapshot struct {
 	RuntimeOS           string                         `json:"runtimeOS"`
 	HostName            string                         `json:"hostName"`
 	Bundle              *update.BundleInfo             `json:"bundle,omitempty"`
+	DNSProxy            dnsproxy.Health                `json:"dnsProxy"`
 }
 
 type Service struct {
@@ -124,6 +126,13 @@ type Service struct {
 	domainTrafficSampleInterval time.Duration
 	domainHealthSampleInterval  time.Duration
 	siteTrafficSampleInterval   time.Duration
+	dnsProxyHealth              func() dnsproxy.Health
+}
+
+func (s *Service) SetDNSProxyHealth(provider func() dnsproxy.Health) {
+	if s != nil {
+		s.dnsProxyHealth = provider
+	}
 }
 
 func NewService(
@@ -256,6 +265,10 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 	}
 	bundle := s.bundleInfo()
 	uptime := readSystemUptimeFile(s.uptimePath)
+	dnsHealth := dnsproxy.Health{State: "disabled"}
+	if s.dnsProxyHealth != nil {
+		dnsHealth = s.dnsProxyHealth()
+	}
 
 	return Snapshot{
 		ProvidersCount:  len(state.Providers),
@@ -281,6 +294,7 @@ func (s *Service) Snapshot(ctx context.Context) (Snapshot, error) {
 		RuntimeOS:           runtime.GOOS,
 		HostName:            strings.TrimSpace(hostName),
 		Bundle:              bundle,
+		DNSProxy:            dnsHealth,
 	}, nil
 }
 

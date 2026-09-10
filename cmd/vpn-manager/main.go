@@ -120,6 +120,9 @@ func main() {
 		db,
 		filepath.Join(paths.DataDir, "traffic-history.json"),
 	)
+	if dnsProxy != nil {
+		statusService.SetDNSProxyHealth(dnsProxy.Health)
+	}
 
 	if _, err := stateManager.Load(); err != nil {
 		log.Fatalf("bootstrap state store: %v", err)
