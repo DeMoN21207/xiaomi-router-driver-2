@@ -141,6 +141,7 @@ func main() {
 	}
 
 	apiHandler := api.NewHandler(api.Dependencies{
+		Context:       rootCtx,
 		State:         stateManager,
 		Domains:       domainManager,
 		Events:        eventStore,

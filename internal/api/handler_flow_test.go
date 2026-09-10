@@ -284,9 +284,11 @@ func TestManualApplyWithActiveSubscriptionRequiresRuntimeAndKeepsPreviousDomains
 		t.Fatalf("Save() error = %v", err)
 	}
 
-	response := requestJSON[map[string]string](t, handler, http.MethodPost, "/api/rules/apply", nil, http.StatusInternalServerError)
-	if !strings.Contains(response["error"], "subscription runtime manager is not configured") {
-		t.Fatalf("unexpected apply error: %v", response)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/rules/apply", nil))
+	operation := waitForApplyOperation(t, handler, recorder)
+	if operation.Status != "failed" || !strings.Contains(operation.Error, "subscription runtime manager is not configured") {
+		t.Fatalf("unexpected apply operation: %+v", operation)
 	}
 
 	appliedDomains, err := domainsManager.List()

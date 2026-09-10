@@ -8,12 +8,66 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"xiomi-router-driver/internal/config"
 	"xiomi-router-driver/internal/domains"
 	"xiomi-router-driver/internal/openvpn"
 	"xiomi-router-driver/internal/sqlitedb"
 )
+
+func TestHandleManualApplyRunsAsTrackableOperation(t *testing.T) {
+	tempDir := t.TempDir()
+	db := openAPITestDB(t, filepath.Join(tempDir, "vpn-manager.db"))
+	stateManager := config.NewManager(db, "")
+	if _, err := stateManager.Save(config.DefaultState()); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(Dependencies{
+		State:   stateManager,
+		Domains: domains.NewManager(db, "", ""),
+		OpenVPN: openvpn.NewManager(tempDir, tempDir, db, nil, nil),
+		DataDir: tempDir,
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/rules/apply", nil))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("apply status = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	var started struct {
+		Operation applyOperation `json:"operation"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &started); err != nil {
+		t.Fatal(err)
+	}
+	if started.Operation.ID == "" {
+		t.Fatal("apply response did not include an operation ID")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		statusRec := httptest.NewRecorder()
+		handler.ServeHTTP(statusRec, httptest.NewRequest(http.MethodGet, "/api/rules/apply/"+started.Operation.ID, nil))
+		if statusRec.Code != http.StatusOK {
+			t.Fatalf("operation status = %d: %s", statusRec.Code, statusRec.Body.String())
+		}
+		var payload struct {
+			Operation applyOperation `json:"operation"`
+		}
+		if err := json.Unmarshal(statusRec.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Operation.Status == "succeeded" {
+			return
+		}
+		if payload.Operation.Status == "failed" {
+			t.Fatalf("apply operation failed: %+v", payload.Operation)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("apply operation did not finish")
+}
 
 func TestHandleRuleApplyRollbackOnFailure(t *testing.T) {
 	tempDir := t.TempDir()
@@ -152,9 +206,9 @@ func TestHandleManualApplyRestoresCurrentDomainsOnFailure(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/rules/apply", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("ServeHTTP() status = %d, want %d, body=%s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	operation := waitForApplyOperation(t, handler, rec)
+	if operation.Status != "failed" {
+		t.Fatalf("apply operation = %+v, want failed", operation)
 	}
 
 	currentDomains, err := domainsManager.List()
@@ -164,6 +218,36 @@ func TestHandleManualApplyRestoresCurrentDomainsOnFailure(t *testing.T) {
 	if len(currentDomains) != 1 || currentDomains[0] != "previous.example.com" {
 		t.Fatalf("expected failed apply to restore previous domains, got %+v", currentDomains)
 	}
+}
+
+func waitForApplyOperation(t *testing.T, handler *Handler, started *httptest.ResponseRecorder) applyOperation {
+	t.Helper()
+	if started.Code != http.StatusAccepted {
+		t.Fatalf("apply start status = %d, want 202: %s", started.Code, started.Body.String())
+	}
+	var payload struct {
+		Operation applyOperation `json:"operation"`
+	}
+	if err := json.Unmarshal(started.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/rules/apply/"+payload.Operation.ID, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("apply status request = %d: %s", recorder.Code, recorder.Body.String())
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Operation.Status == "succeeded" || payload.Operation.Status == "failed" {
+			return payload.Operation
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("apply operation did not finish")
+	return applyOperation{}
 }
 
 func openAPITestDB(t *testing.T, path string) *sql.DB {

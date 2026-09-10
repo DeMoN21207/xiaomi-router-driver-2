@@ -280,6 +280,81 @@ func TestManagerDeleteRuleSQLite(t *testing.T) {
 	}
 }
 
+func TestRestoreRuleIfCurrentDoesNotOverwriteNewerEdit(t *testing.T) {
+	db := openTestDB(t)
+	manager := NewManager(db, "")
+	original := Rule{ID: "rule_1", Name: "Original", ProviderID: "provider_1", Domains: []string{"old.example"}, Enabled: true}
+	state := DefaultState()
+	state.Providers = []Provider{{ID: "provider_1", Name: "VPN", Type: ProviderTypeOpenVPN, Source: "vpn.ovpn", Enabled: true}}
+	state.Rules = []Rule{original}
+	if _, err := manager.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := manager.UpdateRule(Rule{ID: "rule_1", Name: "Applied", ProviderID: "provider_1", Domains: []string{"applied.example"}, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer, err := manager.UpdateRule(Rule{ID: "rule_1", Name: "Newer", ProviderID: "provider_1", Domains: []string{"newer.example"}, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restored, err := manager.RestoreRuleIfCurrent(applied, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored {
+		t.Fatal("stale rollback overwrote a newer rule edit")
+	}
+	loaded, err := manager.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Rules) != 1 || !sameRule(loaded.Rules[0], newer) {
+		t.Fatalf("newer rule was not preserved: %+v", loaded.Rules)
+	}
+}
+
+func TestRestoreRuleIfAbsentDoesNotOverwriteRecreatedRule(t *testing.T) {
+	db := openTestDB(t)
+	manager := NewManager(db, "")
+	original := Rule{ID: "rule_1", Name: "Original", ProviderID: "provider_1", Domains: []string{"old.example"}, Enabled: true}
+	state := DefaultState()
+	state.Providers = []Provider{{ID: "provider_1", Name: "VPN", Type: ProviderTypeOpenVPN, Source: "vpn.ovpn", Enabled: true}}
+	state.Rules = []Rule{original}
+	if _, err := manager.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.DeleteRule(original.ID); err != nil {
+		t.Fatal(err)
+	}
+	recreated := original
+	recreated.Name = "Recreated"
+	state, err := manager.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Rules = append(state.Rules, recreated)
+	if _, err := manager.Save(state); err != nil {
+		t.Fatal(err)
+	}
+
+	restored, err := manager.RestoreRuleIfAbsent(original, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored {
+		t.Fatal("stale delete rollback overwrote a recreated rule")
+	}
+	loaded, err := manager.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Rules) != 1 || loaded.Rules[0].Name != "Recreated" {
+		t.Fatalf("recreated rule was not preserved: %+v", loaded.Rules)
+	}
+}
+
 func openTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 

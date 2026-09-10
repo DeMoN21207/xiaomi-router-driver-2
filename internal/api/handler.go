@@ -35,6 +35,7 @@ import (
 )
 
 type Dependencies struct {
+	Context               context.Context
 	State                 *config.Manager
 	Domains               *domains.Manager
 	Events                *events.Store
@@ -70,6 +71,9 @@ type Handler struct {
 	dataDir               string
 	router                http.Handler
 	applyMu               sync.Mutex
+	appContext            context.Context
+	applyOperationsMu     sync.Mutex
+	applyOperations       map[string]applyOperation
 }
 
 type providerRequest struct {
@@ -110,6 +114,10 @@ type applyResult struct {
 const applyRequestTimeout = 2 * time.Minute
 
 func NewHandler(deps Dependencies) *Handler {
+	appContext := deps.Context
+	if appContext == nil {
+		appContext = context.Background()
+	}
 	handler := &Handler{
 		state:                 deps.State,
 		domains:               deps.Domains,
@@ -126,6 +134,8 @@ func NewHandler(deps Dependencies) *Handler {
 		clearPriorityOverride: deps.ClearPriorityOverride,
 		applyPriorityNow:      deps.ApplyPriorityNow,
 		dataDir:               deps.DataDir,
+		appContext:            appContext,
+		applyOperations:       make(map[string]applyOperation),
 	}
 
 	mux := http.NewServeMux()
@@ -152,6 +162,7 @@ func NewHandler(deps Dependencies) *Handler {
 	mux.HandleFunc("/api/rules", handler.handleRules)
 	mux.HandleFunc("/api/rules/", handler.handleRule)
 	mux.HandleFunc("/api/rules/apply", handler.handleApplyRules)
+	mux.HandleFunc("/api/rules/apply/", handler.handleApplyOperation)
 	mux.HandleFunc("/api/domains/health", handler.handleDomainHealth)
 	mux.HandleFunc("/api/domains/health/check", handler.handleCheckDomainHealth)
 	mux.HandleFunc("/api/domains", handler.handleDomainsPreview)
@@ -1498,7 +1509,10 @@ func (h *Handler) handleRule(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), applyRequestTimeout)
 			defer cancel()
 
-			result, err := h.applyCurrentRulesWithRollback(ctx, state)
+			previousRule := state.Rules[index]
+			result, err := h.applyCurrentRulesWithRollback(ctx, func() (bool, error) {
+				return h.state.RestoreRuleIfCurrent(savedRule, previousRule)
+			})
 			if err != nil {
 				writeApplyError(w, err)
 				return
@@ -1516,7 +1530,8 @@ func (h *Handler) handleRule(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		if findRuleIndex(state.Rules, id) < 0 {
+		index := findRuleIndex(state.Rules, id)
+		if index < 0 {
 			writeError(w, http.StatusNotFound, fmt.Errorf("rule %s not found", id))
 			return
 		}
@@ -1535,7 +1550,10 @@ func (h *Handler) handleRule(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), applyRequestTimeout)
 			defer cancel()
 
-			result, err := h.applyCurrentRulesWithRollback(ctx, state)
+			deletedRule := state.Rules[index]
+			result, err := h.applyCurrentRulesWithRollback(ctx, func() (bool, error) {
+				return h.state.RestoreRuleIfAbsent(deletedRule, index)
+			})
 			if err != nil {
 				writeApplyError(w, err)
 				return
@@ -1558,16 +1576,12 @@ func (h *Handler) handleApplyRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), applyRequestTimeout)
-	defer cancel()
-
-	result, err := h.applyCurrentRules(ctx)
+	operation, err := h.startApplyOperation()
 	if err != nil {
-		writeApplyError(w, err)
+		writeError(w, http.StatusConflict, err)
 		return
 	}
-
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, http.StatusAccepted, map[string]any{"operation": operation})
 }
 
 func writeApplyError(w http.ResponseWriter, err error) {
@@ -1597,34 +1611,44 @@ func (h *Handler) ApplyCurrentRules(ctx context.Context) error {
 	return err
 }
 
-func (h *Handler) applyCurrentRulesWithRollback(ctx context.Context, previousState config.State) (applyResult, error) {
+func (h *Handler) applyCurrentRulesWithRollback(ctx context.Context, rollback func() (bool, error)) (applyResult, error) {
 	result, err := h.applyCurrentRules(ctx)
 	if err == nil {
 		return result, nil
 	}
 
-	if rollbackErr := h.rollbackFailedRuleApply(previousState); rollbackErr != nil {
+	restored, rollbackErr := h.rollbackFailedRuleApply(rollback)
+	if rollbackErr != nil {
 		h.recordEvent("error", "rules.apply_rollback_failed", fmt.Sprintf("%v; rollback failed: %v", err, rollbackErr))
 		return applyResult{}, fmt.Errorf("%w; rollback failed: %v", err, rollbackErr)
 	}
 
-	h.recordEvent("warn", "rules.apply_rolled_back", fmt.Sprintf("Rolled back configuration after apply failure: %v", err))
+	if restored {
+		h.recordEvent("warn", "rules.apply_rolled_back", fmt.Sprintf("Rolled back changed rule after apply failure: %v", err))
+	} else {
+		h.recordEvent("warn", "rules.apply_rollback_skipped", fmt.Sprintf("Kept a newer rule edit after apply failure: %v", err))
+	}
 	return applyResult{}, err
 }
 
-func (h *Handler) rollbackFailedRuleApply(previousState config.State) error {
-	if _, err := h.state.Save(previousState); err != nil {
-		return fmt.Errorf("restore previous config: %w", err)
+func (h *Handler) rollbackFailedRuleApply(rollback func() (bool, error)) (bool, error) {
+	restored := false
+	if rollback != nil {
+		var err error
+		restored, err = rollback()
+		if err != nil {
+			return false, fmt.Errorf("restore changed rule: %w", err)
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), applyRequestTimeout)
 	defer cancel()
 
 	if _, err := h.applyCurrentRules(ctx); err != nil {
-		return fmt.Errorf("restore previous runtime: %w", err)
+		return restored, fmt.Errorf("restore current runtime: %w", err)
 	}
 
-	return nil
+	return restored, nil
 }
 
 func (h *Handler) applyCurrentRules(ctx context.Context) (applyResult, error) {

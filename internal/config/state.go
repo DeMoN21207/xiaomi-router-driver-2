@@ -331,6 +331,113 @@ func (m *Manager) DeleteRule(id string) error {
 	return tx.Commit()
 }
 
+// RestoreRuleIfCurrent performs an optimistic rollback. It restores previous
+// only while the rule still equals the value written by the failed request.
+func (m *Manager) RestoreRuleIfCurrent(expectedCurrent Rule, previous Rule) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.ensureReadyUnlocked(); err != nil {
+		return false, err
+	}
+	expected := normalizeRules([]Rule{expectedCurrent})
+	replacement := normalizeRules([]Rule{previous})
+	if len(expected) != 1 || len(replacement) != 1 || expected[0].ID != replacement[0].ID {
+		return false, errors.New("rollback rules are invalid")
+	}
+	state, err := m.loadUnlocked()
+	if err != nil {
+		return false, err
+	}
+	var current *Rule
+	for index := range state.Rules {
+		if state.Rules[index].ID == expected[0].ID {
+			current = &state.Rules[index]
+			break
+		}
+	}
+	if current == nil || !sameRule(*current, expected[0]) {
+		return false, nil
+	}
+	tx, err := m.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE rules SET name = ?, provider_id = ?, selected_location = ?, enabled = ? WHERE id = ?`,
+		replacement[0].Name, replacement[0].ProviderID, replacement[0].SelectedLocation, boolToInt(replacement[0].Enabled), replacement[0].ID); err != nil {
+		return false, err
+	}
+	if err := replaceRuleDomainsTx(tx, replacement[0].ID, replacement[0].Domains); err != nil {
+		return false, err
+	}
+	if err := saveMetaTx(tx, "updatedAt", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// RestoreRuleIfAbsent restores a deleted rule at its former position only if
+// another request has not recreated that rule ID in the meantime.
+func (m *Manager) RestoreRuleIfAbsent(previous Rule, position int) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.ensureReadyUnlocked(); err != nil {
+		return false, err
+	}
+	rules := normalizeRules([]Rule{previous})
+	if len(rules) != 1 {
+		return false, errors.New("rollback rule is invalid")
+	}
+	state, err := m.loadUnlocked()
+	if err != nil {
+		return false, err
+	}
+	for _, current := range state.Rules {
+		if current.ID == rules[0].ID {
+			return false, nil
+		}
+	}
+	position = max(0, min(position, len(state.Rules)))
+	tx, err := m.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE rules SET position = position + 1 WHERE position >= ?`, position); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(`INSERT INTO rules (id, name, provider_id, selected_location, enabled, position) VALUES (?, ?, ?, ?, ?, ?)`,
+		rules[0].ID, rules[0].Name, rules[0].ProviderID, rules[0].SelectedLocation, boolToInt(rules[0].Enabled), position); err != nil {
+		return false, err
+	}
+	if err := replaceRuleDomainsTx(tx, rules[0].ID, rules[0].Domains); err != nil {
+		return false, err
+	}
+	if err := saveMetaTx(tx, "updatedAt", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func sameRule(left Rule, right Rule) bool {
+	if left.ID != right.ID || left.Name != right.Name || left.ProviderID != right.ProviderID ||
+		left.SelectedLocation != right.SelectedLocation || left.Enabled != right.Enabled || len(left.Domains) != len(right.Domains) {
+		return false
+	}
+	for index := range left.Domains {
+		if left.Domains[index] != right.Domains[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *Manager) ensureReadyUnlocked() error {
 	if m.initialized {
 		return nil

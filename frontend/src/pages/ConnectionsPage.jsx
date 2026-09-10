@@ -1,5 +1,5 @@
 import { useDeferredValue, useEffect, useMemo, useState, useRef, useCallback } from "react";
-import { fetchJSON } from "../api.js";
+import { applyRules, fetchJSON } from "../api.js";
 import { parseDomainInput } from "../domainInput.js";
 import { useI18n } from "../i18n.jsx";
 import Icon from "../components/Icon.jsx";
@@ -356,7 +356,7 @@ export default function ConnectionsPage() {
           enabled: patch.enabled ?? provider.enabled,
         }),
       });
-      await fetchJSON("/api/rules/apply", { method: "POST" });
+		await applyRules();
       setPageError("");
       showToast(patch.enabled ? t("connections.providerEnabled") : t("connections.providerDisabled"));
       await refresh();
@@ -680,7 +680,7 @@ function ProviderCard({ provider, providers, rules, toneClasses, statusLabel, is
 
   async function applyAndRefresh() {
     try {
-      await fetchJSON("/api/rules/apply", { method: "POST" });
+		await applyRules();
     } finally {
       await onDomainsChange();
     }
@@ -1123,7 +1123,7 @@ function PriorityPoliciesPanel({ provider, providerRules, policies, priorityStat
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      await fetchJSON("/api/rules/apply", { method: "POST" });
+		await applyRules();
       cancelEdit();
       showToast(t("connections.prioritySaved"));
       await onChanged();
@@ -1139,7 +1139,7 @@ function PriorityPoliciesPanel({ provider, providerRules, policies, priorityStat
     setSaving(true);
     try {
       await fetchJSON(`/api/priority-policies/${encodeURIComponent(policy.id)}`, { method: "DELETE" });
-      await fetchJSON("/api/rules/apply", { method: "POST" });
+		await applyRules();
       showToast(t("connections.priorityDeleted"));
       await onChanged();
     } catch (error) {

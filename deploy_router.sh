@@ -231,6 +231,15 @@ json_check_status() {
   fi
 }
 
+json_extract_apply_field() {
+	local field="$1"
+	if command -v jq >/dev/null 2>&1; then
+		jq -r --arg field "$field" '.operation[$field] // empty'
+	else
+		node -e 'let s=""; process.stdin.on("data",d=>s+=d); process.stdin.on("end",()=>process.stdout.write(String(JSON.parse(s).operation?.[process.argv[1]] ?? "")));' "$field"
+	fi
+}
+
 if [[ -z "${ROUTER_REMOTE_DIR:-}" || "$ROUTER_REMOTE_DIR" == "/" ]]; then
   echo "[error] ROUTER_REMOTE_DIR must be set and must not be /." >&2
   exit 1
@@ -407,7 +416,29 @@ curl -fsS --max-time 20 \
   --data "$automation_body" \
   "$api_base/api/config/automation" >/dev/null
 
-curl -fsS --max-time 60 -X POST "$api_base/api/rules/apply" >/dev/null || sleep 2
+apply_body="$(curl -fsS --max-time 20 -X POST "$api_base/api/rules/apply")"
+apply_id="$(printf '%s' "$apply_body" | json_extract_apply_field id)"
+if [[ -z "$apply_id" ]]; then
+	echo "[error] Apply operation ID is missing: $apply_body" >&2
+	exit 1
+fi
+apply_status=""
+for ((attempt = 0; attempt < 60; attempt += 1)); do
+	apply_body="$(curl -fsS --max-time 20 "$api_base/api/rules/apply/$apply_id")"
+	apply_status="$(printf '%s' "$apply_body" | json_extract_apply_field status)"
+	case "$apply_status" in
+		succeeded) break ;;
+		failed)
+			echo "[error] Rule application failed: $apply_body" >&2
+			exit 1
+			;;
+	esac
+	sleep 1
+done
+if [[ "$apply_status" != "succeeded" ]]; then
+	echo "[error] Rule application did not finish: $apply_body" >&2
+	exit 1
+fi
 curl -fsS --max-time 30 "$api_base/api/status" | json_check_status
 
 echo

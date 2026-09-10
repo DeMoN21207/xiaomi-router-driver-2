@@ -43,3 +43,23 @@ export async function fetchJSON(url, options) {
     }
   }
 }
+
+export async function applyRules({ pollIntervalMs = 500, timeoutMs = 5 * 60 * 1000 } = {}) {
+	const started = await fetchJSON("/api/rules/apply", { method: "POST" });
+	const operationId = started?.operation?.id;
+	if (!operationId) return started;
+
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() <= deadline) {
+		if (pollIntervalMs > 0) {
+			await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+		}
+		const payload = await fetchJSON(`/api/rules/apply/${encodeURIComponent(operationId)}`, {
+			trackLoading: false,
+		});
+		const operation = payload?.operation;
+		if (operation?.status === "succeeded") return operation.result || { status: "applied" };
+		if (operation?.status === "failed") throw new Error(operation.error || "Не удалось применить правила");
+	}
+	throw new Error("Применение правил не завершилось за отведённое время");
+}
