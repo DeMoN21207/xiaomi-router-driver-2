@@ -1,7 +1,7 @@
 const DASHBOARD_REFRESH_KEY = "routevpn_dashboard_refresh_ms";
 const DEFAULT_DASHBOARD_REFRESH_MS = 10_000;
 
-export const DASHBOARD_REFRESH_OPTIONS = [0, 500, 1_000, 5_000, 10_000, 30_000, 60_000];
+export const DASHBOARD_REFRESH_OPTIONS = [0, 5_000, 10_000, 30_000, 60_000];
 
 export function readDashboardRefreshInterval() {
   try {
@@ -25,4 +25,3 @@ export function writeDashboardRefreshInterval(value) {
   }
   return nextValue;
 }
-

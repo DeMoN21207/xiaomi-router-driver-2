@@ -97,6 +97,19 @@ func CheckIntegrity(db *sql.DB) error {
 	return rows.Err()
 }
 
+func CheckFile(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	return CheckIntegrity(db)
+}
+
 func Checkpoint(db *sql.DB) error {
 	if db == nil {
 		return errors.New("sqlite database is not configured")

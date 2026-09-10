@@ -14,7 +14,7 @@ export function subscribeLoading(fn) {
 }
 
 export async function fetchJSON(url, options) {
-  const { trackLoading, ...fetchOptions } = options || {};
+	const { trackLoading, timeoutMs = 30_000, ...fetchOptions } = options || {};
   // Only mutating requests (saves / heavy actions) toggle the global loader.
   // Passive GETs used for initial page rendering should not flash an indicator.
   const method = (fetchOptions?.method || "GET").toUpperCase();
@@ -23,6 +23,18 @@ export async function fetchJSON(url, options) {
     inFlight += 1;
     emit();
   }
+	let timeoutId;
+	let abortHandler;
+	if (timeoutMs > 0) {
+		const controller = new AbortController();
+		if (fetchOptions.signal) {
+			abortHandler = () => controller.abort(fetchOptions.signal.reason);
+			if (fetchOptions.signal.aborted) abortHandler();
+			else fetchOptions.signal.addEventListener("abort", abortHandler, { once: true });
+		}
+		fetchOptions.signal = controller.signal;
+		timeoutId = setTimeout(() => controller.abort(new Error("Превышено время ожидания запроса")), timeoutMs);
+	}
 	try {
 		const authorizedOptions = withAPIToken(fetchOptions);
 		let response = await fetch(url, authorizedOptions);
@@ -44,8 +56,10 @@ export async function fetchJSON(url, options) {
     }
 
     throw new Error(message);
-  } finally {
-    if (track) {
+	} finally {
+		if (timeoutId) clearTimeout(timeoutId);
+		if (abortHandler && options?.signal) options.signal.removeEventListener("abort", abortHandler);
+		if (track) {
       inFlight = Math.max(0, inFlight - 1);
       emit();
     }

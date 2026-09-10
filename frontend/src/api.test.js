@@ -42,3 +42,16 @@ test("applyRules reports a failed background operation", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test("fetchJSON aborts a request after its deadline", async () => {
+	const { fetchJSON } = await import("./api.js");
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (_url, options) => new Promise((_resolve, reject) => {
+		options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+	});
+	try {
+		await assert.rejects(() => fetchJSON("/api/stuck", { timeoutMs: 10 }), /время ожидания/i);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});

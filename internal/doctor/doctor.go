@@ -4,11 +4,17 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"xiomi-router-driver/internal/sqlitedb"
 )
 
 type resultLevel string
@@ -66,6 +72,8 @@ func Run(w io.Writer) int {
 
 	dnsmasqPath := firstNonEmpty(os.Getenv("DNSMASQ_CONFIG_FILE"), "/tmp/dnsmasq.d/vpn_dns.conf")
 	checks = append(checks, checkDNSMasqPath(dnsmasqPath))
+	checks = append(checks, checkDNSResolution())
+	checks = append(checks, checkApplicationState(applicationRoot())...)
 
 	failures := 0
 	fmt.Fprintln(w, "VPN Manager doctor")
@@ -82,6 +90,100 @@ func Run(w io.Writer) int {
 	}
 	fmt.Fprintln(w, "\nNo critical checks failed.")
 	return 0
+}
+
+func applicationRoot() string {
+	if root := strings.TrimSpace(os.Getenv("VPN_MANAGER_ROOT")); root != "" {
+		return filepath.Clean(root)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	return filepath.Dir(executable)
+}
+
+func checkApplicationState(root string) []checkResult {
+	root = filepath.Clean(root)
+	checks := []checkResult{checkDiskSpace(root)}
+	dbPath := filepath.Join(root, "data", "vpn-manager.db")
+	if err := sqlitedb.CheckFile(dbPath); err != nil {
+		level := levelFail
+		if os.IsNotExist(err) {
+			level = levelWarn
+		}
+		checks = append(checks, checkResult{Level: level, Name: "sqlite integrity", Detail: err.Error()})
+	} else {
+		checks = append(checks, checkResult{Level: levelOK, Name: "sqlite integrity", Detail: "PRAGMA quick_check returned ok"})
+	}
+	backupPath := sqlitedb.BackupPath(dbPath)
+	if info, err := os.Stat(backupPath); err == nil {
+		checks = append(checks, checkResult{Level: levelOK, Name: "sqlite backup", Detail: fmt.Sprintf("%s (%d bytes)", backupPath, info.Size())})
+	} else {
+		checks = append(checks, checkResult{Level: levelWarn, Name: "sqlite backup", Detail: "last-known-good backup is missing"})
+	}
+	if _, err := os.Stat(filepath.Join(root, ".update-journal.json")); err == nil {
+		checks = append(checks, checkResult{Level: levelWarn, Name: "update transaction", Detail: "an update journal is pending recovery"})
+	} else {
+		checks = append(checks, checkResult{Level: levelOK, Name: "update transaction", Detail: "no interrupted update journal"})
+	}
+	checks = append(checks, checkServiceBootstrap(root), checkProcessOwnership(root))
+	return checks
+}
+
+func checkDiskSpace(path string) checkResult {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return checkResult{Level: levelWarn, Name: "storage", Detail: err.Error()}
+	}
+	free := uint64(stat.Bavail) * uint64(stat.Bsize)
+	level := levelOK
+	if free < 64<<20 {
+		level = levelWarn
+	}
+	return checkResult{Level: level, Name: "storage", Detail: fmt.Sprintf("%d MiB available at %s", free>>20, path)}
+}
+
+func checkServiceBootstrap(root string) checkResult {
+	for _, path := range []string{"/etc/init.d/vpn-manager", filepath.Join(root, "vpn-manager-autostart.sh")} {
+		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+			return checkResult{Level: levelOK, Name: "service bootstrap", Detail: path}
+		}
+	}
+	return checkResult{Level: levelWarn, Name: "service bootstrap", Detail: "init.d service or cron watchdog was not found"}
+}
+
+func checkProcessOwnership(root string) checkResult {
+	data, err := os.ReadFile("/tmp/vpn-manager.pid")
+	if err != nil {
+		return checkResult{Level: levelWarn, Name: "service process", Detail: "PID file is missing"}
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return checkResult{Level: levelWarn, Name: "service process", Detail: "PID file is invalid"}
+	}
+	executable, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		return checkResult{Level: levelWarn, Name: "service process", Detail: fmt.Sprintf("PID %d is not running", pid)}
+	}
+	expected := filepath.Join(root, "vpn-manager")
+	if strings.TrimSuffix(executable, " (deleted)") != expected {
+		return checkResult{Level: levelFail, Name: "service process", Detail: fmt.Sprintf("PID %d runs %s, expected %s", pid, executable, expected)}
+	}
+	return checkResult{Level: levelOK, Name: "service process", Detail: fmt.Sprintf("PID %d runs the expected binary", pid)}
+}
+
+func checkDNSResolution() checkResult {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	addresses, err := net.DefaultResolver.LookupHost(ctx, "github.com")
+	if err != nil || len(addresses) == 0 {
+		if err == nil {
+			err = fmt.Errorf("no addresses returned")
+		}
+		return checkResult{Level: levelWarn, Name: "DNS resolution", Detail: err.Error()}
+	}
+	return checkResult{Level: levelOK, Name: "DNS resolution", Detail: addresses[0]}
 }
 
 func checkCommand(command string, critical bool) checkResult {

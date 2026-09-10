@@ -11,8 +11,8 @@ const TOP_ROUTING_DOMAINS_LIMIT = 10;
 const TOP_ROUTING_DOMAINS_QUERY = `/api/traffic/domains?sort=bytes&limit=${TOP_ROUTING_DOMAINS_LIMIT}`;
 
 const DEFAULT_AUTOMATION = {
-  installService: false,
-  autoRecover: false,
+	installService: true,
+	autoRecover: true,
   providerFailover: true,
   failoverFailureSeconds: 120,
   failoverRestoreSeconds: 60,
@@ -323,7 +323,7 @@ export default function SettingsPage() {
 
     try {
       await saveUpdateSettings();
-      await fetchJSON("/api/system/update/install", { method: "POST" });
+		await fetchJSON("/api/system/update/install", { method: "POST", timeoutMs: 5 * 60 * 1000 });
       setUpdateMessage(t("settings.updateRestarting"));
       window.setTimeout(() => {
         refreshUpdateStatus().catch(() => {});
@@ -348,10 +348,11 @@ export default function SettingsPage() {
     try {
       const body = new FormData();
       body.append("archive", file);
-      await fetchJSON("/api/system/update/upload", {
-        method: "POST",
-        body,
-      });
+		await fetchJSON("/api/system/update/upload", {
+			method: "POST",
+			body,
+			timeoutMs: 5 * 60 * 1000,
+		});
       setUpdateMessage(t("settings.updateRestarting"));
       window.setTimeout(() => {
         refreshUpdateStatus().catch(() => {});

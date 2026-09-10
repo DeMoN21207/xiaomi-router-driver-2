@@ -149,8 +149,8 @@ func DefaultRoutingSettings() RoutingSettings {
 
 func DefaultAutomationSettings() AutomationSettings {
 	return AutomationSettings{
-		InstallService:         false,
-		AutoRecover:            false,
+		InstallService:         true,
+		AutoRecover:            true,
 		ProviderFailover:       true,
 		FailoverFailureSeconds: 120,
 		FailoverRestoreSeconds: 60,

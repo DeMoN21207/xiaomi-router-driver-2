@@ -277,9 +277,27 @@ func main() {
 func requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
+		response := &responseStatusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(response, r)
+		duration := time.Since(start)
+		if shouldLogRequest(r.Method, response.status, duration) {
+			log.Printf("%s %s %d %s", r.Method, r.URL.Path, response.status, duration.Round(time.Millisecond))
+		}
 	})
+}
+
+type responseStatusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *responseStatusWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func shouldLogRequest(method string, status int, duration time.Duration) bool {
+	return (method != http.MethodGet && method != http.MethodHead) || status >= http.StatusBadRequest || duration >= 2*time.Second
 }
 
 func setEnvironment(environ []string, key string, value string) []string {

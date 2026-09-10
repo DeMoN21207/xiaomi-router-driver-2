@@ -96,6 +96,9 @@ func TestManagerRoundTripSQLite(t *testing.T) {
 }
 
 func TestDefaultAutomationSettingsTrafficCleanup(t *testing.T) {
+	if settings := DefaultAutomationSettings(); !settings.InstallService || !settings.AutoRecover {
+		t.Fatalf("first-install automation defaults are not resilient: %+v", settings)
+	}
 	if got := DefaultAutomationSettings().TrafficCleanupDays; got != 14 {
 		t.Fatalf("expected default traffic cleanup 14 days, got %d", got)
 	}
