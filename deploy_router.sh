@@ -28,12 +28,14 @@ TEMP_KNOWN_HOSTS=""
 REMOTE_UPDATE_LOCKED=0
 
 cleanup() {
+	local status=$?
 	if [[ "$REMOTE_UPDATE_LOCKED" == "1" ]] && declare -F ssh_run >/dev/null 2>&1; then
 		ssh_run "$ROUTER_USER@$ROUTER_HOST" rm -f /tmp/vpn-manager.updating >/dev/null 2>&1 || true
 	fi
   if [[ -n "$TEMP_KNOWN_HOSTS" ]]; then
     rm -f "$TEMP_KNOWN_HOSTS"
   fi
+	return "$status"
 }
 trap cleanup EXIT
 
@@ -422,19 +424,21 @@ REMOTE_UPDATE_LOCKED=0
 echo
 echo "[6/7] Reinstalling automation bootstrap and reconciling routes..."
 api_base="http://$ROUTER_HOST:$ROUTER_HTTP_PORT"
-api_auth=()
-if [[ -n "$ROUTER_API_TOKEN" ]]; then
-	api_auth=(-H "Authorization: Bearer $ROUTER_API_TOKEN")
-fi
+api_mutation_curl() {
+	if [[ -n "$ROUTER_API_TOKEN" ]]; then
+		curl -H "Authorization: Bearer $ROUTER_API_TOKEN" "$@"
+	else
+		curl "$@"
+	fi
+}
 automation_body="$(curl -fsS --max-time 20 "$api_base/api/config/automation" | json_extract_automation)"
-curl -fsS --max-time 20 \
+api_mutation_curl -fsS --max-time 20 \
   -X PUT \
-	"${api_auth[@]}" \
   -H "Content-Type: application/json" \
   --data "$automation_body" \
   "$api_base/api/config/automation" >/dev/null
 
-apply_body="$(curl -fsS --max-time 20 "${api_auth[@]}" -X POST "$api_base/api/rules/apply")"
+apply_body="$(api_mutation_curl -fsS --max-time 20 -X POST "$api_base/api/rules/apply")"
 apply_id="$(printf '%s' "$apply_body" | json_extract_apply_field id)"
 if [[ -z "$apply_id" ]]; then
 	echo "[error] Apply operation ID is missing: $apply_body" >&2
