@@ -132,7 +132,9 @@ func TestManualPriorityLoadsRuntimeAfterPreviousApplyCompletes(t *testing.T) {
 	}
 }
 
-func waitForPriorityWANFixture(t *testing.T, service *status.Service) status.Snapshot {
+func waitForPriorityWANFixture(t *testing.T, service interface {
+	RuntimeSnapshot(context.Context) (status.Snapshot, error)
+}) status.Snapshot {
 	t.Helper()
 	type fixtureResult struct {
 		snapshot status.Snapshot

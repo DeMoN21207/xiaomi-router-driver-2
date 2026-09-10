@@ -2,14 +2,55 @@ package status
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"xiomi-router-driver/internal/config"
 	"xiomi-router-driver/internal/domains"
 	"xiomi-router-driver/internal/sqlitedb"
 )
+
+func TestParseDefaultRouteInterface(t *testing.T) {
+	output := "default via 192.168.31.1 dev eth0.2 proto static src 192.168.31.2\n"
+	if got := parseDefaultRouteInterface(output); got != "eth0.2" {
+		t.Fatalf("parseDefaultRouteInterface() = %q, want eth0.2", got)
+	}
+}
+
+func TestProbeWANUsesInterfaceAndSucceedsWhenAnyTargetReplies(t *testing.T) {
+	var calls [][]string
+	service := &Service{
+		wanProbes:       []string{"1.1.1.1", "8.8.8.8"},
+		wanProbeTimeout: time.Second,
+		wanInterface: func(context.Context) string {
+			return "eth0.2"
+		},
+		wanCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			calls = append(calls, append([]string{name}, args...))
+			if args[len(args)-1] == "1.1.1.1" {
+				return []byte("unreachable"), errors.New("exit 1")
+			}
+			return []byte("64 bytes time=12.3 ms"), nil
+		},
+	}
+
+	got := service.probeWAN(context.Background())
+	if got.State != "up" || got.Probe != "8.8.8.8" || got.Interface != "eth0.2" {
+		t.Fatalf("probeWAN() = %+v", got)
+	}
+	wantSecond := []string{"ping", "-c", "1", "-W", "1", "-I", "eth0.2", "8.8.8.8"}
+	if len(calls) != 2 || !reflect.DeepEqual(calls[1], wantSecond) {
+		t.Fatalf("probe calls = %v, want second %v", calls, wantSecond)
+	}
+	if strings.Contains(got.LastError, "1.1.1.1") {
+		t.Fatalf("successful fallback retained failure: %+v", got)
+	}
+}
 
 func TestServiceSnapshotIncludesBundleInfo(t *testing.T) {
 	tempDir := t.TempDir()

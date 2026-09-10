@@ -62,11 +62,15 @@ type TrafficRoute struct {
 type WANStatus struct {
 	State      string `json:"state"`
 	Probe      string `json:"probe"`
+	Interface  string `json:"interface,omitempty"`
 	LatencyMs  int64  `json:"latencyMs"`
 	CheckedAt  string `json:"checkedAt"`
 	LastError  string `json:"lastError"`
 	CheckedVia string `json:"checkedVia"`
 }
+
+type wanCommandFunc func(ctx context.Context, name string, args ...string) ([]byte, error)
+type wanInterfaceFunc func(ctx context.Context) string
 
 type Snapshot struct {
 	ProvidersCount      int                            `json:"providersCount"`
@@ -103,8 +107,10 @@ type Service struct {
 	openvpnBinary               string
 	singboxBinary               string
 	uptimePath                  string
-	wanProbe                    string
+	wanProbes                   []string
 	wanProbeTimeout             time.Duration
+	wanCommand                  wanCommandFunc
+	wanInterface                wanInterfaceFunc
 	wanCacheTTL                 time.Duration
 	wanMu                       sync.Mutex
 	wanCache                    WANStatus
@@ -134,26 +140,32 @@ func NewService(
 	openvpnBinary := runtimebin.Resolve(os.Getenv("VPN_MANAGER_OPENVPN_BIN"), "openvpn", appDir, dataDir)
 	singboxBinary := runtimebin.Resolve(os.Getenv("VPN_MANAGER_SINGBOX_BIN"), "sing-box", appDir, dataDir)
 
-	wanProbe := strings.TrimSpace(os.Getenv("VPN_MANAGER_WAN_PROBE"))
-	if wanProbe == "" {
-		wanProbe = "1.1.1.1"
-	}
+	wanProbes := parseWANProbes(os.Getenv("VPN_MANAGER_WAN_PROBES"), os.Getenv("VPN_MANAGER_WAN_PROBE"))
 	wanProbeTimeout := resolveDurationFromEnv("VPN_MANAGER_WAN_PROBE_TIMEOUT_MS", 2*time.Second)
 	wanCacheTTL := resolveDurationFromEnv("VPN_MANAGER_WAN_CACHE_TTL_MS", 15*time.Second)
+	command := defaultWANCommand
 
 	return &Service{
-		state:                       state,
-		domains:                     domains,
-		openvpn:                     openvpnManager,
-		subscriptions:               subscriptions,
-		updateRoutesPath:            updateRoutesPath,
-		appDir:                      appDir,
-		dataDir:                     dataDir,
-		openvpnBinary:               openvpnBinary,
-		singboxBinary:               singboxBinary,
-		uptimePath:                  defaultUptimePath,
-		wanProbe:                    wanProbe,
-		wanProbeTimeout:             wanProbeTimeout,
+		state:            state,
+		domains:          domains,
+		openvpn:          openvpnManager,
+		subscriptions:    subscriptions,
+		updateRoutesPath: updateRoutesPath,
+		appDir:           appDir,
+		dataDir:          dataDir,
+		openvpnBinary:    openvpnBinary,
+		singboxBinary:    singboxBinary,
+		uptimePath:       defaultUptimePath,
+		wanProbes:        wanProbes,
+		wanProbeTimeout:  wanProbeTimeout,
+		wanCommand:       command,
+		wanInterface: func(ctx context.Context) string {
+			output, err := command(ctx, "ip", "-4", "route", "show", "default")
+			if err != nil {
+				return ""
+			}
+			return parseDefaultRouteInterface(string(output))
+		},
 		wanCacheTTL:                 wanCacheTTL,
 		history:                     newTrafficHistoryStore(db, legacyTrafficPath, trafficHistoryRetention),
 		domainTraffic:               newDomainTrafficStore(db),
@@ -350,7 +362,7 @@ func (s *Service) cachedWANStatus(ctx context.Context) WANStatus {
 
 	return WANStatus{
 		State:     "checking",
-		Probe:     s.wanProbe,
+		Probe:     strings.Join(s.wanProbes, ","),
 		CheckedAt: now.UTC().Format(time.RFC3339),
 	}
 }
@@ -377,54 +389,95 @@ func (s *Service) refreshWANCache() {
 }
 
 func (s *Service) probeWAN(ctx context.Context) WANStatus {
+	probes := s.wanProbes
+	if len(probes) == 0 {
+		probes = []string{"1.1.1.1", "8.8.8.8"}
+	}
 	status := WANStatus{
 		State:     "unknown",
-		Probe:     s.wanProbe,
+		Probe:     strings.Join(probes, ","),
 		CheckedAt: time.Now().UTC().Format(time.RFC3339),
 	}
-
-	pingBinary, err := exec.LookPath("ping")
-	if err != nil {
-		status.LastError = "ping binary not found"
-		return status
+	command := s.wanCommand
+	if command == nil {
+		command = defaultWANCommand
+	}
+	status.CheckedVia = "ping"
+	if s.wanInterface != nil {
+		status.Interface = strings.TrimSpace(s.wanInterface(ctx))
 	}
 
-	status.CheckedVia = pingBinary
-
-	args := []string{}
-	if runtime.GOOS == "windows" {
-		milliseconds := int(s.wanProbeTimeout / time.Millisecond)
-		if milliseconds <= 0 {
-			milliseconds = 2000
+	failures := make([]string, 0, len(probes))
+	for _, probe := range probes {
+		args := wanPingArgs(s.wanProbeTimeout, status.Interface, probe)
+		output, err := command(ctx, "ping", args...)
+		if ctx.Err() == context.DeadlineExceeded {
+			status.State = "down"
+			status.LastError = "wan probe timeout"
+			return status
 		}
-		args = []string{"-n", "1", "-w", strconv.Itoa(milliseconds), s.wanProbe}
-	} else {
-		seconds := int((s.wanProbeTimeout + time.Second - 1) / time.Second)
-		if seconds <= 0 {
-			seconds = 2
+		if err == nil {
+			status.State = "up"
+			status.Probe = probe
+			status.LatencyMs = parsePingLatency(string(output))
+			status.LastError = ""
+			return status
 		}
-		args = []string{"-c", "1", "-W", strconv.Itoa(seconds), s.wanProbe}
-	}
-
-	cmd := exec.CommandContext(ctx, pingBinary, args...)
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		status.State = "down"
-		status.LastError = "wan probe timeout"
-		return status
-	}
-	if err != nil {
-		status.State = "down"
-		status.LastError = strings.TrimSpace(string(output))
-		if status.LastError == "" {
-			status.LastError = err.Error()
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = err.Error()
 		}
-		return status
+		failures = append(failures, probe+": "+message)
 	}
-
-	status.State = "up"
-	status.LatencyMs = parsePingLatency(string(output))
+	status.State = "down"
+	status.LastError = strings.Join(failures, "; ")
 	return status
+}
+
+func defaultWANCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
+	binary, err := exec.LookPath(name)
+	if err != nil {
+		return nil, fmt.Errorf("%s binary not found: %w", name, err)
+	}
+	return exec.CommandContext(ctx, binary, args...).CombinedOutput()
+}
+
+func parseWANProbes(values ...string) []string {
+	for _, value := range values {
+		fields := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ';' || r == ' ' })
+		if len(fields) > 0 {
+			return fields
+		}
+	}
+	return []string{"1.1.1.1", "8.8.8.8"}
+}
+
+func parseDefaultRouteInterface(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != "default" {
+			continue
+		}
+		for index := 0; index+1 < len(fields); index++ {
+			if fields[index] == "dev" {
+				return fields[index+1]
+			}
+		}
+	}
+	return ""
+}
+
+func wanPingArgs(timeout time.Duration, interfaceName string, probe string) []string {
+	if runtime.GOOS == "windows" {
+		milliseconds := max(1, int(timeout/time.Millisecond))
+		return []string{"-n", "1", "-w", strconv.Itoa(milliseconds), probe}
+	}
+	seconds := max(1, int((timeout+time.Second-1)/time.Second))
+	args := []string{"-c", "1", "-W", strconv.Itoa(seconds)}
+	if strings.TrimSpace(interfaceName) != "" {
+		args = append(args, "-I", interfaceName)
+	}
+	return append(args, probe)
 }
 
 func parsePingLatency(output string) int64 {
