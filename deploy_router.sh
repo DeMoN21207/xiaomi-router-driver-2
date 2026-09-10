@@ -24,8 +24,12 @@ LOCAL_ENV_EXAMPLE_FILE="$ROOT_DIR/deploy_router.local.example.sh"
 : "${ROUTER_SSH_STRICT:=accept-new}"
 
 TEMP_KNOWN_HOSTS=""
+REMOTE_UPDATE_LOCKED=0
 
 cleanup() {
+	if [[ "$REMOTE_UPDATE_LOCKED" == "1" ]] && declare -F ssh_run >/dev/null 2>&1; then
+		ssh_run "$ROUTER_USER@$ROUTER_HOST" rm -f /tmp/vpn-manager.updating >/dev/null 2>&1 || true
+	fi
   if [[ -n "$TEMP_KNOWN_HOSTS" ]]; then
     rm -f "$TEMP_KNOWN_HOSTS"
   fi
@@ -285,16 +289,29 @@ remote_dir_q="$(sh_quote "$ROUTER_REMOTE_DIR")"
 remote_service_q="$(sh_quote "$ROUTER_SERVICE")"
 
 echo "[2/7] Cleaning remote bundle directory and preserving data..."
+REMOTE_UPDATE_LOCKED=1
 remote_script <<REMOTE_EOF
 set -e
 remote_dir=$remote_dir_q
 service=$remote_service_q
 tmp="\${remote_dir}.data-preserve"
+: > /tmp/vpn-manager.updating
 rm -rf "\$tmp"
-pkill -x "\$service" 2>/dev/null || true
-if [ -x /sbin/start-stop-daemon ]; then
-  /sbin/start-stop-daemon -K -q -p "/tmp/\$service.pid" 2>/dev/null || true
+if [ -x "/etc/init.d/\$service" ]; then
+  "/etc/init.d/\$service" stop >/dev/null 2>&1 || true
 fi
+pid_file="/tmp/\$service.pid"
+if [ -r "\$pid_file" ]; then
+  pid="\$(cat "\$pid_file" 2>/dev/null)"
+  case "\$pid" in ''|*[!0-9]*) pid="" ;; esac
+  if [ -n "\$pid" ] && [ -d "/proc/\$pid" ]; then
+    running_exe="\$(readlink -f "/proc/\$pid/exe" 2>/dev/null)"
+    running_exe="\${running_exe% (deleted)}"
+    expected_exe="\$(readlink -f "\$remote_dir/\$service" 2>/dev/null)"
+    [ "\$running_exe" = "\$expected_exe" ] && kill "\$pid" 2>/dev/null || true
+  fi
+fi
+rm -f "\$pid_file"
 if [ -d "\$remote_dir/data" ]; then
   mv "\$remote_dir/data" "\$tmp"
 fi
@@ -344,10 +361,6 @@ chmod +x "\$binary"
 [ -f start.sh ] && chmod +x start.sh
 [ -f bin/openvpn ] && chmod +x bin/openvpn
 [ -f bin/sing-box ] && chmod +x bin/sing-box
-pkill -x "\$service" 2>/dev/null || true
-if [ -x /sbin/start-stop-daemon ]; then
-  /sbin/start-stop-daemon -K -q -p "/tmp/\$service.pid" 2>/dev/null || true
-fi
 rm -f "/tmp/\$service.pid"
 export VPN_MANAGER_ROOT="\$remote_dir"
 export VPN_MANAGER_PORT="\$http_port"
@@ -357,6 +370,7 @@ if [ -x /sbin/start-stop-daemon ]; then
   /sbin/start-stop-daemon -S -q -b -m -p "/tmp/\$service.pid" -x "./\$binary"
 else
   "./\$binary" >"/tmp/\$service.log" 2>&1 </dev/null &
+  echo "\$!" >"/tmp/\$service.pid"
 fi
 
 attempt=0
@@ -364,11 +378,13 @@ while [ "\$attempt" -lt "\$health_retries" ]; do
   if command -v wget >/dev/null 2>&1; then
     if wget -qO "/tmp/\$service-health.json" "http://127.0.0.1:\$http_port/api/status" 2>/dev/null; then
       head -c 400 "/tmp/\$service-health.json"
+      rm -f /tmp/vpn-manager.updating
       exit 0
     fi
   elif command -v curl >/dev/null 2>&1; then
     if curl -fsS "http://127.0.0.1:\$http_port/api/status" -o "/tmp/\$service-health.json" 2>/dev/null; then
       head -c 400 "/tmp/\$service-health.json"
+      rm -f /tmp/vpn-manager.updating
       exit 0
     fi
   fi
@@ -379,6 +395,7 @@ done
 echo "healthcheck failed after \$health_retries attempts" >&2
 exit 1
 REMOTE_EOF
+REMOTE_UPDATE_LOCKED=0
 
 echo
 echo "[6/7] Reinstalling automation bootstrap and reconciling routes..."

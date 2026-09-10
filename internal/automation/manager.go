@@ -237,16 +237,20 @@ PROG="%s"
 ROOT_DIR="%s"
 PORT="%s"
 PATH_ENV="%s/bin:%s/.vpn-manager/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+UPDATE_JOURNAL="$ROOT_DIR/.update-journal.json"
+UPDATE_LOCK="/tmp/vpn-manager.updating"
 
 start_service() {
 	[ -x "$PROG" ] || return 1
+	[ -e "$UPDATE_JOURNAL" ] && return 0
+	[ -e "$UPDATE_LOCK" ] && return 0
 
 	procd_open_instance
 	procd_set_param command "$PROG"
 	procd_set_param env VPN_MANAGER_ROOT="$ROOT_DIR" VPN_MANAGER_PORT="$PORT" PATH="$PATH_ENV"
 	procd_set_param stdout 1
 	procd_set_param stderr 1
-	procd_set_param respawn 3600 5 5
+	procd_set_param respawn 3600 5 0
 	procd_close_instance
 }
 `, escapeShellDoubleQuoted(binaryPath), escapeShellDoubleQuoted(rootDir), escapeShellDoubleQuoted(port), escapeShellDoubleQuoted(rootDir), escapeShellDoubleQuoted(rootDir))
@@ -260,10 +264,29 @@ ROOT_DIR="%s"
 PORT="%s"
 LOG_FILE="/tmp/vpn-manager.log"
 PID_FILE="/tmp/vpn-manager.pid"
+UPDATE_JOURNAL="$ROOT_DIR/.update-journal.json"
+UPDATE_LOCK="/tmp/vpn-manager.updating"
+WATCHDOG_LOCK="/tmp/vpn-manager-watchdog.lock"
 PATH="$ROOT_DIR/bin:$ROOT_DIR/.vpn-manager/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 [ -x "$PROG" ] || exit 0
-pgrep -x "%s" >/dev/null 2>&1 && exit 0
+if [ -r "$PID_FILE" ]; then
+	PID="$(cat "$PID_FILE" 2>/dev/null)"
+	case "$PID" in
+		''|*[!0-9]*) PID="" ;;
+	esac
+	if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+		RUNNING_EXE="$(readlink -f "/proc/$PID/exe" 2>/dev/null)"
+		RUNNING_EXE="${RUNNING_EXE%% (deleted)}"
+		EXPECTED_EXE="$(readlink -f "$PROG" 2>/dev/null)"
+		[ "$RUNNING_EXE" = "$EXPECTED_EXE" ] && exit 0
+	fi
+fi
+[ -e "$UPDATE_JOURNAL" ] && exit 0
+[ -e "$UPDATE_LOCK" ] && exit 0
+mkdir "$WATCHDOG_LOCK" 2>/dev/null || exit 0
+trap 'rmdir "$WATCHDOG_LOCK" 2>/dev/null' EXIT INT TERM
+rm -f "$PID_FILE"
 
 export VPN_MANAGER_ROOT="$ROOT_DIR"
 export VPN_MANAGER_PORT="$PORT"
@@ -275,7 +298,8 @@ if [ -x /sbin/start-stop-daemon ]; then
 fi
 
 "$PROG" >>"$LOG_FILE" 2>&1 </dev/null &
-`, escapeShellDoubleQuoted(binaryPath), escapeShellDoubleQuoted(rootDir), escapeShellDoubleQuoted(port), serviceName)
+echo "$!" >"$PID_FILE"
+	`, escapeShellDoubleQuoted(binaryPath), escapeShellDoubleQuoted(rootDir), escapeShellDoubleQuoted(port))
 }
 
 func detectServiceInstallMethod(mountsPath string) (serviceInstallMethod, error) {

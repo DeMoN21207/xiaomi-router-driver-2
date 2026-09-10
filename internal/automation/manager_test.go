@@ -2,10 +2,27 @@ package automation
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestRenderedServiceScriptsHaveValidShellSyntax(t *testing.T) {
+	t.Parallel()
+	for name, script := range map[string]string{
+		"init": renderInitScript("/mnt/usb/vpn-manager/vpn-manager", "/mnt/usb/vpn-manager", "18080"),
+		"cron": renderCronBootstrapScript("/mnt/usb/vpn-manager/vpn-manager", "/mnt/usb/vpn-manager", "18080"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			cmd := exec.Command("sh", "-n")
+			cmd.Stdin = strings.NewReader(script)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("rendered script syntax error: %v: %s", err, output)
+			}
+		})
+	}
+}
 
 func TestDetectServiceInstallMethodFromMounts(t *testing.T) {
 	t.Parallel()
@@ -65,7 +82,13 @@ func TestRenderCronBootstrapScript(t *testing.T) {
 		`PORT="18080"`,
 		`PID_FILE="/tmp/vpn-manager.pid"`,
 		`PATH="$ROOT_DIR/bin:$ROOT_DIR/.vpn-manager/bin:/usr/sbin:/usr/bin:/sbin:/bin"`,
-		`pgrep -x "vpn-manager" >/dev/null 2>&1 && exit 0`,
+		`UPDATE_JOURNAL="$ROOT_DIR/.update-journal.json"`,
+		`UPDATE_LOCK="/tmp/vpn-manager.updating"`,
+		`RUNNING_EXE="$(readlink -f "/proc/$PID/exe" 2>/dev/null)"`,
+		`RUNNING_EXE="${RUNNING_EXE% (deleted)}"`,
+		`[ "$RUNNING_EXE" = "$EXPECTED_EXE" ] && exit 0`,
+		`[ -e "$UPDATE_JOURNAL" ] && exit 0`,
+		`[ -e "$UPDATE_LOCK" ] && exit 0`,
 		`export VPN_MANAGER_ROOT="$ROOT_DIR"`,
 		`export VPN_MANAGER_PORT="$PORT"`,
 		`export PATH`,
@@ -75,6 +98,9 @@ func TestRenderCronBootstrapScript(t *testing.T) {
 		if !strings.Contains(script, fragment) {
 			t.Fatalf("renderCronBootstrapScript() missing fragment %q", fragment)
 		}
+	}
+	if strings.Contains(script, "pgrep") {
+		t.Fatal("watchdog must validate its PID and executable instead of matching a process name")
 	}
 }
 
@@ -89,6 +115,7 @@ func TestRenderInitScriptIncludesBundleBinPath(t *testing.T) {
 		`PORT="18080"`,
 		`PATH_ENV="/mnt/usb/vpn-manager/bin:/mnt/usb/vpn-manager/.vpn-manager/bin:/usr/sbin:/usr/bin:/sbin:/bin"`,
 		`procd_set_param env VPN_MANAGER_ROOT="$ROOT_DIR" VPN_MANAGER_PORT="$PORT" PATH="$PATH_ENV"`,
+		`procd_set_param respawn 3600 5 0`,
 	} {
 		if !strings.Contains(script, fragment) {
 			t.Fatalf("renderInitScript() missing fragment %q", fragment)
