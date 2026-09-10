@@ -181,12 +181,17 @@ func main() {
 		log.Fatalf("load embedded UI: %v", err)
 	}
 	fileServer := http.FileServer(http.FS(staticFS))
+	apiToken := api.LoadAPIToken(paths.DataDir)
+	apiHandlerWithSecurity := api.LimitRequestBody(api.BearerAuth(apiHandler, apiToken), 128<<20)
+	if apiToken != "" {
+		log.Printf("API bearer authentication enabled for mutating requests")
+	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/api/", apiHandler)
+	mux.Handle("/api/", apiHandlerWithSecurity)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-			apiHandler.ServeHTTP(w, r)
+			apiHandlerWithSecurity.ServeHTTP(w, r)
 			return
 		}
 
@@ -201,16 +206,21 @@ func main() {
 		http.ServeFileFS(w, r, staticFS, "index.html")
 	})
 
+	listenAddress := strings.TrimSpace(os.Getenv("VPN_MANAGER_LISTEN_ADDR"))
+	if listenAddress == "" {
+		listenAddress = "0.0.0.0"
+	}
 	server := &http.Server{
-		Addr:              ":" + port,
+		Addr:              listenAddress + ":" + port,
 		Handler:           requestLogger(mux),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      2 * time.Minute,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		WriteTimeout:      5 * time.Minute,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
-	log.Printf("vpn-manager listening on http://0.0.0.0:%s", port)
+	log.Printf("vpn-manager listening on http://%s:%s", listenAddress, port)
 	serverErrors := make(chan error, 1)
 	go func() {
 		err := server.ListenAndServe()

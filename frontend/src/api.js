@@ -23,8 +23,16 @@ export async function fetchJSON(url, options) {
     inFlight += 1;
     emit();
   }
-  try {
-    const response = await fetch(url, fetchOptions);
+	try {
+		const authorizedOptions = withAPIToken(fetchOptions);
+		let response = await fetch(url, authorizedOptions);
+		if (response.status === 401 && typeof window !== "undefined" && typeof window.prompt === "function") {
+			const token = window.prompt("Введите API-токен роутера");
+			if (token?.trim()) {
+				storeAPIToken(token.trim());
+				response = await fetch(url, withAPIToken(fetchOptions));
+			}
+		}
     if (response.ok) return response.json();
 
     let message = "Запрос завершился ошибкой";
@@ -42,6 +50,30 @@ export async function fetchJSON(url, options) {
       emit();
     }
   }
+}
+
+function readAPIToken() {
+	try {
+		return globalThis.sessionStorage?.getItem("vpn-manager-api-token") || "";
+	} catch {
+		return "";
+	}
+}
+
+function storeAPIToken(token) {
+	try {
+		globalThis.sessionStorage?.setItem("vpn-manager-api-token", token);
+	} catch {
+		// Session storage may be unavailable in restricted browser contexts.
+	}
+}
+
+function withAPIToken(options = {}) {
+	const token = readAPIToken();
+	if (!token) return options;
+	const headers = new Headers(options.headers || {});
+	headers.set("Authorization", `Bearer ${token}`);
+	return { ...options, headers };
 }
 
 export async function applyRules({ pollIntervalMs = 500, timeoutMs = 5 * 60 * 1000 } = {}) {

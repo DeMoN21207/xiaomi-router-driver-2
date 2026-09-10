@@ -22,6 +22,7 @@ LOCAL_ENV_EXAMPLE_FILE="$ROOT_DIR/deploy_router.local.example.sh"
 : "${ROUTER_HEALTH_DELAY:=1}"
 : "${ROUTER_SCP_LEGACY:=1}"
 : "${ROUTER_SSH_STRICT:=accept-new}"
+: "${ROUTER_API_TOKEN:=}"
 
 TEMP_KNOWN_HOSTS=""
 REMOTE_UPDATE_LOCKED=0
@@ -409,14 +410,19 @@ REMOTE_UPDATE_LOCKED=0
 echo
 echo "[6/7] Reinstalling automation bootstrap and reconciling routes..."
 api_base="http://$ROUTER_HOST:$ROUTER_HTTP_PORT"
+api_auth=()
+if [[ -n "$ROUTER_API_TOKEN" ]]; then
+	api_auth=(-H "Authorization: Bearer $ROUTER_API_TOKEN")
+fi
 automation_body="$(curl -fsS --max-time 20 "$api_base/api/config/automation" | json_extract_automation)"
 curl -fsS --max-time 20 \
   -X PUT \
+	"${api_auth[@]}" \
   -H "Content-Type: application/json" \
   --data "$automation_body" \
   "$api_base/api/config/automation" >/dev/null
 
-apply_body="$(curl -fsS --max-time 20 -X POST "$api_base/api/rules/apply")"
+apply_body="$(curl -fsS --max-time 20 "${api_auth[@]}" -X POST "$api_base/api/rules/apply")"
 apply_id="$(printf '%s' "$apply_body" | json_extract_apply_field id)"
 if [[ -z "$apply_id" ]]; then
 	echo "[error] Apply operation ID is missing: $apply_body" >&2
