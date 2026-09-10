@@ -133,6 +133,9 @@ func main() {
 	if _, err := statusService.TrafficHistory("1d"); err != nil {
 		log.Fatalf("bootstrap traffic history store: %v", err)
 	}
+	if err := sqlitedb.Maintain(db, dbPath); err != nil {
+		log.Printf("initial sqlite maintenance failed: %v", err)
+	}
 	if err := appdir.ArchiveLegacyData(paths); err != nil {
 		log.Printf("archive legacy data files: %v", err)
 	}
@@ -165,6 +168,12 @@ func main() {
 	startWorker(statusService.RunDomainTrafficSampler)
 	startWorker(statusService.RunDomainHealthSampler)
 	startWorker(statusService.RunSiteTrafficSampler)
+	startWorker(func(ctx context.Context) {
+		sqlitedb.RunMaintenance(ctx, db, dbPath, 6*time.Hour, func(err error) {
+			log.Printf("sqlite maintenance failed: %v", err)
+			recordEvent("error", "storage.maintenance_failed", err.Error())
+		})
+	})
 
 	staticFS, err := fs.Sub(ui.Files, "static")
 	if err != nil {
@@ -232,8 +241,7 @@ func main() {
 		},
 		WaitWorkers: workers.Wait,
 		CheckpointDB: func() error {
-			_, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
-			return err
+			return sqlitedb.Checkpoint(db)
 		},
 		CloseDB: db.Close,
 	}); err != nil {
