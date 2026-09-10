@@ -26,6 +26,14 @@ if [[ -f "$LOCAL_ENV_FILE" ]]; then
   source "$LOCAL_ENV_FILE"
 fi
 
+# Capture source identity before the build rewrites tracked bundle artifacts.
+if [[ -z "$ROUTER_COMMIT" ]] && command -v git >/dev/null 2>&1 && git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  ROUTER_COMMIT="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+  if [[ -n "$ROUTER_COMMIT" ]] && [[ -n "$(git -C "$ROOT_DIR" status --porcelain 2>/dev/null)" ]]; then
+    ROUTER_COMMIT="${ROUTER_COMMIT}-dirty"
+  fi
+fi
+
 if [[ ! -x "$GO_EXE" ]]; then
   if ! command -v go >/dev/null 2>&1; then
     echo "[error] Go was not found. Install Go or place it in .tools/go." >&2
@@ -116,13 +124,6 @@ elif [[ -f "$ROUTER_PACKAGE_DIR/bin/sing-box" ]]; then
 fi
 
 chmod +x "$ROUTER_PACKAGE_DIR/bin/"* 2>/dev/null || true
-
-if [[ -z "$ROUTER_COMMIT" ]] && command -v git >/dev/null 2>&1 && git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  ROUTER_COMMIT="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || true)"
-  if [[ -n "$ROUTER_COMMIT" ]] && [[ -n "$(git -C "$ROOT_DIR" status --porcelain 2>/dev/null)" ]]; then
-    ROUTER_COMMIT="${ROUTER_COMMIT}-dirty"
-  fi
-fi
 
 if [[ -z "$ROUTER_BUILT_AT" ]]; then
   ROUTER_BUILT_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
