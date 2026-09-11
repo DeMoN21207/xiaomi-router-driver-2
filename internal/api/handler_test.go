@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"xiomi-router-driver/internal/config"
 	eventstore "xiomi-router-driver/internal/events"
@@ -338,6 +339,110 @@ func TestProviderRefreshEndpointRefreshesSubscriptionWithoutActiveRules(t *testi
 	}
 	if payload.Applied {
 		t.Fatalf("expected no apply without active rules")
+	}
+}
+
+func TestProviderRefreshSurvivesClientCancellation(t *testing.T) {
+	started := make(chan struct{})
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		time.Sleep(50 * time.Millisecond)
+		_, _ = w.Write([]byte(testSubscriptionSource()))
+	}))
+	defer source.Close()
+
+	tempDir := t.TempDir()
+	db := openAPITestDB(t, filepath.Join(tempDir, "vpn-manager.db"))
+	stateManager := config.NewManager(db, filepath.Join(tempDir, "vpn-state.json"))
+	state := config.DefaultState()
+	state.Providers = []config.Provider{{
+		ID:      "provider-sub",
+		Name:    "Sub",
+		Type:    config.ProviderTypeSubscription,
+		Source:  source.URL,
+		Enabled: true,
+	}}
+	if _, err := stateManager.Save(state); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	appContext, cancelApp := context.WithCancel(context.Background())
+	defer cancelApp()
+	handler := NewHandler(Dependencies{Context: appContext, State: stateManager, DataDir: tempDir})
+	requestContext, cancelRequest := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/api/providers/provider-sub/refresh", nil).WithContext(requestContext)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	<-started
+	cancelRequest()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("provider refresh did not finish after the source responded")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ServeHTTP() status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
+func TestProviderRefreshStopsWhenApplicationStops(t *testing.T) {
+	started := make(chan struct{})
+	sourceCanceled := make(chan struct{})
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		close(sourceCanceled)
+	}))
+	defer source.Close()
+
+	tempDir := t.TempDir()
+	db := openAPITestDB(t, filepath.Join(tempDir, "vpn-manager.db"))
+	stateManager := config.NewManager(db, filepath.Join(tempDir, "vpn-state.json"))
+	state := config.DefaultState()
+	state.Providers = []config.Provider{{
+		ID:      "provider-sub",
+		Name:    "Sub",
+		Type:    config.ProviderTypeSubscription,
+		Source:  source.URL,
+		Enabled: true,
+	}}
+	if _, err := stateManager.Save(state); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	appContext, cancelApp := context.WithCancel(context.Background())
+	handler := NewHandler(Dependencies{Context: appContext, State: stateManager, DataDir: tempDir})
+	requestContext, cancelRequest := context.WithCancel(context.Background())
+	defer cancelRequest()
+	req := httptest.NewRequest(http.MethodPost, "/api/providers/provider-sub/refresh", nil).WithContext(requestContext)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	<-started
+	cancelApp()
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+		cancelRequest()
+		<-done
+		t.Fatal("provider refresh ignored application shutdown")
+	}
+	select {
+	case <-sourceCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("subscription request was not canceled with the application")
+	}
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("ServeHTTP() status = %d, want %d, body=%s", rec.Code, http.StatusBadGateway, rec.Body.String())
 	}
 }
 

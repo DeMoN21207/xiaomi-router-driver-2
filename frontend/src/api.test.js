@@ -55,3 +55,34 @@ test("fetchJSON aborts a request after its deadline", async () => {
 		globalThis.fetch = originalFetch;
 	}
 });
+
+test("refreshSubscription allows the full subscription refresh window", async () => {
+	const api = await import("./api.js");
+	assert.equal(typeof api.refreshSubscription, "function", "refreshSubscription must be exported");
+
+	const originalFetch = globalThis.fetch;
+	const originalSetTimeout = globalThis.setTimeout;
+	const observedTimeouts = [];
+	let observedRequest;
+	globalThis.setTimeout = (callback, delay, ...args) => {
+		observedTimeouts.push(delay);
+		return originalSetTimeout(callback, 60_000, ...args);
+	};
+	globalThis.fetch = async (url, options = {}) => {
+		observedRequest = { url, method: options.method || "GET" };
+		return { ok: true, json: async () => ({ status: "refreshed", entries: 81 }) };
+	};
+
+	try {
+		const result = await api.refreshSubscription("provider/sub");
+		assert.equal(result.status, "refreshed");
+		assert.deepEqual(observedRequest, {
+			url: "/api/providers/provider%2Fsub/refresh",
+			method: "POST",
+		});
+		assert.ok(observedTimeouts.includes(5 * 60 * 1000), `timeouts = ${observedTimeouts.join(", ")}`);
+	} finally {
+		globalThis.fetch = originalFetch;
+		globalThis.setTimeout = originalSetTimeout;
+	}
+});

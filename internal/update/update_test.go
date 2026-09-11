@@ -60,6 +60,44 @@ func TestExtractTarGzRejectsPathTraversal(t *testing.T) {
 	}
 }
 
+func TestExtractTarGzAcceptsRootDirectoryEntry(t *testing.T) {
+	tempDir := t.TempDir()
+	archivePath := filepath.Join(tempDir, "bundle.tar.gz")
+	file, err := os.Create(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := gzip.NewWriter(file)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "./", Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("manager")
+	if err := tw.WriteHeader(&tar.Header{Name: "vpn-manager", Typeflag: tar.TypeReg, Mode: 0o755, Size: int64(len(content))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	outDir := filepath.Join(tempDir, "out")
+	if err := ExtractTarGz(archivePath, outDir); err != nil {
+		t.Fatalf("ExtractTarGz() error = %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(outDir, "vpn-manager")); err != nil || string(got) != "manager" {
+		t.Fatalf("extracted vpn-manager = %q, %v", got, err)
+	}
+}
+
 func TestValidateBundleAcceptsLinuxARM64Bundle(t *testing.T) {
 	root := t.TempDir()
 	writeValidBundle(t, root, "linux", "arm64")

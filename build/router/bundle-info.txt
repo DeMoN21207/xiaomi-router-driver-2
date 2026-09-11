@@ -6,5 +6,5 @@ package_dir=build/router
 data_dir=data
 openvpn_path=bin/openvpn
 singbox_path=bin/sing-box
-commit=b819e7e
-built_at=2026-09-11T07:29:13Z
+commit=dfd4742-dirty
+built_at=2026-09-11T10:29:43Z

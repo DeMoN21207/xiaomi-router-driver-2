@@ -151,7 +151,9 @@ fi
 
 ROUTER_ARCHIVE_PATH="$ROOT_DIR/build/$ROUTER_ARCHIVE_NAME"
 mkdir -p "$(dirname "$ROUTER_ARCHIVE_PATH")"
-tar -C "$ROUTER_PACKAGE_DIR" -czf "$ROUTER_ARCHIVE_PATH" .
+tar -C "$ROUTER_PACKAGE_DIR" -czf "$ROUTER_ARCHIVE_PATH" \
+  "$ROUTER_BINARY_NAME" README.md start.sh bundle-info.txt "$ROUTER_DATA_DIR_NAME" bin
+bash "$ROOT_DIR/test_router_archive.sh" "$ROUTER_ARCHIVE_PATH"
 
 echo "[4/4] Router bundle ready: $ROUTER_PACKAGE_DIR"
 echo "[done] Release archive: $ROUTER_ARCHIVE_PATH"

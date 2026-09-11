@@ -66,6 +66,13 @@ export async function fetchJSON(url, options) {
   }
 }
 
+export function refreshSubscription(providerID) {
+	return fetchJSON(`/api/providers/${encodeURIComponent(providerID)}/refresh`, {
+		method: "POST",
+		timeoutMs: 5 * 60 * 1000,
+	});
+}
+
 function readAPIToken() {
 	try {
 		return globalThis.sessionStorage?.getItem("vpn-manager-api-token") || "";

@@ -111,7 +111,10 @@ type applyResult struct {
 	Domains      []string `json:"domains"`
 }
 
-const applyRequestTimeout = 2 * time.Minute
+const (
+	applyRequestTimeout        = 2 * time.Minute
+	subscriptionRefreshTimeout = 4*time.Minute + 30*time.Second
+)
 
 func NewHandler(deps Dependencies) *Handler {
 	appContext := deps.Context
@@ -1407,7 +1410,10 @@ func (h *Handler) handleProviderRefresh(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	entries, err := subscription.RefreshEntriesCachedContext(r.Context(), provider.Source, h.subscriptionRuntimeDir())
+	ctx, cancel := context.WithTimeout(h.appContext, subscriptionRefreshTimeout)
+	defer cancel()
+
+	entries, err := subscription.RefreshEntriesCachedContext(ctx, provider.Source, h.subscriptionRuntimeDir())
 	if err != nil {
 		writeError(w, http.StatusBadGateway, fmt.Errorf("refresh subscription %q: %w", provider.Name, err))
 		return
@@ -1419,9 +1425,6 @@ func (h *Handler) handleProviderRefresh(w http.ResponseWriter, r *http.Request, 
 		"applied": false,
 	}
 	if provider.Enabled && providerHasEnabledRules(state, provider.ID) {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), applyRequestTimeout)
-		defer cancel()
-
 		result, err := h.applyCurrentRules(ctx)
 		if err != nil {
 			writeApplyError(w, err)

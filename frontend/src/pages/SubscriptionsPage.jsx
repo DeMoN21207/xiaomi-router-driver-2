@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from "react";
-import { fetchJSON } from "../api.js";
+import { fetchJSON, refreshSubscription } from "../api.js";
 import { useI18n } from "../i18n.jsx";
 import Icon from "../components/Icon.jsx";
 import InlineNotice from "../components/InlineNotice.jsx";
@@ -87,7 +87,7 @@ export default function SubscriptionsPage() {
   async function refreshProvider(provider) {
     setRefreshingProviderId(provider.id);
     try {
-      const result = await fetchJSON(`/api/providers/${encodeURIComponent(provider.id)}/refresh`, { method: "POST" });
+      const result = await refreshSubscription(provider.id);
       showToast(t("subscriptions.refreshed", { count: String(result.entries ?? 0) }));
       await refresh();
     } catch (err) {
@@ -104,7 +104,7 @@ export default function SubscriptionsPage() {
     setSyncing(true);
     try {
       for (const provider of providers) {
-        await fetchJSON(`/api/providers/${encodeURIComponent(provider.id)}/refresh`, { method: "POST" });
+        await refreshSubscription(provider.id);
       }
       showToast(t("subscriptions.synced", { count: String(providers.length) }));
       await refresh();

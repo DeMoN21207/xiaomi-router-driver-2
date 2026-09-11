@@ -1,5 +1,5 @@
 import { useDeferredValue, useEffect, useMemo, useState, useRef, useCallback } from "react";
-import { applyRules, fetchJSON } from "../api.js";
+import { applyRules, fetchJSON, refreshSubscription as requestSubscriptionRefresh } from "../api.js";
 import { parseDomainInput } from "../domainInput.js";
 import { useI18n } from "../i18n.jsx";
 import Icon from "../components/Icon.jsx";
@@ -372,7 +372,7 @@ export default function ConnectionsPage() {
   async function refreshSubscription(provider) {
     setRefreshingProviderId(provider.id);
     try {
-      const result = await fetchJSON(`/api/providers/${encodeURIComponent(provider.id)}/refresh`, { method: "POST" });
+      const result = await requestSubscriptionRefresh(provider.id);
       setPageError("");
       showToast(t("connections.subscriptionRefreshed", { count: String(result.entries ?? 0) }));
       await refresh();

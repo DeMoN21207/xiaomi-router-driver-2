@@ -40,6 +40,9 @@ func ExtractTarGz(archivePath string, targetDir string) error {
 		if err != nil {
 			return fmt.Errorf("read tar entry: %w", err)
 		}
+		if header.Typeflag == tar.TypeDir && filepath.Clean(strings.TrimSpace(header.Name)) == "." {
+			continue
+		}
 
 		entryPath, err := safeArchiveEntryPath(targetAbs, header.Name)
 		if err != nil {
