@@ -250,12 +250,13 @@ func (s *Service) TrafficHistory(rangeName string) (TrafficHistoryResponse, erro
 		}, nil
 	}
 
-	samples, err := s.history.List()
+	now := time.Now().UTC()
+	samples, err := s.history.ListBetween(trafficHistoryQueryFrom(spec, now, s.trafficSampleInterval), now)
 	if err != nil {
 		return TrafficHistoryResponse{}, err
 	}
 
-	return aggregateTrafficHistory(samples, spec, time.Now().UTC(), s.trafficSampleInterval), nil
+	return aggregateTrafficHistory(samples, spec, now, s.trafficSampleInterval), nil
 }
 
 func summarizeEnabledRules(state config.State) (int, map[string]int, map[string]map[string]struct{}) {
@@ -347,12 +348,24 @@ func (s *Service) TrafficHistoryCustom(fromStr, toStr string) (TrafficHistoryRes
 		}, nil
 	}
 
-	samples, err := s.history.List()
+	samples, err := s.history.ListBetween(trafficHistoryQueryFrom(spec, to, s.trafficSampleInterval), to)
 	if err != nil {
 		return TrafficHistoryResponse{}, err
 	}
 
 	return aggregateTrafficHistory(samples, spec, to, s.trafficSampleInterval), nil
+}
+
+func trafficHistoryQueryFrom(spec trafficHistoryRangeSpec, now time.Time, sampleInterval time.Duration) time.Time {
+	start := now.Add(-spec.Lookback)
+	pad := spec.Bucket
+	if sampleInterval > 0 && (pad <= 0 || sampleInterval < pad) {
+		pad = sampleInterval
+	}
+	if pad < time.Minute {
+		pad = time.Minute
+	}
+	return start.Add(-pad)
 }
 
 func parseTrafficHistoryRange(raw string) (trafficHistoryRangeSpec, error) {
@@ -597,6 +610,10 @@ func (s *trafficHistoryStore) Append(sample trafficHistorySample) error {
 }
 
 func (s *trafficHistoryStore) List() ([]trafficHistorySample, error) {
+	return s.ListBetween(time.Time{}, time.Time{})
+}
+
+func (s *trafficHistoryStore) ListBetween(from time.Time, to time.Time) ([]trafficHistorySample, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -604,7 +621,7 @@ func (s *trafficHistoryStore) List() ([]trafficHistorySample, error) {
 		return nil, err
 	}
 
-	rows, err := s.db.Query(`
+	query := `
 		SELECT
 			s.id,
 			s.collected_at,
@@ -616,9 +633,24 @@ func (s *trafficHistoryStore) List() ([]trafficHistorySample, error) {
 			r.rx_bytes,
 			r.tx_bytes
 		FROM traffic_history_samples s
-		LEFT JOIN traffic_history_routes r ON r.sample_id = s.id
-		ORDER BY s.collected_at ASC, s.id ASC, r.provider_name ASC, r.location ASC, r.interface_name ASC
-	`)
+		LEFT JOIN traffic_history_routes r ON r.sample_id = s.id`
+	args := make([]any, 0, 2)
+	conditions := make([]string, 0, 2)
+	if !from.IsZero() {
+		conditions = append(conditions, "s.collected_at >= ?")
+		args = append(args, from.UTC().Format(time.RFC3339))
+	}
+	if !to.IsZero() {
+		conditions = append(conditions, "s.collected_at <= ?")
+		args = append(args, to.UTC().Format(time.RFC3339))
+	}
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += `
+		ORDER BY s.collected_at ASC, s.id ASC, r.provider_name ASC, r.location ASC, r.interface_name ASC`
+
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}

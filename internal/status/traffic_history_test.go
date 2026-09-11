@@ -1,8 +1,11 @@
 package status
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
+
+	"xiomi-router-driver/internal/sqlitedb"
 )
 
 func TestAggregateTrafficHistoryBuildsDeltas(t *testing.T) {
@@ -82,6 +85,49 @@ func TestCounterDeltaHandlesCounterReset(t *testing.T) {
 	}
 	if got := counterDelta(320, 300); got != 20 {
 		t.Fatalf("expected regular counter delta 20, got %d", got)
+	}
+}
+
+func TestTrafficHistoryStoreListBetweenSkipsSamplesOutsideWindow(t *testing.T) {
+	db, err := sqlitedb.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	store := newTrafficHistoryStore(db, "", 30*24*time.Hour)
+	now := time.Now().UTC().Truncate(time.Second)
+	outside := now.Add(-48 * time.Hour).Format(time.RFC3339)
+	inWindow := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	alsoInWindow := now.Add(-30 * time.Minute).Format(time.RFC3339)
+	for _, at := range []string{outside, inWindow, alsoInWindow} {
+		if err := store.Append(trafficHistorySample{
+			CollectedAt: at,
+			Routes:      []trafficHistoryRouteStat{testTrafficRoute("p1", "Provider", "subscription", "NL", "tun0", 10, 5)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	samples, err := store.ListBetween(now.Add(-3*time.Hour), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 2 {
+		t.Fatalf("expected 2 samples in window, got %d", len(samples))
+	}
+	if samples[0].CollectedAt != inWindow || samples[1].CollectedAt != alsoInWindow {
+		t.Fatalf("unexpected samples: %#v", samples)
+	}
+}
+
+func TestTrafficHistoryQueryFromPadsOneBucket(t *testing.T) {
+	now := time.Date(2026, time.March, 25, 12, 0, 0, 0, time.UTC)
+	spec := trafficHistoryRangeSpec{Name: "1h", Lookback: time.Hour, Bucket: 5 * time.Minute}
+	got := trafficHistoryQueryFrom(spec, now, 5*time.Minute)
+	want := now.Add(-time.Hour - 5*time.Minute)
+	if !got.Equal(want) {
+		t.Fatalf("query from = %s, want %s", got, want)
 	}
 }
 

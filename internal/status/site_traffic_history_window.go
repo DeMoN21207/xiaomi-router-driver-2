@@ -55,7 +55,7 @@ func (s *Service) siteTrafficHistoryWindow(scope string, sortBy string, order st
 		Sites:      result.Stats,
 		TotalBytes: result.TotalBytes,
 		UpdatedAt:  result.UpdatedAt,
-		Page:       page,
+		Page:       result.Page,
 		PageSize:   pageSize,
 		Total:      result.TotalCount,
 		TotalPages: totalTrafficPages(result.TotalCount, pageSize),
@@ -89,11 +89,7 @@ func (s *siteTrafficStore) ListHistory(scope string, sortBy string, order string
 		conditions = append(conditions, "via_tunnel = 0")
 	}
 
-	if query := strings.ToLower(strings.TrimSpace(search)); query != "" {
-		like := "%" + query + "%"
-		conditions = append(conditions, "(LOWER(domain) LIKE ? OR last_ip LIKE ?)")
-		args = append(args, like, like)
-	}
+	conditions, args = appendTrafficSearch(conditions, args, search)
 
 	where := " WHERE " + strings.Join(conditions, " AND ")
 
@@ -114,6 +110,7 @@ func (s *siteTrafficStore) ListHistory(scope string, sortBy string, order string
 		return pagedSiteTrafficResult{}, err
 	}
 
+	page = clampTrafficPage(page, pageSize, totalCount)
 	query := `
 		SELECT
 			domain,
@@ -154,5 +151,6 @@ func (s *siteTrafficStore) ListHistory(scope string, sortBy string, order string
 		TotalCount: totalCount,
 		TotalBytes: nullInt64ToUint64(totalBytes),
 		UpdatedAt:  updatedAt.String,
+		Page:       page,
 	}, nil
 }

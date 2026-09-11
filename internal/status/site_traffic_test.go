@@ -101,6 +101,22 @@ func TestSiteTrafficStoreListSupportsSourceIPFilterAndPagination(t *testing.T) {
 	if len(direct.Stats) != 1 || direct.Stats[0].Domain != "youtube.com" || direct.Stats[0].ViaTunnel {
 		t.Fatalf("unexpected direct scope stats: %+v", direct.Stats)
 	}
+
+	clamped, err := store.List("all", "bytes", "", "", "", 99, 2)
+	if err != nil {
+		t.Fatalf("List() past last page error = %v", err)
+	}
+	if clamped.Page != 2 || clamped.TotalCount != 3 || len(clamped.Stats) != 1 {
+		t.Fatalf("expected last page 2 with 1 row, got page=%d count=%d rows=%d", clamped.Page, clamped.TotalCount, len(clamped.Stats))
+	}
+
+	wildcard, err := store.List("all", "bytes", "", "", "%", 1, 10)
+	if err != nil {
+		t.Fatalf("List() wildcard search error = %v", err)
+	}
+	if wildcard.TotalCount != 0 {
+		t.Fatalf("literal %% should not match every domain, got %d", wildcard.TotalCount)
+	}
 }
 
 func TestSiteTrafficStoreListCoversSortScopeSearchSourceAndPages(t *testing.T) {
@@ -108,17 +124,18 @@ func TestSiteTrafficStoreListCoversSortScopeSearchSourceAndPages(t *testing.T) {
 	seedTrafficMatrix(t, store)
 
 	tests := []struct {
-		name    string
-		scope   string
-		sortBy  string
-		order   string
-		source  string
-		search  string
-		page    int
-		size    int
-		total   int
-		bytes   uint64
-		domains []string
+		name     string
+		scope    string
+		sortBy   string
+		order    string
+		source   string
+		search   string
+		page     int
+		size     int
+		wantPage int
+		total    int
+		bytes    uint64
+		domains  []string
 	}{
 		{
 			name:    "bytes desc default",
@@ -230,6 +247,93 @@ func TestSiteTrafficStoreListCoversSortScopeSearchSourceAndPages(t *testing.T) {
 			bytes:   10000,
 			domains: []string{"gamma.net", "beta.com"},
 		},
+		{
+			name:    "device and tunneled",
+			scope:   "tunneled",
+			source:  "192.168.31.10",
+			sortBy:  "bytes",
+			page:    1,
+			size:    10,
+			total:   1,
+			bytes:   3000,
+			domains: []string{"alpha.com"},
+		},
+		{
+			name:    "device and direct",
+			scope:   "direct",
+			source:  "192.168.31.20",
+			sortBy:  "bytes",
+			page:    1,
+			size:    10,
+			total:   2,
+			bytes:   5000,
+			domains: []string{"delta.org", "beta.com"},
+		},
+		{
+			name:    "device search and page",
+			source:  "192.168.31.20",
+			search:  "delta",
+			sortBy:  "domain",
+			order:   "asc",
+			page:    1,
+			size:    10,
+			total:   1,
+			bytes:   4000,
+			domains: []string{"delta.org"},
+		},
+		{
+			name:    "scope search",
+			scope:   "tunneled",
+			search:  "gamma",
+			sortBy:  "packets",
+			order:   "desc",
+			page:    1,
+			size:    10,
+			total:   1,
+			bytes:   2000,
+			domains: []string{"gamma.net"},
+		},
+		{
+			name:    "filtered last page",
+			source:  "192.168.31.20",
+			sortBy:  "bytes",
+			page:    2,
+			size:    1,
+			total:   2,
+			bytes:   5000,
+			domains: []string{"beta.com"},
+		},
+		{
+			name:     "page zero becomes first page",
+			sortBy:   "domain",
+			order:    "asc",
+			page:     0,
+			size:     10,
+			wantPage: 1,
+			total:    4,
+			bytes:    10000,
+			domains:  []string{"alpha.com", "beta.com", "delta.org", "gamma.net"},
+		},
+		{
+			name:     "page past end clamps",
+			sortBy:   "bytes",
+			page:     99,
+			size:     2,
+			wantPage: 2,
+			total:    4,
+			bytes:    10000,
+			domains:  []string{"gamma.net", "beta.com"},
+		},
+		{
+			name:    "underscore is literal",
+			search:  "_",
+			sortBy:  "bytes",
+			page:    1,
+			size:    10,
+			total:   0,
+			bytes:   0,
+			domains: []string{},
+		},
 	}
 
 	for _, tt := range tests {
@@ -243,6 +347,16 @@ func TestSiteTrafficStoreListCoversSortScopeSearchSourceAndPages(t *testing.T) {
 			}
 			if result.TotalBytes != tt.bytes {
 				t.Fatalf("TotalBytes = %d, want %d", result.TotalBytes, tt.bytes)
+			}
+			wantPage := tt.wantPage
+			if wantPage == 0 {
+				wantPage = 1
+				if tt.page > 1 {
+					wantPage = tt.page
+				}
+			}
+			if result.Page != wantPage {
+				t.Fatalf("Page = %d, want %d", result.Page, wantPage)
 			}
 			gotDomains := make([]string, 0, len(result.Stats))
 			for _, item := range result.Stats {
@@ -343,6 +457,9 @@ func TestSiteTrafficStoreListDevicesSupportsSearchPaginationAndOptions(t *testin
 	}
 	if filtered.Devices[0].TunneledBytes != 6144 {
 		t.Fatalf("expected tunneled bytes 6144, got %d", filtered.Devices[0].TunneledBytes)
+	}
+	if len(filtered.Options) != 2 {
+		t.Fatalf("device options must stay unfiltered by scope, got %d", len(filtered.Options))
 	}
 
 	sourceFiltered, err := store.ListDevices("all", "bytes", "", "192.168.31.10", "", 1, 10, 10)
@@ -900,6 +1017,75 @@ func TestSiteTrafficStoreListHistorySupportsFiltersSortingAndPagination(t *testi
 	}
 	if len(searched.Stats) != 1 || searched.Stats[0].Domain != "beta.com" || searched.Stats[0].ViaTunnel {
 		t.Fatalf("unexpected direct search history stat: %+v", searched.Stats)
+	}
+
+	domainSearch, err := store.ListHistory("all", "bytes", "desc", "192.168.31.10", "GAMMA", 1, 10, from, to)
+	if err != nil {
+		t.Fatalf("ListHistory() domain search error = %v", err)
+	}
+	if domainSearch.TotalCount != 1 || len(domainSearch.Stats) != 1 || domainSearch.Stats[0].Domain != "gamma.net" {
+		t.Fatalf("unexpected domain search history: %+v", domainSearch)
+	}
+
+	updated, err := store.ListHistory("all", "updated", "asc", "192.168.31.10", "", 1, 10, from, to)
+	if err != nil {
+		t.Fatalf("ListHistory() updated sort error = %v", err)
+	}
+	if len(updated.Stats) != 3 || updated.Stats[0].Domain != "alpha.com" || updated.Stats[2].Domain != "gamma.net" {
+		t.Fatalf("unexpected updated history order: %+v", updated.Stats)
+	}
+
+	clamped, err := store.ListHistory("tunneled", "bytes", "desc", "192.168.31.10", "", 9, 1, from, to)
+	if err != nil {
+		t.Fatalf("ListHistory() page clamp error = %v", err)
+	}
+	if clamped.Page != 2 || clamped.TotalCount != 2 || len(clamped.Stats) != 1 {
+		t.Fatalf("expected tunneled history last page 2, got page=%d count=%d rows=%d", clamped.Page, clamped.TotalCount, len(clamped.Stats))
+	}
+}
+
+func TestServiceSiteTrafficExposesClampedPageAndDeviceFilter(t *testing.T) {
+	store := newSiteTrafficStore(openSiteTrafficTestDB(t))
+	seedTrafficMatrix(t, store)
+	service := &Service{siteTraffic: store}
+
+	resp, err := service.SiteTraffic("direct", "bytes", "desc", "192.168.31.20", "", 99, 1)
+	if err != nil {
+		t.Fatalf("SiteTraffic() error = %v", err)
+	}
+	if resp.Page != 2 || resp.TotalPages != 2 || resp.Total != 2 {
+		t.Fatalf("unexpected pagination %#v", resp)
+	}
+	if len(resp.Sites) != 1 || resp.Sites[0].Domain != "beta.com" {
+		t.Fatalf("unexpected clamped sites %#v", resp.Sites)
+	}
+	if resp.SourceIP != "192.168.31.20" || resp.TotalBytes != 5000 {
+		t.Fatalf("unexpected device filter totals %#v", resp)
+	}
+
+	devices, err := service.DeviceTraffic("tunneled", "bytes", "", "", "", 1, 10, 0)
+	if err != nil {
+		t.Fatalf("DeviceTraffic() error = %v", err)
+	}
+	if devices.Total != 2 {
+		t.Fatalf("tunneled device rows = %d, want 2", devices.Total)
+	}
+	if len(devices.Options) != 3 {
+		t.Fatalf("device options should ignore scope, got %d", len(devices.Options))
+	}
+}
+
+func TestTrafficSearchUsesIPPredicateForNumericQueries(t *testing.T) {
+	if !looksLikeIPSearch("198.51.100") || looksLikeIPSearch("youtube") || looksLikeIPSearch("10") {
+		t.Fatal("looksLikeIPSearch() did not classify prefix/IP queries")
+	}
+	conditions, args := appendTrafficSearch(nil, nil, "1.1.1.1")
+	if len(conditions) != 1 || conditions[0] != `last_ip LIKE ? ESCAPE '\'` || len(args) != 1 || args[0] != "%1.1.1.1%" {
+		t.Fatalf("IP search should only match last_ip, got %q %v", conditions, args)
+	}
+	conditions, args = appendTrafficSearch(nil, nil, "you_tube%")
+	if len(conditions) != 1 || !strings.Contains(conditions[0], "LOWER(domain)") || len(args) != 2 || args[0] != `%you\_tube\%%` {
+		t.Fatalf("domain search should escape LIKE wildcards, got %q %v", conditions, args)
 	}
 }
 

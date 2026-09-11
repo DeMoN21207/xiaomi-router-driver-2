@@ -5,16 +5,25 @@ import { useI18n } from "../i18n.jsx";
 import Icon from "../components/Icon.jsx";
 import InlineNotice from "../components/InlineNotice.jsx";
 import { formatBytes, formatBytesPerSecond, formatDate, formatDateFull } from "../utils.js";
+import {
+  buildDeviceHistoryURL as buildDeviceHistoryPath,
+  buildDevicesURL as buildDevicesPath,
+  buildSelectedDeviceURL as buildSelectedDevicePath,
+  buildSitesURL as buildSitesPath,
+  isAbortError,
+} from "../trafficStatsQuery.js";
 
-const siteSortOptions = ["bytes", "packets", "domain"];
+const siteSortOptions = ["bytes", "packets", "domain", "updated"];
 const siteScopeOptions = ["", "tunneled", "direct"];
 const deviceHistoryRangeOptions = ["1h", "3h", "1d", "3d", "7d", "30d"];
 const focusedDeviceSiteLimit = 5;
 const sitePageSize = 20;
+const siteSearchDebounceMs = 300;
 
 export default function TrafficStatsPage() {
   const { t } = useI18n();
   const initialLoadRef = useRef(true);
+  const refreshAbortRef = useRef(null);
 
   const [siteData, setSiteData] = useState(null);
   const [deviceData, setDeviceData] = useState(null);
@@ -24,6 +33,7 @@ export default function TrafficStatsPage() {
   const [siteSortDir, setSiteSortDir] = useState("desc");
   const [siteScope, setSiteScope] = useState("");
   const [siteSearch, setSiteSearch] = useState("");
+  const [debouncedSiteSearch, setDebouncedSiteSearch] = useState("");
   const [selectedDeviceIp, setSelectedDeviceIp] = useState("");
   const [sitePage, setSitePage] = useState(1);
   const [deviceHistoryData, setDeviceHistoryData] = useState(null);
@@ -65,104 +75,64 @@ export default function TrafficStatsPage() {
     }
   }, [showToast]);
 
-  const buildSitesURL = useCallback(() => {
-    const query = new URLSearchParams();
-    query.set("sort", siteSortBy);
-    if (siteSortDir !== "desc") {
-      query.set("order", siteSortDir);
-    }
-    if (siteScope) {
-      query.set("scope", siteScope);
-    }
-    query.set("page", String(sitePage));
-    query.set("pageSize", String(sitePageSize));
-    if (siteSearch.trim()) {
-      query.set("query", siteSearch.trim());
-    }
-    if (selectedDeviceIp) {
-      query.set("sourceIp", selectedDeviceIp);
-      if (deviceHistoryRange === "custom" && deviceHistoryFrom && deviceHistoryTo) {
-        const toISO = (value) => (value.includes("T") ? new Date(value).toISOString() : value);
-        query.set("from", toISO(deviceHistoryFrom));
-        query.set("to", toISO(deviceHistoryTo));
-      } else {
-        query.set("range", deviceHistoryRange);
-      }
-      return `/api/traffic/sites/history?${query.toString()}`;
-    }
-    return `/api/traffic/sites?${query.toString()}`;
-  }, [deviceHistoryFrom, deviceHistoryRange, deviceHistoryTo, selectedDeviceIp, sitePage, siteScope, siteSearch, siteSortBy, siteSortDir]);
+  const buildSitesURL = useCallback(() => buildSitesPath({
+    sortBy: siteSortBy,
+    sortDir: siteSortDir,
+    scope: siteScope,
+    page: sitePage,
+    pageSize: sitePageSize,
+    search: debouncedSiteSearch,
+    sourceIp: selectedDeviceIp,
+  }), [debouncedSiteSearch, selectedDeviceIp, sitePage, siteScope, siteSortBy, siteSortDir]);
 
-  const buildDevicesURL = useCallback(() => {
-    const query = new URLSearchParams();
-    query.set("page", "1");
-    query.set("pageSize", "1");
-    query.set("siteLimit", "0");
-    if (siteScope) {
-      query.set("scope", siteScope);
-    }
-    if (selectedDeviceIp) {
-      query.set("sourceIp", selectedDeviceIp);
-    }
-    return `/api/traffic/devices?${query.toString()}`;
-  }, [selectedDeviceIp, siteScope]);
+  const buildDevicesURL = useCallback(() => buildDevicesPath(), []);
 
-  const buildSelectedDeviceURL = useCallback(() => {
-    if (!selectedDeviceIp) {
-      return "";
-    }
+  const buildSelectedDeviceURL = useCallback(
+    () => buildSelectedDevicePath(selectedDeviceIp, focusedDeviceSiteLimit),
+    [selectedDeviceIp],
+  );
 
-    const query = new URLSearchParams();
-    query.set("sourceIp", selectedDeviceIp);
-    query.set("page", "1");
-    query.set("pageSize", "1");
-    query.set("siteLimit", String(focusedDeviceSiteLimit));
-    if (siteScope) {
-      query.set("scope", siteScope);
-    }
-    return `/api/traffic/devices?${query.toString()}`;
-  }, [selectedDeviceIp, siteScope]);
-
-  const buildDeviceHistoryURL = useCallback(() => {
-    if (!selectedDeviceIp) {
-      return "";
-    }
-
-    const query = new URLSearchParams();
-    query.set("sourceIp", selectedDeviceIp);
-    if (deviceHistoryRange === "custom" && deviceHistoryFrom && deviceHistoryTo) {
-      const toISO = (value) => (value.includes("T") ? new Date(value).toISOString() : value);
-      query.set("from", toISO(deviceHistoryFrom));
-      query.set("to", toISO(deviceHistoryTo));
-    } else {
-      query.set("range", deviceHistoryRange);
-    }
-    return `/api/traffic/devices/history?${query.toString()}`;
-  }, [deviceHistoryFrom, deviceHistoryRange, deviceHistoryTo, selectedDeviceIp]);
+  const buildDeviceHistoryURL = useCallback(
+    () => buildDeviceHistoryPath(selectedDeviceIp, deviceHistoryRange, deviceHistoryFrom, deviceHistoryTo),
+    [deviceHistoryFrom, deviceHistoryRange, deviceHistoryTo, selectedDeviceIp],
+  );
 
   const refresh = useCallback(async (initial = false) => {
+    refreshAbortRef.current?.abort();
+    const controller = new AbortController();
+    refreshAbortRef.current = controller;
     if (initial) {
       setLoading(true);
     }
 
     try {
+      const fetchOptions = { signal: controller.signal, timeoutMs: 30_000 };
       const [sitesResult, devicesResult, selectedDeviceResult, deviceHistoryResult] = await Promise.all([
-        fetchJSON(buildSitesURL()),
-        fetchJSON(buildDevicesURL()),
-        selectedDeviceIp ? fetchJSON(buildSelectedDeviceURL()) : Promise.resolve(null),
-        selectedDeviceIp ? fetchJSON(buildDeviceHistoryURL()) : Promise.resolve(null),
+        fetchJSON(buildSitesURL(), fetchOptions),
+        fetchJSON(buildDevicesURL(), fetchOptions),
+        selectedDeviceIp ? fetchJSON(buildSelectedDeviceURL(), fetchOptions) : Promise.resolve(null),
+        selectedDeviceIp ? fetchJSON(buildDeviceHistoryURL(), fetchOptions) : Promise.resolve(null),
       ]);
+      if (controller.signal.aborted) {
+        return { ok: false, aborted: true };
+      }
       setSiteData(sitesResult);
       setDeviceData(devicesResult);
       setSelectedDeviceData(selectedDeviceResult);
       setDeviceHistoryData(deviceHistoryResult);
       setError("");
+      if (typeof sitesResult?.page === "number" && sitesResult.page > 0) {
+        setSitePage((current) => (current === sitesResult.page ? current : sitesResult.page));
+      }
       return { ok: true };
     } catch (err) {
+      if (controller.signal.aborted || isAbortError(err)) {
+        return { ok: false, aborted: true };
+      }
       setError(err.message);
       return { ok: false, error: err };
     } finally {
-      if (initial) {
+      if (initial && !controller.signal.aborted) {
         setLoading(false);
       }
     }
@@ -174,7 +144,7 @@ export default function TrafficStatsPage() {
       const result = await refresh(false);
       if (result.ok) {
         showToast(t("trafficStats.refreshSuccess"));
-      } else {
+      } else if (!result.aborted) {
         showToast(result.error.message, true);
       }
     } finally {
@@ -186,6 +156,7 @@ export default function TrafficStatsPage() {
     const initial = initialLoadRef.current;
     initialLoadRef.current = false;
     void refresh(initial);
+    return () => refreshAbortRef.current?.abort();
   }, [refresh]);
 
   useEffect(() => {
@@ -261,24 +232,29 @@ export default function TrafficStatsPage() {
   }, []);
 
   const handleSearchChange = useCallback((value) => {
-    setSitePage(1);
     setSiteSearch(value);
   }, []);
+
+  useEffect(() => {
+    const nextQuery = siteSearch.trim();
+    const timerId = window.setTimeout(() => {
+      setDebouncedSiteSearch((current) => {
+        if (current === nextQuery) {
+          return current;
+        }
+        setSitePage(1);
+        return nextQuery;
+      });
+    }, siteSearchDebounceMs);
+    return () => window.clearTimeout(timerId);
+  }, [siteSearch]);
 
   const handleDeviceFilterChange = useCallback((value) => {
     setSitePage(1);
     setSelectedDeviceIp(value);
   }, []);
 
-  useEffect(() => {
-    if (!siteData) {
-      return;
-    }
-    const lastPage = Math.max(1, siteData.totalPages || 0);
-    if (sitePage > lastPage) {
-      setSitePage(lastPage);
-    }
-  }, [siteData, sitePage]);
+
 
   useEffect(() => {
     const syncPreference = () => setAutoRefreshMs(readDashboardRefreshInterval());
@@ -308,7 +284,7 @@ export default function TrafficStatsPage() {
   const deviceOptions = deviceData?.options ?? [];
 
   useEffect(() => {
-    if (selectedDeviceIp && !deviceOptions.some((item) => item.sourceIp === selectedDeviceIp)) {
+    if (selectedDeviceIp && deviceOptions.length > 0 && !deviceOptions.some((item) => item.sourceIp === selectedDeviceIp)) {
       setSelectedDeviceIp("");
     }
   }, [deviceOptions, selectedDeviceIp]);
@@ -323,19 +299,15 @@ export default function TrafficStatsPage() {
   async function handleCollectNow() {
     setCollecting(true);
     try {
-      const [sitesResult, devicesResult, selectedDeviceResult, deviceHistoryResult] = await Promise.all([
-        fetchJSON(buildSitesURL(), { method: "POST" }),
-        fetchJSON(buildDevicesURL()),
-        selectedDeviceIp ? fetchJSON(buildSelectedDeviceURL()) : Promise.resolve(null),
-        selectedDeviceIp ? fetchJSON(buildDeviceHistoryURL()) : Promise.resolve(null),
-      ]);
-      setSiteData(sitesResult);
-      setDeviceData(devicesResult);
-      setSelectedDeviceData(selectedDeviceResult);
-      setDeviceHistoryData(deviceHistoryResult);
-      setError("");
+      await fetchJSON("/api/traffic/sites", { method: "POST" });
+      const result = await refresh(false);
+      if (!result.ok && !result.aborted) {
+        setError(result.error.message);
+      }
     } catch (err) {
-      setError(err.message);
+      if (!isAbortError(err)) {
+        setError(err.message);
+      }
     } finally {
       setCollecting(false);
     }
@@ -502,11 +474,9 @@ export default function TrafficStatsPage() {
           customFrom={deviceHistoryFrom}
           customTo={deviceHistoryTo}
           onRangeChange={(range) => {
-            setSitePage(1);
             setDeviceHistoryRange(range);
           }}
           onApplyCustomRange={(from, to) => {
-            setSitePage(1);
             setDeviceHistoryFrom(from);
             setDeviceHistoryTo(to);
             setDeviceHistoryRange("custom");
@@ -589,7 +559,7 @@ export default function TrafficStatsPage() {
             <div className="p-8 text-center text-sm text-on-surface-variant">...</div>
           ) : sites.length === 0 ? (
             <div className="p-8 text-center text-sm text-on-surface-variant">
-              {siteSearch || selectedDevice ? t("trafficStats.noResults") : t("trafficStats.empty")}
+              {debouncedSiteSearch || selectedDeviceIp ? t("trafficStats.noResults") : t("trafficStats.empty")}
             </div>
           ) : (
             <>
@@ -602,7 +572,7 @@ export default function TrafficStatsPage() {
                       <th className="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant">{t("trafficStats.route")}</th>
                       <SortableTh sortKey="bytes" current={siteSortBy} dir={siteSortDir} onSort={handleSortChange} align="right">{t("trafficStats.traffic")}</SortableTh>
                       <SortableTh sortKey="packets" current={siteSortBy} dir={siteSortDir} onSort={handleSortChange} align="right" className="hidden lg:table-cell">{t("trafficStats.packets")}</SortableTh>
-                      <SortableTh sortKey="bytes" current={siteSortBy} dir={siteSortDir} onSort={handleSortChange} align="right" className="hidden xl:table-cell">{t("trafficStats.share")}</SortableTh>
+                      <th className="hidden px-5 py-3 text-right text-[10px] font-bold uppercase tracking-widest text-on-surface-variant xl:table-cell">{t("trafficStats.share")}</th>
                       <SortableTh sortKey="updated" current={siteSortBy} dir={siteSortDir} onSort={handleSortChange} className="hidden md:table-cell">{t("trafficStats.updated")}</SortableTh>
                       <th className="px-5 py-3 text-[10px] font-bold uppercase tracking-widest text-on-surface-variant" style={{ minWidth: 140 }}></th>
                     </tr>
@@ -684,7 +654,11 @@ export default function TrafficStatsPage() {
                 pageSize={siteData.pageSize}
                 total={siteData.total}
                 totalPages={siteData.totalPages}
-                onPageChange={setSitePage}
+                onPageChange={(page) => {
+                  if (page !== sitePage) {
+                    setSitePage(page);
+                  }
+                }}
                 t={t}
               />
             </>

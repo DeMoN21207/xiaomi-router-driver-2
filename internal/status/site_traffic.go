@@ -104,6 +104,7 @@ type pagedSiteTrafficResult struct {
 	TotalCount int
 	TotalBytes uint64
 	UpdatedAt  string
+	Page       int
 }
 
 type pagedDeviceTrafficResult struct {
@@ -112,6 +113,7 @@ type pagedDeviceTrafficResult struct {
 	TotalCount int
 	TotalBytes uint64
 	UpdatedAt  string
+	Page       int
 }
 
 type dnsObservation struct {
@@ -267,7 +269,7 @@ func (s *Service) SiteTraffic(scope string, sortBy string, order string, sourceI
 		Sites:      result.Stats,
 		TotalBytes: result.TotalBytes,
 		UpdatedAt:  result.UpdatedAt,
-		Page:       page,
+		Page:       result.Page,
 		PageSize:   pageSize,
 		Total:      result.TotalCount,
 		TotalPages: totalTrafficPages(result.TotalCount, pageSize),
@@ -308,7 +310,7 @@ func (s *Service) DeviceTraffic(scope string, sortBy string, order string, sourc
 		Options:    result.Options,
 		TotalBytes: result.TotalBytes,
 		UpdatedAt:  result.UpdatedAt,
-		Page:       page,
+		Page:       result.Page,
 		PageSize:   pageSize,
 		Total:      result.TotalCount,
 		TotalPages: totalTrafficPages(result.TotalCount, pageSize),
@@ -1118,11 +1120,15 @@ func (s *siteTrafficStore) ensureReady() error {
 			value TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_site_traffic_updated_at ON site_traffic(updated_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_site_traffic_scope_bytes ON site_traffic(via_tunnel, bytes DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_site_traffic_connections_last_seen ON site_traffic_connections(last_seen)`,
 		`CREATE INDEX IF NOT EXISTS idx_site_dns_observations_observed_at ON site_dns_observations(observed_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_device_site_traffic_source ON device_site_traffic(source_ip, bytes DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_device_site_traffic_bytes ON device_site_traffic(bytes DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_device_site_traffic_history_bucket ON device_site_traffic_history(bucket_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_device_site_traffic_history_source_bucket ON device_site_traffic_history(source_ip, bucket_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_device_traffic_history_bucket ON device_traffic_history(bucket_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_device_traffic_history_source_bucket ON device_traffic_history(source_ip, bucket_at)`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil {
 			s.initErr = err
@@ -1411,11 +1417,7 @@ func (s *siteTrafficStore) List(scope string, sortBy string, order string, sourc
 		conditions = append(conditions, "via_tunnel = 0")
 	}
 
-	if query := strings.ToLower(strings.TrimSpace(search)); query != "" {
-		like := "%" + query + "%"
-		conditions = append(conditions, "(LOWER(domain) LIKE ? OR last_ip LIKE ?)")
-		args = append(args, like, like)
-	}
+	conditions, args = appendTrafficSearch(conditions, args, search)
 
 	where := ""
 	if len(conditions) > 0 {
@@ -1432,6 +1434,7 @@ func (s *siteTrafficStore) List(scope string, sortBy string, order string, sourc
 		return pagedSiteTrafficResult{}, err
 	}
 
+	page = clampTrafficPage(page, pageSize, totalCount)
 	query := `SELECT domain, bytes, packets, updated_at, last_ip, via_tunnel, route_label FROM ` + tableName + where +
 		` ORDER BY ` + siteTrafficOrderClause(sortBy, order) + ` LIMIT ? OFFSET ?`
 	queryArgs := append(append([]any{}, args...), pageSize, (page-1)*pageSize)
@@ -1461,6 +1464,7 @@ func (s *siteTrafficStore) List(scope string, sortBy string, order string, sourc
 		TotalCount: totalCount,
 		TotalBytes: nullInt64ToUint64(totalBytes),
 		UpdatedAt:  updatedAt.String,
+		Page:       page,
 	}, nil
 }
 
@@ -1488,19 +1492,22 @@ func (s *siteTrafficStore) ListDevices(scope string, sortBy string, order string
 	}
 
 	if query := strings.ToLower(strings.TrimSpace(search)); query != "" {
-		like := "%" + query + "%"
-		conditions = append(conditions, `(
-			LOWER(device_name) LIKE ? OR
-			source_ip LIKE ? OR
-			LOWER(device_mac) LIKE ? OR
-			EXISTS (
+		like := likeContains(query)
+		if looksLikeIPSearch(query) {
+			conditions = append(conditions, `(`+likePredicate("source_ip")+` OR `+likePredicate("LOWER(device_mac)")+`)`)
+			args = append(args, like, like)
+		} else {
+			conditions = append(conditions, `(`+
+				likePredicate("LOWER(device_name)")+` OR `+
+				likePredicate("source_ip")+` OR `+
+				likePredicate("LOWER(device_mac)")+` OR EXISTS (
 				SELECT 1
 				FROM device_site_traffic dst
 				WHERE dst.source_ip = device_traffic.source_ip
-				  AND LOWER(dst.domain) LIKE ?
-			)
-		)`)
-		args = append(args, like, like, like, like)
+				  AND `+likePredicate("LOWER(dst.domain)")+`
+			))`)
+			args = append(args, like, like, like, like)
+		}
 	}
 
 	where := ""
@@ -1518,7 +1525,8 @@ func (s *siteTrafficStore) ListDevices(scope string, sortBy string, order string
 		return pagedDeviceTrafficResult{}, err
 	}
 
-	options, err := s.listDeviceOptions(scope)
+	page = clampTrafficPage(page, pageSize, totalCount)
+	options, err := s.listDeviceOptions()
 	if err != nil {
 		return pagedDeviceTrafficResult{}, err
 	}
@@ -1600,6 +1608,7 @@ func (s *siteTrafficStore) ListDevices(scope string, sortBy string, order string
 		TotalCount: totalCount,
 		TotalBytes: nullInt64ToUint64(totalBytes),
 		UpdatedAt:  updatedAt.String,
+		Page:       page,
 	}, nil
 }
 
@@ -1633,15 +1642,9 @@ func (s *siteTrafficStore) Reset() error {
 	return tx.Commit()
 }
 
-func (s *siteTrafficStore) listDeviceOptions(scope string) ([]DeviceTrafficOption, error) {
-	query := `SELECT source_ip, device_name, device_mac FROM device_traffic`
-	switch strings.TrimSpace(scope) {
-	case "tunneled":
-		query += ` WHERE tunneled_bytes > 0`
-	case "direct":
-		query += ` WHERE direct_bytes > 0`
-	}
-	query += ` ORDER BY LOWER(CASE WHEN TRIM(device_name) <> '' THEN device_name ELSE source_ip END), source_ip`
+func (s *siteTrafficStore) listDeviceOptions() ([]DeviceTrafficOption, error) {
+	query := `SELECT source_ip, device_name, device_mac FROM device_traffic
+		ORDER BY LOWER(CASE WHEN TRIM(device_name) <> '' THEN device_name ELSE source_ip END), source_ip`
 
 	rows, err := s.db.Query(query)
 	if err != nil {
@@ -1677,6 +1680,44 @@ func siteTrafficOrderClause(sortBy, order string) string {
 	default:
 		return "bytes " + d + ", packets DESC, LOWER(domain) ASC"
 	}
+}
+
+func appendTrafficSearch(conditions []string, args []any, search string) ([]string, []any) {
+	query := strings.ToLower(strings.TrimSpace(search))
+	if query == "" {
+		return conditions, args
+	}
+	like := likeContains(query)
+	if looksLikeIPSearch(query) {
+		return append(conditions, likePredicate("last_ip")), append(args, like)
+	}
+	return append(conditions, "("+likePredicate("LOWER(domain)")+" OR "+likePredicate("last_ip")+")"), append(args, like, like)
+}
+
+func likeContains(query string) string {
+	return "%" + escapeLikePattern(query) + "%"
+}
+
+func escapeLikePattern(query string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return replacer.Replace(query)
+}
+
+func likePredicate(column string) string {
+	return column + ` LIKE ? ESCAPE '\'`
+}
+
+func looksLikeIPSearch(query string) bool {
+	if query == "" {
+		return false
+	}
+	for _, r := range query {
+		if (r >= '0' && r <= '9') || r == '.' || r == ':' {
+			continue
+		}
+		return false
+	}
+	return strings.ContainsAny(query, ".:")
 }
 
 func deviceTrafficOrderClause(sortBy, order string) string {
@@ -1737,6 +1778,15 @@ func totalTrafficPages(total int, pageSize int) int {
 		return 0
 	}
 	return (total + pageSize - 1) / pageSize
+}
+
+func clampTrafficPage(page, pageSize, totalCount int) int {
+	page = normalizeTrafficPage(page)
+	lastPage := totalTrafficPages(totalCount, pageSize)
+	if lastPage > 0 && page > lastPage {
+		return lastPage
+	}
+	return page
 }
 
 func nullInt64ToUint64(value sql.NullInt64) uint64 {

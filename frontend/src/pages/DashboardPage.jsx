@@ -455,7 +455,6 @@ function TrafficAnalyticsCard({ routes, totalTrafficBytes, history, range, loadi
             routes.map((route) => {
               const routeKey = routeTrafficKey(route);
               const series = routeSeriesByKey.get(routeKey);
-              const chart = buildRouteTrafficChart(series?.points ?? []);
               const isRunning = route.status === "running";
               const rangeTotal = series?.totalBytes || 0;
               const peakBucket = series?.peakBytes || 0;
@@ -464,6 +463,7 @@ function TrafficAnalyticsCard({ routes, totalTrafficBytes, history, range, loadi
                 ? Math.round((rangeTotal / history.totalBytes) * 100)
                 : 0;
               const isExpanded = expandedRoutes.has(routeKey);
+              const chart = isExpanded ? buildRouteTrafficChart(series?.points ?? []) : null;
 
               return (
                 <div key={routeKey} className="overflow-hidden rounded-xl border border-outline-variant/10 bg-surface-container">
